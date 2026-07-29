@@ -1,0 +1,51 @@
+# .NET build output
+[Bb]in/
+[Oo]bj/
+artifacts/
+TestResults/
+*.nupkg
+*.snupkg
+
+# Visual Studio and VS Code user state
+.vs/
+.vscode/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# JetBrains IDEs
+.idea/
+*.sln.iml
+
+# Test coverage and logs
+coverage/
+coverage*.json
+coverage*.xml
+*.coverage
+*.coveragexml
+*.log
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+appsettings.*.local.json
+*.pfx
+*.p12
+*.key
+
+# Azure and infrastructure tooling
+.azure/
+.terraform/
+*.tfstate
+*.tfstate.*
+infra/main.json
+
+# Generated deployment manifests
+deploy/k8s/spotvideo.rendered.yaml
+
+# Operating system files
+.DS_Store
+Thumbs.db
+Desktop.ini
