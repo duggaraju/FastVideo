@@ -45,10 +45,16 @@ data:
   ServiceBus__InputQueue: "video-submitted"
   ServiceBus__CompletionQueue: "segment-completed"
   ServiceBus__StitchedQueue: "video-stitched"
-  Storage__ServiceUri: "__STORAGE_SERVICE_URI__"
   Storage__TableServiceUri: "__TABLE_SERVICE_URI__"
   Storage__StateTable: "encodingstate"
-  Storage__WorkingContainer: "videos"
+  Storage__InputAccountName: "__INPUT_STORAGE_ACCOUNT__"
+  Storage__InputContainer: "__INPUT_STORAGE_CONTAINER__"
+  Storage__InputMountPath: "/mnt/input"
+  Storage__OutputAccountName: "__OUTPUT_STORAGE_ACCOUNT__"
+  Storage__OutputContainer: "__OUTPUT_STORAGE_CONTAINER__"
+  Storage__OutputMountPath: "/mnt/output"
+  Storage__WorkingContainer: "__OUTPUT_STORAGE_CONTAINER__"
+  WorkloadIdentity__ClientId: "__WORKLOAD_CLIENT_ID__"
   Kubernetes__Namespace: "spotvideo"
   Images__Encoder: "__ACR_LOGIN_SERVER__/spotvideo-encoder:__IMAGE_TAG__"
   Images__Stitcher: "__ACR_LOGIN_SERVER__/spotvideo-stitcher:__IMAGE_TAG__"
@@ -83,9 +89,38 @@ spec:
           envFrom:
             - configMapRef:
                 name: spotvideo-config
+          volumeMounts:
+            - name: input-storage
+              mountPath: /mnt/input
+              readOnly: true
+            - name: output-storage
+              mountPath: /mnt/output
           resources:
             requests: { cpu: "250m", memory: "512Mi" }
             limits: { cpu: "1", memory: "2Gi" }
+      volumes:
+        - name: input-storage
+          csi:
+            driver: blob.csi.azure.com
+            readOnly: true
+            volumeAttributes:
+              protocol: fuse2
+              storageAccount: "__INPUT_STORAGE_ACCOUNT__"
+              containerName: "__INPUT_STORAGE_CONTAINER__"
+              AzureStorageAuthType: MSI
+              AzureStorageIdentityClientID: "__WORKLOAD_CLIENT_ID__"
+              mountOptions: "--use-attr-cache=true --file-cache-timeout-in-seconds=300 --cancel-list-on-mount-seconds=10"
+        - name: output-storage
+          csi:
+            driver: blob.csi.azure.com
+            readOnly: false
+            volumeAttributes:
+              protocol: fuse2
+              storageAccount: "__OUTPUT_STORAGE_ACCOUNT__"
+              containerName: "__OUTPUT_STORAGE_CONTAINER__"
+              AzureStorageAuthType: MSI
+              AzureStorageIdentityClientID: "__WORKLOAD_CLIENT_ID__"
+              mountOptions: "--use-attr-cache=true --file-cache-timeout-in-seconds=30 --disable-writeback-cache=true"
 ---
 apiVersion: apps/v1
 kind: Deployment

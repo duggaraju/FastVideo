@@ -48,8 +48,11 @@ $replacements = @{
     "__WORKLOAD_CLIENT_ID__" = $deployment.workloadClientId.value
     "__SERVICE_BUS_NAMESPACE__" = $serviceBusNamespace
     "__SERVICE_BUS_NAMESPACE_SHORT__" = $serviceBusShortName
-    "__STORAGE_SERVICE_URI__" = $deployment.storageServiceUri.value
     "__TABLE_SERVICE_URI__" = $deployment.tableServiceUri.value
+    "__INPUT_STORAGE_ACCOUNT__" = $deployment.inputStorageName.value
+    "__INPUT_STORAGE_CONTAINER__" = $deployment.inputContainerName.value
+    "__OUTPUT_STORAGE_ACCOUNT__" = $deployment.outputStorageName.value
+    "__OUTPUT_STORAGE_CONTAINER__" = $deployment.outputContainerName.value
     "__ACR_LOGIN_SERVER__" = $acrLoginServer
     "__IMAGE_TAG__" = $ImageTag
 }
@@ -63,4 +66,5 @@ kubectl apply --filename $renderedManifest
 
 Write-Host "Deployed SpotVideo to $($deployment.aksName.value) with image tag $ImageTag"
 Write-Host "Service Bus input queue: $serviceBusNamespace/video-submitted"
-Write-Host "Blob container: $($deployment.storageServiceUri.value)/videos"
+Write-Host "Input blob container: $($deployment.inputStorageServiceUri.value)/$($deployment.inputContainerName.value)"
+Write-Host "Output blob container: $($deployment.outputStorageServiceUri.value)/$($deployment.outputContainerName.value)"

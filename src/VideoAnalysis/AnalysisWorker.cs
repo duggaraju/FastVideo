@@ -1,8 +1,5 @@
 using System.Text.Json;
-using Azure;
-using Azure.Core;
 using Azure.Messaging.ServiceBus;
-using Azure.Storage.Blobs;
 using FFMpegCore;
 using k8s;
 using k8s.Models;
@@ -12,8 +9,6 @@ namespace SpotVideo.Analysis;
 
 public sealed class AnalysisWorker(
     ServiceBusClient serviceBus,
-    BlobServiceClient storage,
-    TokenCredential credential,
     IKubernetes kubernetes,
     IParallelizationStrategy parallelizationStrategy,
     IConfiguration configuration,
@@ -44,50 +39,56 @@ public sealed class AnalysisWorker(
                 ?? throw new InvalidOperationException("Message body is empty");
             Validate(request);
             var workingContainer = configuration["Storage:WorkingContainer"] ?? "videos";
+            var inputAccount = RequiredConfig("Storage:InputAccountName");
+            var inputContainer = RequiredConfig("Storage:InputContainer");
+            var outputAccount = RequiredConfig("Storage:OutputAccountName");
+            var outputContainer = RequiredConfig("Storage:OutputContainer");
+            var inputMountPath = configuration["Storage:InputMountPath"] ?? "/mnt/input";
+            var outputMountPath = configuration["Storage:OutputMountPath"] ?? "/mnt/output";
             var audioBlobName = $"{request.JobId}/audio.m4a";
 
-            var inputPath = Path.Combine(Path.GetTempPath(), $"{request.JobId}-source");
-            var audioPath = Path.Combine(Path.GetTempPath(), $"{request.JobId}-audio.m4a");
-            try
+            var inputPath = BlobMountPaths.FromUri(request.InputVideoUri, inputAccount, inputContainer, inputMountPath);
+            var audioPath = BlobMountPaths.FromBlobName(audioBlobName, outputMountPath);
+            Directory.CreateDirectory(Path.GetDirectoryName(audioPath)!);
+
+            var media = await FFProbe.AnalyseAsync(inputPath, cancellationToken: args.CancellationToken);
+            if (media.Duration <= TimeSpan.Zero)
             {
-                await CreateSourceClient(request.InputVideoUri).DownloadToAsync(inputPath, args.CancellationToken);
-                var media = await FFProbe.AnalyseAsync(inputPath, cancellationToken: args.CancellationToken);
-                if (media.Duration <= TimeSpan.Zero)
-                {
-                    throw new InvalidOperationException("FFprobe returned an invalid duration");
-                }
-
-                await ExtractAudioAsync(inputPath, audioPath, request.AudioCodec);
-                await storage.GetBlobContainerClient(workingContainer)
-                    .GetBlobClient(audioBlobName)
-                    .UploadAsync(audioPath, overwrite: true, args.CancellationToken);
-
-                var segments = await parallelizationStrategy.CreateSegmentsAsync(
-                    inputPath,
-                    media.Duration,
-                    request.SegmentDurationSeconds,
-                    args.CancellationToken);
-                if (segments.Count == 0)
-                    throw new InvalidOperationException("Parallelization strategy produced no segments");
-
-                var manifest = new VideoManifest(
-                    request.JobId, request.InputVideoUri, request.OutputVideoUri, workingContainer, audioBlobName, media.Duration,
-                    request.SegmentDurationSeconds, segments.Count, segments, request.VideoCodec,
-                    request.AudioCodec, request.Preset, request.Crf);
-                await WriteManifestAsync(manifest, args.CancellationToken);
-                await SubmitEncodingJobAsync(manifest, args.CancellationToken);
-                await args.CompleteMessageAsync(args.Message, args.CancellationToken);
-                logger.LogInformation(
-                    "Submitted {SegmentCount} encoding indexes for {JobId} using {ParallelizationStrategy}",
-                    segments.Count,
-                    request.JobId,
-                    parallelizationStrategy.Name);
+                throw new InvalidOperationException("FFprobe returned an invalid duration");
             }
-            finally
-            {
-                File.Delete(inputPath);
-                File.Delete(audioPath);
-            }
+
+            await ExtractAudioAsync(inputPath, audioPath, request.AudioCodec);
+
+            var segments = await parallelizationStrategy.CreateSegmentsAsync(
+                inputPath,
+                media.Duration,
+                request.SegmentDurationSeconds,
+                args.CancellationToken);
+            if (segments.Count == 0)
+                throw new InvalidOperationException("Parallelization strategy produced no segments");
+
+            var manifest = new VideoManifest(
+                request.JobId,
+                request.InputVideoUri,
+                request.OutputVideoUri,
+                workingContainer,
+                audioBlobName,
+                media.Duration,
+                request.SegmentDurationSeconds,
+                segments.Count,
+                segments,
+                request.VideoCodec,
+                request.AudioCodec,
+                request.Preset,
+                request.Crf);
+            await WriteManifestAsync(manifest, outputMountPath, args.CancellationToken);
+            await SubmitEncodingJobAsync(manifest, outputAccount, outputContainer, inputAccount, inputContainer, outputMountPath, inputMountPath, args.CancellationToken);
+            await args.CompleteMessageAsync(args.Message, args.CancellationToken);
+            logger.LogInformation(
+                "Submitted {SegmentCount} encoding indexes for {JobId} using {ParallelizationStrategy}",
+                segments.Count,
+                request.JobId,
+                parallelizationStrategy.Name);
         }
         catch (JsonException exception)
         {
@@ -98,9 +99,6 @@ public sealed class AnalysisWorker(
             await args.DeadLetterMessageAsync(args.Message, "InvalidMessage", exception.Message, args.CancellationToken);
         }
     }
-
-    private BlobClient CreateSourceClient(Uri sourceUri) =>
-        string.IsNullOrEmpty(sourceUri.Query) ? new BlobClient(sourceUri, credential) : new BlobClient(sourceUri);
 
     private static Task ExtractAudioAsync(string inputPath, string audioPath, string audioCodec) =>
         FFMpegArguments
@@ -115,15 +113,23 @@ public sealed class AnalysisWorker(
             })
             .ProcessAsynchronously();
 
-    private async Task WriteManifestAsync(VideoManifest manifest, CancellationToken cancellationToken)
+    private static async Task WriteManifestAsync(VideoManifest manifest, string outputMountPath, CancellationToken cancellationToken)
     {
-        var container = storage.GetBlobContainerClient(manifest.WorkingContainer);
-        var content = BinaryData.FromObjectAsJson(manifest);
-        await container.GetBlobClient($"{manifest.JobId}/manifest.json")
-            .UploadAsync(content, overwrite: true, cancellationToken);
+        var manifestPath = BlobMountPaths.FromBlobName($"{manifest.JobId}/manifest.json", outputMountPath);
+        Directory.CreateDirectory(Path.GetDirectoryName(manifestPath)!);
+        var content = JsonSerializer.SerializeToUtf8Bytes(manifest);
+        await File.WriteAllBytesAsync(manifestPath, content, cancellationToken);
     }
 
-    private async Task SubmitEncodingJobAsync(VideoManifest manifest, CancellationToken cancellationToken)
+    private async Task SubmitEncodingJobAsync(
+        VideoManifest manifest,
+        string outputAccount,
+        string outputContainer,
+        string inputAccount,
+        string inputContainer,
+        string outputMountPath,
+        string inputMountPath,
+        CancellationToken cancellationToken)
     {
         var jobName = JobNames.For("encode", manifest.JobId);
         var targetNamespace = configuration["Kubernetes:Namespace"] ?? "spotvideo";
@@ -147,10 +153,17 @@ public sealed class AnalysisWorker(
             Env("VIDEO_CODEC", manifest.VideoCodec),
             Env("PRESET", manifest.Preset),
             Env("CRF", manifest.Crf.ToString()),
-            Env("STORAGE_SERVICE_URI", configuration["Storage:ServiceUri"]!),
+            Env("INPUT_STORAGE_ACCOUNT_NAME", inputAccount),
+            Env("INPUT_STORAGE_CONTAINER", inputContainer),
+            Env("INPUT_MOUNT_PATH", inputMountPath),
+            Env("OUTPUT_STORAGE_ACCOUNT_NAME", outputAccount),
+            Env("OUTPUT_STORAGE_CONTAINER", outputContainer),
+            Env("OUTPUT_MOUNT_PATH", outputMountPath),
             Env("SERVICE_BUS_NAMESPACE", configuration["ServiceBus:Namespace"]!),
             Env("COMPLETION_QUEUE", configuration["ServiceBus:CompletionQueue"] ?? "segment-completed")
         };
+        var inputVolumeName = "input-storage";
+        var outputVolumeName = "output-storage";
         var labels = new Dictionary<string, string>
         {
             ["app.kubernetes.io/name"] = "spotvideo-encoder",
@@ -169,12 +182,22 @@ public sealed class AnalysisWorker(
                         Name = "encoder",
                         Image = configuration["Images:Encoder"] ?? throw new InvalidOperationException("Images:Encoder is required"),
                         Env = environment,
+                        VolumeMounts =
+                        [
+                            new V1VolumeMount { Name = inputVolumeName, MountPath = inputMountPath, ReadOnlyProperty = true },
+                            new V1VolumeMount { Name = outputVolumeName, MountPath = outputMountPath }
+                        ],
                         Resources = new V1ResourceRequirements
                         {
                             Requests = new Dictionary<string, ResourceQuantity> { ["cpu"] = new("2"), ["memory"] = new("4Gi") },
                             Limits = new Dictionary<string, ResourceQuantity> { ["cpu"] = new("4"), ["memory"] = new("8Gi") }
                         }
                     }
+                ],
+                Volumes =
+                [
+                    BlobFuseVolume(inputVolumeName, inputAccount, inputContainer, RequiredConfig("WorkloadIdentity:ClientId"), readOnly: true),
+                    BlobFuseVolume(outputVolumeName, outputAccount, outputContainer, RequiredConfig("WorkloadIdentity:ClientId"), readOnly: false)
                 ],
                 RestartPolicy = "Never",
                 ServiceAccountName = "spotvideo-worker",
@@ -200,6 +223,34 @@ public sealed class AnalysisWorker(
     }
 
     private static V1EnvVar Env(string name, string value) => new() { Name = name, Value = value };
+
+    private static V1Volume BlobFuseVolume(string name, string storageAccount, string containerName, string clientId, bool readOnly)
+    {
+        var mountOptions = readOnly
+            ? "--use-attr-cache=true --file-cache-timeout-in-seconds=300 --cancel-list-on-mount-seconds=10"
+            : "--use-attr-cache=true --file-cache-timeout-in-seconds=30 --disable-writeback-cache=true";
+        return new V1Volume
+        {
+            Name = name,
+            Csi = new V1CSIVolumeSource
+            {
+                Driver = "blob.csi.azure.com",
+                ReadOnlyProperty = readOnly,
+                VolumeAttributes = new Dictionary<string, string>
+                {
+                    ["protocol"] = "fuse2",
+                    ["storageAccount"] = storageAccount,
+                    ["containerName"] = containerName,
+                    ["AzureStorageAuthType"] = "MSI",
+                    ["AzureStorageIdentityClientID"] = clientId,
+                    ["mountOptions"] = mountOptions
+                }
+            }
+        };
+    }
+
+    private string RequiredConfig(string key) =>
+        configuration[key] ?? throw new InvalidOperationException($"{key} is required");
 
     private static bool IsNotFound(Exception exception) =>
         exception.ToString().Contains("404", StringComparison.Ordinal) ||

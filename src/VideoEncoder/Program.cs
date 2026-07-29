@@ -1,7 +1,7 @@
 using System.Security.Cryptography;
+using System.Text.Json;
 using Azure.Identity;
 using Azure.Messaging.ServiceBus;
-using Azure.Storage.Blobs;
 using FFMpegCore;
 using SpotVideo.Contracts;
 
@@ -15,21 +15,25 @@ var credential = new DefaultAzureCredential();
 var jobId = Required("JOB_ID");
 var index = int.Parse(Required("JOB_COMPLETION_INDEX"));
 var sourceUri = new Uri(Required("SOURCE_VIDEO_URI"));
-var inputPath = Path.Combine(Path.GetTempPath(), $"source-{jobId}");
-var outputPath = Path.Combine(Path.GetTempPath(), $"segment-{index:D6}.mp4");
-var source = string.IsNullOrEmpty(sourceUri.Query) ? new BlobClient(sourceUri, credential) : new BlobClient(sourceUri);
-await source.DownloadToAsync(inputPath);
-
-var storage = new BlobServiceClient(new Uri(Required("STORAGE_SERVICE_URI")), credential);
+var inputPath = BlobMountPaths.FromUri(
+    sourceUri,
+    Required("INPUT_STORAGE_ACCOUNT_NAME"),
+    Required("INPUT_STORAGE_CONTAINER"),
+    Required("INPUT_MOUNT_PATH"));
+var outputMountPath = Required("OUTPUT_MOUNT_PATH");
 var outputContainer = Required("OUTPUT_CONTAINER");
-var manifestBlob = storage.GetBlobContainerClient(outputContainer).GetBlobClient($"{jobId}/manifest.json");
-var manifest = (await manifestBlob.DownloadContentAsync()).Value.Content.ToObjectFromJson<VideoManifest>()
+var manifestPath = BlobMountPaths.FromBlobName($"{jobId}/manifest.json", outputMountPath);
+await using var manifestStream = File.OpenRead(manifestPath);
+var manifest = await JsonSerializer.DeserializeAsync<VideoManifest>(manifestStream)
     ?? throw new InvalidOperationException("Manifest payload is empty");
 var segmentCount = manifest.SegmentCount;
 if (index < 0 || index >= segmentCount)
     throw new InvalidOperationException($"Completion index {index} is outside segment count {segmentCount}");
 var segment = manifest.Segments.SingleOrDefault(item => item.Index == index)
     ?? throw new InvalidOperationException($"Segment definition for index {index} was not found");
+var blobName = $"{jobId}/segments/{index:D6}.mp4";
+var outputPath = BlobMountPaths.FromBlobName(blobName, outputMountPath);
+Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
 
 var start = TimeSpan.FromSeconds(segment.StartSeconds);
 await FFMpegArguments
@@ -40,9 +44,6 @@ await FFMpegArguments
         .WithCustomArgument($"-an -preset {Required("PRESET")} -crf {Required("CRF")} -movflags +faststart -avoid_negative_ts make_zero"))
     .ProcessAsynchronously();
 
-var blobName = $"{jobId}/segments/{index:D6}.mp4";
-var outputBlob = storage.GetBlobContainerClient(outputContainer).GetBlobClient(blobName);
-await outputBlob.UploadAsync(outputPath, overwrite: true);
 var fileInfo = new FileInfo(outputPath);
 await using var stream = File.OpenRead(outputPath);
 var hash = Convert.ToHexString(await SHA256.HashDataAsync(stream)).ToLowerInvariant();

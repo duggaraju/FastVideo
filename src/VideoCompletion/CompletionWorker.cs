@@ -115,12 +115,16 @@ public sealed class CompletionWorker(
             Env("OUTPUT_CONTAINER", completion.WorkingContainer),
             Env("AUDIO_BLOB_NAME", completion.AudioBlobName),
             Env("OUTPUT_VIDEO_URI", completion.OutputVideoUri.ToString()),
-            Env("STORAGE_SERVICE_URI", configuration["Storage:ServiceUri"]!),
             Env("TABLE_SERVICE_URI", configuration["Storage:TableServiceUri"]!),
             Env("STATE_TABLE", configuration["Storage:StateTable"] ?? "encodingstate"),
+            Env("OUTPUT_STORAGE_ACCOUNT_NAME", RequiredConfig("Storage:OutputAccountName")),
+            Env("OUTPUT_STORAGE_CONTAINER", RequiredConfig("Storage:OutputContainer")),
+            Env("OUTPUT_MOUNT_PATH", configuration["Storage:OutputMountPath"] ?? "/mnt/output"),
             Env("SERVICE_BUS_NAMESPACE", configuration["ServiceBus:Namespace"]!),
             Env("STITCHED_QUEUE", configuration["ServiceBus:StitchedQueue"] ?? "video-stitched")
         };
+        var outputVolumeName = "output-storage";
+        var outputMountPath = configuration["Storage:OutputMountPath"] ?? "/mnt/output";
         var pod = new V1PodTemplateSpec
         {
             Metadata = new V1ObjectMeta { Labels = labels },
@@ -133,6 +137,7 @@ public sealed class CompletionWorker(
                         Name = "stitcher",
                         Image = configuration["Images:Stitcher"] ?? throw new InvalidOperationException("Images:Stitcher is required"),
                         Env = environment,
+                        VolumeMounts = [new V1VolumeMount { Name = outputVolumeName, MountPath = outputMountPath }],
                         Resources = new V1ResourceRequirements
                         {
                             Requests = new Dictionary<string, ResourceQuantity> { ["cpu"] = new("1"), ["memory"] = new("2Gi") },
@@ -140,10 +145,18 @@ public sealed class CompletionWorker(
                         }
                     }
                 ],
+                Volumes =
+                [
+                    BlobFuseVolume(
+                        outputVolumeName,
+                        RequiredConfig("Storage:OutputAccountName"),
+                        RequiredConfig("Storage:OutputContainer"),
+                        RequiredConfig("WorkloadIdentity:ClientId"),
+                        readOnly: false)
+                ],
                 RestartPolicy = "Never",
                 ServiceAccountName = "spotvideo-worker",
-                Tolerations = [new V1Toleration { Effect = "NoSchedule", OperatorProperty = "Equal", Key = "kubernetes.azure.com/scalesetpriority", Value = "spot" }],
-                NodeSelector = new Dictionary<string, string> { ["kubernetes.azure.com/scalesetpriority"] = "spot" },
+                NodeSelector = new Dictionary<string, string> { ["kubernetes.azure.com/mode"] = "system", ["kubernetes.io/os"] = "linux" },
                 TerminationGracePeriodSeconds = 120
             }
         };
@@ -157,6 +170,29 @@ public sealed class CompletionWorker(
     }
 
     private static V1EnvVar Env(string name, string value) => new() { Name = name, Value = value };
+
+    private static V1Volume BlobFuseVolume(string name, string storageAccount, string containerName, string clientId, bool readOnly) =>
+        new()
+        {
+            Name = name,
+            Csi = new V1CSIVolumeSource
+            {
+                Driver = "blob.csi.azure.com",
+                ReadOnlyProperty = readOnly,
+                VolumeAttributes = new Dictionary<string, string>
+                {
+                    ["protocol"] = "fuse2",
+                    ["storageAccount"] = storageAccount,
+                    ["containerName"] = containerName,
+                    ["AzureStorageAuthType"] = "MSI",
+                    ["AzureStorageIdentityClientID"] = clientId,
+                    ["mountOptions"] = "--use-attr-cache=true --file-cache-timeout-in-seconds=30 --disable-writeback-cache=true"
+                }
+            }
+        };
+
+    private string RequiredConfig(string key) =>
+        configuration[key] ?? throw new InvalidOperationException($"{key} is required");
 
     private static bool IsNotFound(Exception exception) =>
         exception.ToString().Contains("404", StringComparison.Ordinal) ||
