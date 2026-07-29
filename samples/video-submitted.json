@@ -1,10 +1,10 @@
 {
   "jobId": "video-20260729-001",
-  "sourceBlobUri": "https://replace.blob.core.windows.net/videos/input/source.mp4",
-  "outputContainer": "videos",
+  "inputVideoUri": "https://replace.blob.core.windows.net/videos/input/source.mp4",
+  "outputVideoUri": "https://replace-output.blob.core.windows.net/rendered/video-20260729-001.mp4",
   "segmentDurationSeconds": 60,
   "videoCodec": "libx264",
-  "audioCodec": "aac",
+  "audioCodec": "copy",
   "preset": "medium",
   "crf": 23
 }

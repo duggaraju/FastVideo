@@ -3,7 +3,8 @@
     <OutputType>Exe</OutputType>
   </PropertyGroup>
   <ItemGroup>
-    <ProjectReference Include="../SpotVideo.Contracts/SpotVideo.Contracts.csproj" />
+    <ProjectReference Include="../VideoContracts/VideoContracts.csproj" />
+    <PackageReference Include="Azure.Data.Tables" />
     <PackageReference Include="Azure.Identity" />
     <PackageReference Include="Azure.Messaging.ServiceBus" />
     <PackageReference Include="Azure.Storage.Blobs" />

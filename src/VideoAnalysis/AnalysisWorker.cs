@@ -15,6 +15,7 @@ public sealed class AnalysisWorker(
     BlobServiceClient storage,
     TokenCredential credential,
     IKubernetes kubernetes,
+    IParallelizationStrategy parallelizationStrategy,
     IConfiguration configuration,
     ILogger<AnalysisWorker> logger) : BackgroundService
 {
@@ -42,30 +43,50 @@ public sealed class AnalysisWorker(
             var request = args.Message.Body.ToObjectFromJson<VideoSubmitted>()
                 ?? throw new InvalidOperationException("Message body is empty");
             Validate(request);
+            var workingContainer = configuration["Storage:WorkingContainer"] ?? "videos";
+            var audioBlobName = $"{request.JobId}/audio.m4a";
 
             var inputPath = Path.Combine(Path.GetTempPath(), $"{request.JobId}-source");
+            var audioPath = Path.Combine(Path.GetTempPath(), $"{request.JobId}-audio.m4a");
             try
             {
-                await CreateSourceClient(request.SourceBlobUri).DownloadToAsync(inputPath, args.CancellationToken);
+                await CreateSourceClient(request.InputVideoUri).DownloadToAsync(inputPath, args.CancellationToken);
                 var media = await FFProbe.AnalyseAsync(inputPath, cancellationToken: args.CancellationToken);
                 if (media.Duration <= TimeSpan.Zero)
                 {
                     throw new InvalidOperationException("FFprobe returned an invalid duration");
                 }
 
-                var segmentCount = checked((int)Math.Ceiling(media.Duration.TotalSeconds / request.SegmentDurationSeconds));
+                await ExtractAudioAsync(inputPath, audioPath, request.AudioCodec);
+                await storage.GetBlobContainerClient(workingContainer)
+                    .GetBlobClient(audioBlobName)
+                    .UploadAsync(audioPath, overwrite: true, args.CancellationToken);
+
+                var segments = await parallelizationStrategy.CreateSegmentsAsync(
+                    inputPath,
+                    media.Duration,
+                    request.SegmentDurationSeconds,
+                    args.CancellationToken);
+                if (segments.Count == 0)
+                    throw new InvalidOperationException("Parallelization strategy produced no segments");
+
                 var manifest = new VideoManifest(
-                    request.JobId, request.SourceBlobUri, request.OutputContainer, media.Duration,
-                    request.SegmentDurationSeconds, segmentCount, request.VideoCodec,
+                    request.JobId, request.InputVideoUri, request.OutputVideoUri, workingContainer, audioBlobName, media.Duration,
+                    request.SegmentDurationSeconds, segments.Count, segments, request.VideoCodec,
                     request.AudioCodec, request.Preset, request.Crf);
                 await WriteManifestAsync(manifest, args.CancellationToken);
                 await SubmitEncodingJobAsync(manifest, args.CancellationToken);
                 await args.CompleteMessageAsync(args.Message, args.CancellationToken);
-                logger.LogInformation("Submitted {SegmentCount} encoding indexes for {JobId}", segmentCount, request.JobId);
+                logger.LogInformation(
+                    "Submitted {SegmentCount} encoding indexes for {JobId} using {ParallelizationStrategy}",
+                    segments.Count,
+                    request.JobId,
+                    parallelizationStrategy.Name);
             }
             finally
             {
                 File.Delete(inputPath);
+                File.Delete(audioPath);
             }
         }
         catch (JsonException exception)
@@ -81,9 +102,22 @@ public sealed class AnalysisWorker(
     private BlobClient CreateSourceClient(Uri sourceUri) =>
         string.IsNullOrEmpty(sourceUri.Query) ? new BlobClient(sourceUri, credential) : new BlobClient(sourceUri);
 
+    private static Task ExtractAudioAsync(string inputPath, string audioPath, string audioCodec) =>
+        FFMpegArguments
+            .FromFileInput(inputPath)
+            .OutputToFile(audioPath, true, options =>
+            {
+                options.WithCustomArgument("-map 0:a:0 -vn -sn -dn");
+                if (string.Equals(audioCodec, "copy", StringComparison.OrdinalIgnoreCase))
+                    options.WithCustomArgument("-c:a copy");
+                else
+                    options.WithAudioCodec(audioCodec);
+            })
+            .ProcessAsynchronously();
+
     private async Task WriteManifestAsync(VideoManifest manifest, CancellationToken cancellationToken)
     {
-        var container = storage.GetBlobContainerClient(manifest.OutputContainer);
+        var container = storage.GetBlobContainerClient(manifest.WorkingContainer);
         var content = BinaryData.FromObjectAsJson(manifest);
         await container.GetBlobClient($"{manifest.JobId}/manifest.json")
             .UploadAsync(content, overwrite: true, cancellationToken);
@@ -106,12 +140,11 @@ public sealed class AnalysisWorker(
         {
             new() { Name = "JOB_COMPLETION_INDEX", ValueFrom = new V1EnvVarSource { FieldRef = new V1ObjectFieldSelector { FieldPath = "metadata.annotations['batch.kubernetes.io/job-completion-index']" } } },
             Env("JOB_ID", manifest.JobId),
-            Env("SOURCE_BLOB_URI", manifest.SourceBlobUri.ToString()),
-            Env("OUTPUT_CONTAINER", manifest.OutputContainer),
-            Env("SEGMENT_DURATION_SECONDS", manifest.SegmentDurationSeconds.ToString()),
-            Env("SEGMENT_COUNT", manifest.SegmentCount.ToString()),
+            Env("SOURCE_VIDEO_URI", manifest.InputVideoUri.ToString()),
+            Env("OUTPUT_CONTAINER", manifest.WorkingContainer),
+            Env("AUDIO_BLOB_NAME", manifest.AudioBlobName),
+            Env("OUTPUT_VIDEO_URI", manifest.OutputVideoUri.ToString()),
             Env("VIDEO_CODEC", manifest.VideoCodec),
-            Env("AUDIO_CODEC", manifest.AudioCodec),
             Env("PRESET", manifest.Preset),
             Env("CRF", manifest.Crf.ToString()),
             Env("STORAGE_SERVICE_URI", configuration["Storage:ServiceUri"]!),
@@ -176,12 +209,16 @@ public sealed class AnalysisWorker(
     {
         if (string.IsNullOrWhiteSpace(request.JobId) || request.JobId.Length > 128)
             throw new ArgumentException("JobId must contain 1-128 characters");
-        if (request.SourceBlobUri.Scheme != Uri.UriSchemeHttps)
-            throw new ArgumentException("SourceBlobUri must use HTTPS");
+        if (request.InputVideoUri.Scheme != Uri.UriSchemeHttps)
+            throw new ArgumentException("InputVideoUri must use HTTPS");
+        if (request.OutputVideoUri.Scheme != Uri.UriSchemeHttps)
+            throw new ArgumentException("OutputVideoUri must use HTTPS");
         if (request.SegmentDurationSeconds is < 5 or > 3600)
             throw new ArgumentException("SegmentDurationSeconds must be between 5 and 3600");
         if (request.Crf is < 0 or > 51)
             throw new ArgumentException("Crf must be between 0 and 51");
+        if (string.IsNullOrWhiteSpace(request.AudioCodec))
+            throw new ArgumentException("AudioCodec is required");
     }
 
     public override async Task StopAsync(CancellationToken cancellationToken)

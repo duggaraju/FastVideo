@@ -48,10 +48,12 @@ data:
   Storage__ServiceUri: "__STORAGE_SERVICE_URI__"
   Storage__TableServiceUri: "__TABLE_SERVICE_URI__"
   Storage__StateTable: "encodingstate"
+  Storage__WorkingContainer: "videos"
   Kubernetes__Namespace: "spotvideo"
   Images__Encoder: "__ACR_LOGIN_SERVER__/spotvideo-encoder:__IMAGE_TAG__"
   Images__Stitcher: "__ACR_LOGIN_SERVER__/spotvideo-stitcher:__IMAGE_TAG__"
   Encoding__MaxParallelism: "32"
+  Encoding__ParallelizationStrategy: "fixed-duration"
 ---
 apiVersion: apps/v1
 kind: Deployment

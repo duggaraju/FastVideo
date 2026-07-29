@@ -25,7 +25,7 @@ $acrName = $deployment.acrName.value
 $acrLoginServer = $deployment.acrLoginServer.value
 $projects = @("Analysis", "Completion", "Encoder", "Stitcher")
 foreach ($project in $projects) {
-    $projectName = "SpotVideo.$project"
+    $projectName = "Video$project"
     $imageName = "spotvideo-$($project.ToLowerInvariant())"
     az acr build `
         --registry $acrName `

@@ -62,8 +62,10 @@ public sealed class CompletionWorker(
         {
             ["SegmentIndex"] = completion.SegmentIndex,
             ["SegmentCount"] = completion.SegmentCount,
-            ["OutputContainer"] = completion.OutputContainer,
+            ["WorkingContainer"] = completion.WorkingContainer,
             ["BlobName"] = completion.BlobName,
+            ["AudioBlobName"] = completion.AudioBlobName,
+            ["OutputVideoUri"] = completion.OutputVideoUri.ToString(),
             ["Length"] = completion.Length,
             ["Sha256"] = completion.Sha256,
             ["CompletedAt"] = completion.CompletedAt
@@ -110,7 +112,9 @@ public sealed class CompletionWorker(
         {
             Env("JOB_ID", completion.JobId),
             Env("SEGMENT_COUNT", completion.SegmentCount.ToString()),
-            Env("OUTPUT_CONTAINER", completion.OutputContainer),
+            Env("OUTPUT_CONTAINER", completion.WorkingContainer),
+            Env("AUDIO_BLOB_NAME", completion.AudioBlobName),
+            Env("OUTPUT_VIDEO_URI", completion.OutputVideoUri.ToString()),
             Env("STORAGE_SERVICE_URI", configuration["Storage:ServiceUri"]!),
             Env("TABLE_SERVICE_URI", configuration["Storage:TableServiceUri"]!),
             Env("STATE_TABLE", configuration["Storage:StateTable"] ?? "encodingstate"),
@@ -164,10 +168,14 @@ public sealed class CompletionWorker(
             throw new ArgumentException("JobId is required");
         if (completion.SegmentCount <= 0 || completion.SegmentIndex < 0 || completion.SegmentIndex >= completion.SegmentCount)
             throw new ArgumentException("Segment index/count is invalid");
-        if (string.IsNullOrWhiteSpace(completion.OutputContainer))
-            throw new ArgumentException("OutputContainer is required");
+        if (string.IsNullOrWhiteSpace(completion.WorkingContainer))
+            throw new ArgumentException("WorkingContainer is required");
         if (string.IsNullOrWhiteSpace(completion.BlobName))
             throw new ArgumentException("BlobName is required");
+        if (string.IsNullOrWhiteSpace(completion.AudioBlobName))
+            throw new ArgumentException("AudioBlobName is required");
+        if (completion.OutputVideoUri.Scheme != Uri.UriSchemeHttps)
+            throw new ArgumentException("OutputVideoUri must use HTTPS");
     }
 
     public override async Task StopAsync(CancellationToken cancellationToken)

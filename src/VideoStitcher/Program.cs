@@ -15,6 +15,8 @@ var credential = new DefaultAzureCredential();
 var jobId = Required("JOB_ID");
 var segmentCount = int.Parse(Required("SEGMENT_COUNT"));
 var outputContainer = Required("OUTPUT_CONTAINER");
+var audioBlobName = Required("AUDIO_BLOB_NAME");
+var outputVideoUri = new Uri(Required("OUTPUT_VIDEO_URI"));
 var state = new TableClient(new Uri(Required("TABLE_SERVICE_URI")), Required("STATE_TABLE"), credential);
 var filter = TableClient.CreateQueryFilter($"PartitionKey eq {jobId} and RowKey ge {"segment-"} and RowKey lt {"segment."}");
 var segments = new List<(int Index, string BlobName)>();
@@ -36,15 +38,27 @@ try
         paths.Add(path);
     }
 
+    var stitchedVideoPath = Path.Combine(workingDirectory.FullName, "stitched-video.mp4");
+    await Task.Run(() => FFMpeg.Join(stitchedVideoPath, paths.ToArray()));
+    var audioPath = Path.Combine(workingDirectory.FullName, "audio.m4a");
+    await container.GetBlobClient(audioBlobName).DownloadToAsync(audioPath);
+
     var outputPath = Path.Combine(workingDirectory.FullName, "complete.mp4");
-    await Task.Run(() => FFMpeg.Join(outputPath, paths.ToArray()));
-    var finalBlobName = $"{jobId}/complete.mp4";
-    await container.GetBlobClient(finalBlobName).UploadAsync(outputPath, overwrite: true);
+    await FFMpegArguments
+        .FromFileInput(stitchedVideoPath)
+        .AddFileInput(audioPath)
+        .OutputToFile(outputPath, true, options => options.WithCustomArgument("-map 0:v:0 -map 1:a:0 -c:v copy -c:a copy -shortest -movflags +faststart"))
+        .ProcessAsynchronously();
+
+    var finalBlob = string.IsNullOrEmpty(outputVideoUri.Query)
+        ? new BlobClient(outputVideoUri, credential)
+        : new BlobClient(outputVideoUri);
+    await finalBlob.UploadAsync(outputPath, overwrite: true);
     var length = new FileInfo(outputPath).Length;
 
     await using var serviceBus = new ServiceBusClient(Required("SERVICE_BUS_NAMESPACE"), credential);
     await using var sender = serviceBus.CreateSender(Required("STITCHED_QUEUE"));
-    var completed = new VideoStitched(jobId, finalBlobName, length, DateTimeOffset.UtcNow);
+    var completed = new VideoStitched(jobId, outputVideoUri, length, DateTimeOffset.UtcNow);
     var message = new ServiceBusMessage(BinaryData.FromObjectAsJson(completed))
     {
         MessageId = $"{jobId}:stitched",
