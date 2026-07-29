@@ -4,16 +4,19 @@ targetScope = 'resourceGroup'
 @maxLength(12)
 param prefix string = 'spotvideo'
 param location string = resourceGroup().location
-param systemVmSize string = 'Standard_D4s_v5'
+param systemVmSize string = 'Standard_D2s_v5'
 param spotVmSize string = 'Standard_D8s_v5'
 param spotMinCount int = 0
 param spotMaxCount int = 20
 param kubernetesVersion string = ''
+param inputContainerName string = 'input'
+param outputContainerName string = 'videos'
 
 var suffix = uniqueString(subscription().subscriptionId, resourceGroup().id)
 var compactPrefix = replace(toLower(prefix), '-', '')
 var aksName = '${prefix}-aks-${suffix}'
-var storageName = take('${compactPrefix}${suffix}', 24)
+var inputStorageName = take('${compactPrefix}in${suffix}', 24)
+var outputStorageName = take('${compactPrefix}out${suffix}', 24)
 var acrName = take('${compactPrefix}acr${suffix}', 50)
 var serviceBusName = take('${prefix}-sb-${suffix}', 50)
 var workloadIdentityName = '${prefix}-workload-${suffix}'
@@ -29,8 +32,8 @@ resource acr 'Microsoft.ContainerRegistry/registries@2025-04-01' = {
   }
 }
 
-resource storage 'Microsoft.Storage/storageAccounts@2025-01-01' = {
-  name: storageName
+resource inputStorage 'Microsoft.Storage/storageAccounts@2025-01-01' = {
+  name: inputStorageName
   location: location
   kind: 'StorageV2'
   sku: { name: 'Standard_ZRS' }
@@ -42,8 +45,21 @@ resource storage 'Microsoft.Storage/storageAccounts@2025-01-01' = {
   }
 }
 
-resource blobService 'Microsoft.Storage/storageAccounts/blobServices@2025-01-01' = {
-  parent: storage
+resource outputStorage 'Microsoft.Storage/storageAccounts@2025-01-01' = {
+  name: outputStorageName
+  location: location
+  kind: 'StorageV2'
+  sku: { name: 'Standard_ZRS' }
+  properties: {
+    allowBlobPublicAccess: false
+    allowSharedKeyAccess: false
+    minimumTlsVersion: 'TLS1_2'
+    supportsHttpsTrafficOnly: true
+  }
+}
+
+resource inputBlobService 'Microsoft.Storage/storageAccounts/blobServices@2025-01-01' = {
+  parent: inputStorage
   name: 'default'
   properties: {
     deleteRetentionPolicy: { enabled: true, days: 7 }
@@ -51,14 +67,29 @@ resource blobService 'Microsoft.Storage/storageAccounts/blobServices@2025-01-01'
   }
 }
 
-resource videos 'Microsoft.Storage/storageAccounts/blobServices/containers@2025-01-01' = {
-  parent: blobService
-  name: 'videos'
+resource outputBlobService 'Microsoft.Storage/storageAccounts/blobServices@2025-01-01' = {
+  parent: outputStorage
+  name: 'default'
+  properties: {
+    deleteRetentionPolicy: { enabled: true, days: 7 }
+    containerDeleteRetentionPolicy: { enabled: true, days: 7 }
+  }
+}
+
+resource inputContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2025-01-01' = {
+  parent: inputBlobService
+  name: inputContainerName
+  properties: { publicAccess: 'None' }
+}
+
+resource outputContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2025-01-01' = {
+  parent: outputBlobService
+  name: outputContainerName
   properties: { publicAccess: 'None' }
 }
 
 resource tableService 'Microsoft.Storage/storageAccounts/tableServices@2025-01-01' = {
-  parent: storage
+  parent: outputStorage
   name: 'default'
 }
 
@@ -136,6 +167,7 @@ resource aks 'Microsoft.ContainerService/managedClusters@2025-05-01' = {
     oidcIssuerProfile: { enabled: true }
     securityProfile: { workloadIdentity: { enabled: true } }
     workloadAutoScalerProfile: { keda: { enabled: true } }
+    storageProfile: { blobCSIDriver: { enabled: true } }
     agentPoolProfiles: [
       {
         name: 'systempool'
@@ -189,9 +221,19 @@ resource federation 'Microsoft.ManagedIdentity/userAssignedIdentities/federatedI
   }
 }
 
-resource blobContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(storage.id, workloadIdentity.id, 'blob-contributor')
-  scope: storage
+resource inputBlobContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(inputStorage.id, workloadIdentity.id, 'blob-contributor')
+  scope: inputStorage
+  properties: {
+    principalId: workloadIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
+  }
+}
+
+resource outputBlobContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(outputStorage.id, workloadIdentity.id, 'blob-contributor')
+  scope: outputStorage
   properties: {
     principalId: workloadIdentity.properties.principalId
     principalType: 'ServicePrincipal'
@@ -200,8 +242,8 @@ resource blobContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = 
 }
 
 resource tableContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(storage.id, workloadIdentity.id, 'table-contributor')
-  scope: storage
+  name: guid(outputStorage.id, workloadIdentity.id, 'table-contributor')
+  scope: outputStorage
   properties: {
     principalId: workloadIdentity.properties.principalId
     principalType: 'ServicePrincipal'
@@ -242,8 +284,12 @@ resource acrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
 output aksName string = aks.name
 output acrName string = acr.name
 output acrLoginServer string = acr.properties.loginServer
-output storageName string = storage.name
-output storageServiceUri string = 'https://${storage.name}.blob.${environment().suffixes.storage}'
-output tableServiceUri string = 'https://${storage.name}.table.${environment().suffixes.storage}'
+output inputStorageName string = inputStorage.name
+output inputContainerName string = inputContainer.name
+output inputStorageServiceUri string = 'https://${inputStorage.name}.blob.${environment().suffixes.storage}'
+output outputStorageName string = outputStorage.name
+output outputContainerName string = outputContainer.name
+output outputStorageServiceUri string = 'https://${outputStorage.name}.blob.${environment().suffixes.storage}'
+output tableServiceUri string = 'https://${outputStorage.name}.table.${environment().suffixes.storage}'
 output serviceBusNamespace string = replace(replace(serviceBus.properties.serviceBusEndpoint, 'https://', ''), ':443/', '')
 output workloadClientId string = workloadIdentity.properties.clientId

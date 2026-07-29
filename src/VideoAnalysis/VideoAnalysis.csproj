@@ -1,12 +1,13 @@
-<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk.Worker">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
   </PropertyGroup>
   <ItemGroup>
-    <ProjectReference Include="../SpotVideo.Contracts/SpotVideo.Contracts.csproj" />
+    <ProjectReference Include="../VideoContracts/VideoContracts.csproj" />
     <PackageReference Include="Azure.Identity" />
     <PackageReference Include="Azure.Messaging.ServiceBus" />
-    <PackageReference Include="Azure.Storage.Blobs" />
     <PackageReference Include="FFMpegCore" />
+    <PackageReference Include="KubernetesClient" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" />
   </ItemGroup>
 </Project>

@@ -1,9 +1,9 @@
 <Solution>
   <Folder Name="/src/">
-    <Project Path="src/SpotVideo.Analysis/SpotVideo.Analysis.csproj" />
-    <Project Path="src/SpotVideo.Completion/SpotVideo.Completion.csproj" />
-    <Project Path="src/SpotVideo.Encoder/SpotVideo.Encoder.csproj" />
-    <Project Path="src/SpotVideo.Contracts/SpotVideo.Contracts.csproj" />
-    <Project Path="src/SpotVideo.Stitcher/SpotVideo.Stitcher.csproj" />
+    <Project Path="src/VideoAnalysis/VideoAnalysis.csproj" />
+    <Project Path="src/VideoCompletion/VideoCompletion.csproj" />
+    <Project Path="src/VideoEncoder/VideoEncoder.csproj" />
+    <Project Path="src/VideoContracts/VideoContracts.csproj" />
+    <Project Path="src/VideoStitcher/VideoStitcher.csproj" />
   </Folder>
 </Solution>

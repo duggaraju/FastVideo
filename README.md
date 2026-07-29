@@ -5,10 +5,10 @@ SpotVideo is a .NET 10 and FFmpeg pipeline for horizontally parallel video encod
 ## Workflow
 
 1. KEDA scales `SpotVideo.Analysis` from the `video-submitted` Service Bus queue.
-2. The service downloads the source blob, probes it with FFMpegCore/FFprobe, writes a manifest, and creates a Kubernetes Indexed Job.
-3. Every `SpotVideo.Encoder` index downloads the source, encodes its deterministic time range, uploads one MP4 segment, and sends a `SegmentEncoded` event.
+2. The service downloads the input video URL, probes it with FFMpegCore/FFprobe, extracts one audio track (copy or optional re-encode), computes segment boundaries using the configured parallelization strategy, writes a manifest, and creates a Kubernetes Indexed Job.
+3. Every `SpotVideo.Encoder` index downloads the source, encodes only its deterministic video time range (no audio), uploads one MP4 segment, and sends a `SegmentEncoded` event.
 4. KEDA scales `SpotVideo.Completion` from the `segment-completed` queue. It records one Azure Table row per segment.
-5. Once all unique rows exist, it creates a deterministic stitch Job. `SpotVideo.Stitcher` downloads the ordered segments, joins them through FFMpegCore, uploads `complete.mp4`, and sends `VideoStitched`.
+5. Once all unique rows exist, it creates a deterministic stitch Job. `SpotVideo.Stitcher` stitches the ordered segments from mounted Blob storage, muxes with the single extracted audio file, writes to the requested output video URL path, and sends `VideoStitched`.
 
 Indexed encode and stitch Jobs tolerate Spot eviction: Kubernetes retries failed pods, blob names are deterministic, Service Bus duplicate detection is enabled, and repeated completion messages overwrite no state.
 
@@ -44,13 +44,13 @@ dotnet build SpotVideo.slnx --no-restore --configuration Release
 ./scripts/deploy.ps1 -ResourceGroup rg-spotvideo -Location eastus
 ```
 
-The script deploys [infra/main.bicep](infra/main.bicep), builds four images with ACR Tasks, renders [deploy/k8s/spotvideo.yaml](deploy/k8s/spotvideo.yaml), and applies it. The AKS system pool hosts the listeners and KEDA. A dedicated autoscaling Spot pool, tainted `NoSchedule`, hosts only encode and stitch Jobs.
+The script deploys [infra/main.bicep](infra/main.bicep), builds four images with ACR Tasks, renders [deploy/k8s/spotvideo.yaml](deploy/k8s/spotvideo.yaml), and applies it. The AKS system pool (small regular VMs) hosts analysis, completion, and stitch jobs. A dedicated autoscaling Spot pool, tainted `NoSchedule`, hosts only encode Jobs.
 
 Azure RBAC can take several minutes to propagate after first deployment. If the first pods report authorization failures, restart them after propagation.
 
 ## Submit Work
 
-Send the JSON shape in [samples/video-submitted.json](samples/video-submitted.json) to the `video-submitted` queue. Set the Service Bus message ID to the job ID. `sourceBlobUri` must be HTTPS and can be either a blob URL accessible to the workload identity or a short-lived SAS URL.
+Send the JSON shape in [samples/video-submitted.json](samples/video-submitted.json) to the `video-submitted` queue. Set the Service Bus message ID to the job ID. `inputVideoUri` and `outputVideoUri` must be HTTPS blob URLs. They can target different storage accounts, and should match the input/output BlobFuse mounts configured in deployment.
 
 Job IDs must be unique for distinct work. Reusing a job ID deliberately resumes or deduplicates that workflow because Kubernetes Job names and output paths derive from it.
 
@@ -58,10 +58,21 @@ The default output is:
 
 ```text
 videos/{jobId}/manifest.json
+videos/{jobId}/audio.m4a
 videos/{jobId}/segments/000000.mp4
 videos/{jobId}/segments/000001.mp4
-videos/{jobId}/complete.mp4
+(final file is written to outputVideoUri)
 ```
+
+## BlobFuse mounts
+
+- Input storage is mounted read-only at `/mnt/input` for analysis and encoder read throughput.
+- Output storage is mounted read-write at `/mnt/output` for manifest/audio/segment/final artifact writes.
+- This avoids large local downloads on node OS disks and keeps media I/O on Blob storage paths.
+
+Parallelization strategy is configured through `Encoding__ParallelizationStrategy`:
+- `fixed-duration` (default): split by `segmentDurationSeconds`
+- `keyframe-boundary`: split near target duration but align boundaries to video keyframes
 
 ## Production Notes
 
