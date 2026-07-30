@@ -7,7 +7,8 @@ param(
     [string] $Location,
 
     [string] $Prefix = "spotvideo",
-    [string] $ImageTag = (Get-Date -Format "yyyyMMddHHmmss")
+    [string] $ImageTag = "latest",
+    [switch] $UseLocalDocker
 )
 
 $ErrorActionPreference = "Stop"
@@ -27,13 +28,25 @@ $projects = @("Analysis", "Completion", "Encoder", "Stitcher")
 foreach ($project in $projects) {
     $projectName = "SpotVideo.$project"
     $imageName = "spotvideo-$($project.ToLowerInvariant())"
-    az acr build `
-        --registry $acrName `
-        --image "${imageName}:${ImageTag}" `
-        --file (Join-Path $root "docker/Dockerfile") `
-        --build-arg "PROJECT=$projectName" `
-        --build-arg "APP_DLL=$projectName.dll" `
-        $root
+    $fullImage = "${acrLoginServer}/${imageName}:${ImageTag}"
+    if ($UseLocalDocker) {
+        docker build `
+            --file (Join-Path $root "docker/Dockerfile") `
+            --build-arg "PROJECT=$projectName" `
+            --build-arg "APP_DLL=$projectName.dll" `
+            --tag $fullImage `
+            $root
+        az acr login --name $acrName
+        docker push $fullImage
+    } else {
+        az acr build `
+            --registry $acrName `
+            --image "${imageName}:${ImageTag}" `
+            --file (Join-Path $root "docker/Dockerfile") `
+            --build-arg "PROJECT=$projectName" `
+            --build-arg "APP_DLL=$projectName.dll" `
+            $root
+    }
 }
 
 az aks get-credentials `
@@ -58,7 +71,7 @@ foreach ($replacement in $replacements.GetEnumerator()) {
 }
 
 $renderedManifest = Join-Path $root "deploy/rendered.yaml"
-Set-Content -Path $renderedManifest -Value $manifest -Encoding utf8NoBOM
+Set-Content -Path $renderedManifest -Value $manifest -Encoding UTF8
 kubectl apply --filename $renderedManifest
 
 Write-Host "Deployed SpotVideo to $($deployment.aksName.value) with image tag $ImageTag"

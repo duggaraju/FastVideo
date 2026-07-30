@@ -28,6 +28,7 @@ Indexed encode and stitch Jobs tolerate Spot eviction: Kubernetes retries failed
 - Azure CLI with the Bicep extension
 - `kubectl`
 - An Azure subscription where the deployer can create AKS, role assignments, ACR, Storage, Service Bus, and managed identities
+- Permission to write Azure role assignments on the target scope (for example, Owner or User Access Administrator)
 
 The runtime containers install FFmpeg on Ubuntu and run as the non-root `app` user. Azure access uses AKS Workload Identity; no connection strings or account keys are deployed.
 
