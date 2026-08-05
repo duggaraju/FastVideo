@@ -35,14 +35,40 @@ var blobName = $"{jobId}/segments/{index:D6}.mp4";
 var outputPath = BlobMountPaths.FromBlobName(blobName, outputMountPath);
 Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
 
-var start = TimeSpan.FromSeconds(segment.StartSeconds);
-await FFMpegArguments
-    .FromFileInput(inputPath, false, options => options.Seek(start))
-    .OutputToFile(outputPath, true, options => options
-        .WithDuration(TimeSpan.FromSeconds(segment.DurationSeconds))
-        .WithVideoCodec(Required("VIDEO_CODEC"))
-        .WithCustomArgument($"-an -preset {Required("PRESET")} -crf {Required("CRF")} -movflags +faststart -avoid_negative_ts make_zero"))
-    .ProcessAsynchronously();
+if (!File.Exists(outputPath))
+{
+    var stagingBlobName = $"{jobId}/segments/.staging/{index:D6}-{Guid.NewGuid():N}.mp4";
+    var stagingPath = BlobMountPaths.FromBlobName(stagingBlobName, outputMountPath);
+    Directory.CreateDirectory(Path.GetDirectoryName(stagingPath)!);
+    try
+    {
+        var start = TimeSpan.FromSeconds(segment.StartSeconds);
+        var maxVideoBitrateKbps = int.Parse(Required("MAX_VIDEO_BITRATE_KBPS"));
+        var rateControlArguments = maxVideoBitrateKbps > 0
+            ? $" -maxrate {maxVideoBitrateKbps}k -bufsize {2 * maxVideoBitrateKbps}k"
+            : string.Empty;
+        await FFMpegArguments
+            .FromFileInput(inputPath, false, options => options.Seek(start))
+            .OutputToFile(stagingPath, false, options => options
+                .WithDuration(TimeSpan.FromSeconds(segment.DurationSeconds))
+                .WithVideoCodec(Required("VIDEO_CODEC"))
+                .WithCustomArgument($"-an -preset {Required("PRESET")} -crf {Required("CRF")}{rateControlArguments} -movflags +faststart -avoid_negative_ts make_zero"))
+            .ProcessAsynchronously();
+
+        try
+        {
+            File.Move(stagingPath, outputPath, false);
+        }
+        catch (IOException) when (File.Exists(outputPath))
+        {
+            // Another retry published the same deterministic segment first.
+        }
+    }
+    finally
+    {
+        File.Delete(stagingPath);
+    }
+}
 
 var fileInfo = new FileInfo(outputPath);
 await using var stream = File.OpenRead(outputPath);

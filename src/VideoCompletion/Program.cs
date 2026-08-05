@@ -16,5 +16,8 @@ builder.Services.AddSingleton(new TableClient(
     builder.Configuration["Storage:StateTable"] ?? "encodingstate",
     credential));
 builder.Services.AddSingleton<IKubernetes>(_ => new Kubernetes(KubernetesClientConfiguration.InClusterConfig()));
-builder.Services.AddHostedService<CompletionWorker>();
+if (builder.Configuration.GetValue("Completion:ProcessorEnabled", true))
+    builder.Services.AddHostedService<CompletionWorker>();
+if (builder.Configuration.GetValue("Completion:WatcherEnabled", false))
+    builder.Services.AddHostedService<EncodeJobWatcher>();
 await builder.Build().RunAsync();

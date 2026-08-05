@@ -35,7 +35,7 @@ public sealed class AnalysisWorker(
     {
         try
         {
-            var request = args.Message.Body.ToObjectFromJson<VideoSubmitted>()
+            var request = args.Message.Body.ToObjectFromJson<VideoSubmitted>(JsonSerializerOptions.Web)
                 ?? throw new InvalidOperationException("Message body is empty");
             Validate(request);
             var workingContainer = configuration["Storage:WorkingContainer"] ?? "videos";
@@ -45,7 +45,8 @@ public sealed class AnalysisWorker(
             var outputContainer = RequiredConfig("Storage:OutputContainer");
             var inputMountPath = configuration["Storage:InputMountPath"] ?? "/mnt/input";
             var outputMountPath = configuration["Storage:OutputMountPath"] ?? "/mnt/output";
-            var audioBlobName = $"{request.JobId}/audio.m4a";
+            var audioBlobName = $"{request.JobId}/segments/audio.m4a";
+            var videoCodec = string.IsNullOrWhiteSpace(request.VideoCodec) ? "libsvtav1" : request.VideoCodec;
 
             var inputPath = BlobMountPaths.FromUri(request.InputVideoUri, inputAccount, inputContainer, inputMountPath);
             var audioPath = BlobMountPaths.FromBlobName(audioBlobName, outputMountPath);
@@ -56,6 +57,14 @@ public sealed class AnalysisWorker(
             {
                 throw new InvalidOperationException("FFprobe returned an invalid duration");
             }
+            var sourceVideo = media.PrimaryVideoStream
+                ?? throw new InvalidOperationException("Input does not contain a video stream");
+            var encodingProfile = EncodingProfileSelector.Select(
+                sourceVideo,
+                videoCodec,
+                request.Preset,
+                request.Crf,
+                request.MaxVideoBitrateKbps);
 
             await ExtractAudioAsync(inputPath, audioPath, request.AudioCodec);
 
@@ -77,18 +86,25 @@ public sealed class AnalysisWorker(
                 request.SegmentDurationSeconds,
                 segments.Count,
                 segments,
-                request.VideoCodec,
+                videoCodec,
                 request.AudioCodec,
-                request.Preset,
-                request.Crf);
+                encodingProfile.Preset,
+                encodingProfile.Crf,
+                encodingProfile.MaxVideoBitrateKbps);
             await WriteManifestAsync(manifest, outputMountPath, args.CancellationToken);
             await SubmitEncodingJobAsync(manifest, outputAccount, outputContainer, inputAccount, inputContainer, outputMountPath, inputMountPath, args.CancellationToken);
             await args.CompleteMessageAsync(args.Message, args.CancellationToken);
             logger.LogInformation(
-                "Submitted {SegmentCount} encoding indexes for {JobId} using {ParallelizationStrategy}",
+                "Submitted {SegmentCount} encoding indexes for {JobId} using {ParallelizationStrategy}; source={Width}x{Height} {SourceBitrateKbps}kbps, preset={Preset}, crf={Crf}, maxrate={MaxVideoBitrateKbps}kbps",
                 segments.Count,
                 request.JobId,
-                parallelizationStrategy.Name);
+                parallelizationStrategy.Name,
+                sourceVideo.Width,
+                sourceVideo.Height,
+                sourceVideo.BitRate / 1000,
+                encodingProfile.Preset,
+                encodingProfile.Crf,
+                encodingProfile.MaxVideoBitrateKbps);
         }
         catch (JsonException exception)
         {
@@ -153,6 +169,7 @@ public sealed class AnalysisWorker(
             Env("VIDEO_CODEC", manifest.VideoCodec),
             Env("PRESET", manifest.Preset),
             Env("CRF", manifest.Crf.ToString()),
+            Env("MAX_VIDEO_BITRATE_KBPS", manifest.MaxVideoBitrateKbps.ToString()),
             Env("INPUT_STORAGE_ACCOUNT_NAME", inputAccount),
             Env("INPUT_STORAGE_CONTAINER", inputContainer),
             Env("INPUT_MOUNT_PATH", inputMountPath),
@@ -208,15 +225,20 @@ public sealed class AnalysisWorker(
         };
         var job = new V1Job
         {
-            Metadata = new V1ObjectMeta { Name = jobName, Labels = labels },
+            Metadata = new V1ObjectMeta
+            {
+                Name = jobName,
+                Labels = labels,
+                Annotations = new Dictionary<string, string> { ["spotvideo/job-id"] = manifest.JobId }
+            },
             Spec = new V1JobSpec
             {
                 Template = pod,
                 CompletionMode = "Indexed",
                 Completions = manifest.SegmentCount,
                 Parallelism = Math.Min(manifest.SegmentCount, configuration.GetValue("Encoding:MaxParallelism", 16)),
-                BackoffLimit = 6,
-                TtlSecondsAfterFinished = 3600
+                BackoffLimitPerIndex = 5,
+                TtlSecondsAfterFinished = 86400
             }
         };
         await kubernetes.BatchV1.CreateNamespacedJobAsync(job, targetNamespace, cancellationToken: cancellationToken);
@@ -227,8 +249,8 @@ public sealed class AnalysisWorker(
     private static V1Volume BlobFuseVolume(string name, string storageAccount, string containerName, string clientId, bool readOnly)
     {
         var mountOptions = readOnly
-            ? "--use-attr-cache=true --file-cache-timeout-in-seconds=300 --cancel-list-on-mount-seconds=10"
-            : "--use-attr-cache=true --file-cache-timeout-in-seconds=30 --disable-writeback-cache=true";
+            ? "--allow-other --use-attr-cache=true --cancel-list-on-mount-seconds=10"
+            : "--allow-other --use-attr-cache=true --disable-writeback-cache=true";
         return new V1Volume
         {
             Name = name,
@@ -241,8 +263,8 @@ public sealed class AnalysisWorker(
                     ["protocol"] = "fuse2",
                     ["storageAccount"] = storageAccount,
                     ["containerName"] = containerName,
-                    ["AzureStorageAuthType"] = "MSI",
-                    ["AzureStorageIdentityClientID"] = clientId,
+                    ["ClientID"] = clientId,
+                    ["mountWithWorkloadIdentityToken"] = "true",
                     ["mountOptions"] = mountOptions
                 }
             }
@@ -266,8 +288,10 @@ public sealed class AnalysisWorker(
             throw new ArgumentException("OutputVideoUri must use HTTPS");
         if (request.SegmentDurationSeconds is < 5 or > 3600)
             throw new ArgumentException("SegmentDurationSeconds must be between 5 and 3600");
-        if (request.Crf is < 0 or > 51)
-            throw new ArgumentException("Crf must be between 0 and 51");
+        if (request.Crf is < 0 or > 63)
+            throw new ArgumentException("Crf must be between 0 and 63");
+        if (request.MaxVideoBitrateKbps is < 64 or > 100_000)
+            throw new ArgumentException("MaxVideoBitrateKbps must be between 64 and 100000");
         if (string.IsNullOrWhiteSpace(request.AudioCodec))
             throw new ArgumentException("AudioCodec is required");
     }

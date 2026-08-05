@@ -19,8 +19,10 @@ var inputStorageName = take('${compactPrefix}in${suffix}', 24)
 var outputStorageName = take('${compactPrefix}out${suffix}', 24)
 var acrName = take('${compactPrefix}acr${suffix}', 50)
 var serviceBusName = take('${prefix}-sb-${suffix}', 50)
+var logAnalyticsName = take('${prefix}-logs-${suffix}', 63)
 var workloadIdentityName = '${prefix}-workload-${suffix}'
 var serviceAccountSubject = 'system:serviceaccount:spotvideo:spotvideo-worker'
+var kedaOperatorSubject = 'system:serviceaccount:kube-system:keda-operator'
 
 resource acr 'Microsoft.ContainerRegistry/registries@2025-04-01' = {
   name: acrName
@@ -137,6 +139,20 @@ resource completedQueue 'Microsoft.ServiceBus/namespaces/queues@2024-01-01' = {
   }
 }
 
+resource videoResultsQueue 'Microsoft.ServiceBus/namespaces/queues@2024-01-01' = {
+  parent: serviceBus
+  name: 'video-results'
+  properties: {
+    deadLetteringOnMessageExpiration: true
+    defaultMessageTimeToLive: 'P14D'
+    duplicateDetectionHistoryTimeWindow: 'PT10M'
+    enableBatchedOperations: true
+    lockDuration: 'PT5M'
+    maxDeliveryCount: 10
+    requiresDuplicateDetection: true
+  }
+}
+
 resource stitchedQueue 'Microsoft.ServiceBus/namespaces/queues@2024-01-01' = {
   parent: serviceBus
   name: 'video-stitched'
@@ -156,6 +172,20 @@ resource workloadIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023
   location: location
 }
 
+resource logAnalytics 'Microsoft.OperationalInsights/workspaces@2025-02-01' = {
+  name: logAnalyticsName
+  location: location
+  properties: {
+    retentionInDays: 30
+    sku: {
+      name: 'PerGB2018'
+    }
+    features: {
+      enableLogAccessUsingOnlyResourcePermissions: true
+    }
+  }
+}
+
 resource aks 'Microsoft.ContainerService/managedClusters@2025-05-01' = {
   name: aksName
   location: location
@@ -168,6 +198,15 @@ resource aks 'Microsoft.ContainerService/managedClusters@2025-05-01' = {
     securityProfile: { workloadIdentity: { enabled: true } }
     workloadAutoScalerProfile: { keda: { enabled: true } }
     storageProfile: { blobCSIDriver: { enabled: true } }
+    addonProfiles: {
+      omsagent: {
+        enabled: true
+        config: {
+          logAnalyticsWorkspaceResourceID: logAnalytics.id
+          useAADAuth: 'true'
+        }
+      }
+    }
     agentPoolProfiles: [
       {
         name: 'systempool'
@@ -221,13 +260,24 @@ resource federation 'Microsoft.ManagedIdentity/userAssignedIdentities/federatedI
   }
 }
 
-resource inputBlobContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(inputStorage.id, workloadIdentity.id, 'blob-contributor')
+resource kedaOperatorFederation 'Microsoft.ManagedIdentity/userAssignedIdentities/federatedIdentityCredentials@2023-01-31' = {
+  parent: workloadIdentity
+  name: 'keda-operator'
+  dependsOn: [ federation ]
+  properties: {
+    audiences: [ 'api://AzureADTokenExchange' ]
+    issuer: aks.properties.oidcIssuerProfile.issuerURL
+    subject: kedaOperatorSubject
+  }
+}
+
+resource inputBlobReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(inputStorage.id, workloadIdentity.id, 'blob-reader')
   scope: inputStorage
   properties: {
     principalId: workloadIdentity.properties.principalId
     principalType: 'ServicePrincipal'
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1')
   }
 }
 
@@ -282,8 +332,11 @@ resource acrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
 }
 
 output aksName string = aks.name
+output logAnalyticsName string = logAnalytics.name
+output logAnalyticsResourceId string = logAnalytics.id
 output acrName string = acr.name
 output acrLoginServer string = acr.properties.loginServer
+output inputStorageId string = inputStorage.id
 output inputStorageName string = inputStorage.name
 output inputContainerName string = inputContainer.name
 output inputStorageServiceUri string = 'https://${inputStorage.name}.blob.${environment().suffixes.storage}'
@@ -293,3 +346,4 @@ output outputStorageServiceUri string = 'https://${outputStorage.name}.blob.${en
 output tableServiceUri string = 'https://${outputStorage.name}.table.${environment().suffixes.storage}'
 output serviceBusNamespace string = replace(replace(serviceBus.properties.serviceBusEndpoint, 'https://', ''), ':443/', '')
 output workloadClientId string = workloadIdentity.properties.clientId
+output workloadPrincipalId string = workloadIdentity.properties.principalId

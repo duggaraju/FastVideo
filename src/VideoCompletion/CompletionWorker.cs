@@ -162,7 +162,12 @@ public sealed class CompletionWorker(
         };
         var job = new V1Job
         {
-            Metadata = new V1ObjectMeta { Name = jobName, Labels = labels },
+            Metadata = new V1ObjectMeta
+            {
+                Name = jobName,
+                Labels = labels,
+                Annotations = new Dictionary<string, string> { ["spotvideo/job-id"] = completion.JobId }
+            },
             Spec = new V1JobSpec { Template = pod, BackoffLimit = 6, TtlSecondsAfterFinished = 3600 }
         };
         await kubernetes.BatchV1.CreateNamespacedJobAsync(job, targetNamespace, cancellationToken: cancellationToken);
@@ -184,9 +189,9 @@ public sealed class CompletionWorker(
                     ["protocol"] = "fuse2",
                     ["storageAccount"] = storageAccount,
                     ["containerName"] = containerName,
-                    ["AzureStorageAuthType"] = "MSI",
-                    ["AzureStorageIdentityClientID"] = clientId,
-                    ["mountOptions"] = "--use-attr-cache=true --file-cache-timeout-in-seconds=30 --disable-writeback-cache=true"
+                    ["ClientID"] = clientId,
+                    ["mountWithWorkloadIdentityToken"] = "true",
+                    ["mountOptions"] = "--allow-other --use-attr-cache=true --file-cache-timeout-in-seconds=30 --disable-writeback-cache=true"
                 }
             }
         };

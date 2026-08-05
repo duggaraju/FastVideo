@@ -4,11 +4,12 @@ public sealed record VideoSubmitted(
     string JobId,
     Uri InputVideoUri,
     Uri OutputVideoUri,
-    int SegmentDurationSeconds = 60,
-    string VideoCodec = "libx264",
+    int SegmentDurationSeconds = 20,
+    string VideoCodec = "libsvtav1",
     string AudioCodec = "copy",
-    string Preset = "medium",
-    int Crf = 23);
+    string? Preset = null,
+    int? Crf = null,
+    int? MaxVideoBitrateKbps = null);
 
 public sealed record VideoManifest(
     string JobId,
@@ -23,7 +24,8 @@ public sealed record VideoManifest(
     string VideoCodec,
     string AudioCodec,
     string Preset,
-    int Crf);
+    int Crf,
+    int MaxVideoBitrateKbps);
 
 public sealed record VideoSegment(
     int Index,
@@ -40,6 +42,14 @@ public sealed record SegmentEncoded(
     Uri OutputVideoUri,
     long Length,
     string Sha256,
+    DateTimeOffset CompletedAt);
+
+public sealed record VideoProcessingResult(
+    string JobId,
+    bool Succeeded,
+    string TerminalStage,
+    string? FailedIndexes,
+    string? FailureReason,
     DateTimeOffset CompletedAt);
 
 public sealed record VideoStitched(

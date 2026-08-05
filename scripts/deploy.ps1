@@ -3,24 +3,76 @@ param(
     [Parameter(Mandatory)]
     [string] $ResourceGroup,
 
-    [Parameter(Mandatory)]
     [string] $Location,
 
     [string] $Prefix = "spotvideo",
     [string] $ImageTag = "latest",
-    [switch] $UseLocalDocker
+    [switch] $UseLocalDocker,
+    [switch] $SkipInfrastructureDeployment
 )
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 
-az group create --name $ResourceGroup --location $Location --output none
-$deployment = az deployment group create `
-    --resource-group $ResourceGroup `
-    --template-file (Join-Path $root "infra/main.bicep") `
-    --parameters prefix=$Prefix `
-    --query properties.outputs `
-    --output json | ConvertFrom-Json
+function Assert-NativeCommandSucceeded([string] $Operation) {
+    if ($LASTEXITCODE -ne 0) {
+        throw "$Operation failed with exit code $LASTEXITCODE."
+    }
+}
+
+if ($SkipInfrastructureDeployment) {
+    $deploymentName = az deployment group list `
+        --resource-group $ResourceGroup `
+        --query "sort_by([?properties.provisioningState=='Succeeded' && properties.outputs.acrName != null], &properties.timestamp)[-1].name" `
+        --output tsv
+    Assert-NativeCommandSucceeded "Finding the latest successful SpotVideo infrastructure deployment"
+    if ([string]::IsNullOrWhiteSpace($deploymentName)) {
+        throw "No successful SpotVideo infrastructure deployment was found in resource group '$ResourceGroup'."
+    }
+
+    $deploymentJson = az deployment group show `
+        --resource-group $ResourceGroup `
+        --name $deploymentName `
+        --query properties.outputs `
+        --output json
+    Assert-NativeCommandSucceeded "Reading outputs from deployment '$deploymentName'"
+    Write-Host "Skipping infrastructure deployment; using outputs from '$deploymentName'."
+} else {
+    if ([string]::IsNullOrWhiteSpace($Location)) {
+        throw "Location is required unless -SkipInfrastructureDeployment is specified."
+    }
+
+    az group create --name $ResourceGroup --location $Location --output none
+    Assert-NativeCommandSucceeded "Creating or updating resource group '$ResourceGroup'"
+
+    $deploymentJson = az deployment group create `
+        --resource-group $ResourceGroup `
+        --template-file (Join-Path $root "infra/main.bicep") `
+        --parameters prefix=$Prefix `
+        --query properties.outputs `
+        --output json
+    Assert-NativeCommandSucceeded "Deploying Azure resources; image builds and Kubernetes deployment were not started"
+}
+if ([string]::IsNullOrWhiteSpace($deploymentJson)) {
+    throw "Azure resource deployment outputs are empty."
+}
+$deployment = $deploymentJson | ConvertFrom-Json
+
+# Remove the write grant created by deployments predating input-storage read-only RBAC.
+$legacyInputWriteGrantIds = @(az role assignment list `
+    --assignee $deployment.workloadPrincipalId.value `
+    --role "Storage Blob Data Contributor" `
+    --scope $deployment.inputStorageId.value `
+    --query "[].id" `
+    --output tsv)
+Assert-NativeCommandSucceeded "Checking for the legacy input-storage write role assignment"
+if ($legacyInputWriteGrantIds.Count -gt 0) {
+    az role assignment delete `
+        --assignee $deployment.workloadPrincipalId.value `
+        --role "Storage Blob Data Contributor" `
+        --scope $deployment.inputStorageId.value
+    Assert-NativeCommandSucceeded "Removing the legacy input-storage write role assignment"
+}
 
 $acrName = $deployment.acrName.value
 $acrLoginServer = $deployment.acrLoginServer.value
@@ -36,8 +88,11 @@ foreach ($project in $projects) {
             --build-arg "APP_DLL=$projectName.dll" `
             --tag $fullImage `
             $root
+        Assert-NativeCommandSucceeded "Building $projectName image"
         az acr login --name $acrName
+        Assert-NativeCommandSucceeded "Logging in to Azure Container Registry '$acrName'"
         docker push $fullImage
+        Assert-NativeCommandSucceeded "Pushing $projectName image"
     } else {
         az acr build `
             --registry $acrName `
@@ -46,6 +101,7 @@ foreach ($project in $projects) {
             --build-arg "PROJECT=$projectName" `
             --build-arg "APP_DLL=$projectName.dll" `
             $root
+        Assert-NativeCommandSucceeded "Building $projectName image in Azure Container Registry"
     }
 }
 
@@ -53,6 +109,7 @@ az aks get-credentials `
     --resource-group $ResourceGroup `
     --name $deployment.aksName.value `
     --overwrite-existing
+Assert-NativeCommandSucceeded "Getting AKS credentials"
 
 $serviceBusNamespace = $deployment.serviceBusNamespace.value
 $serviceBusShortName = $serviceBusNamespace.Split('.')[0]
@@ -76,6 +133,14 @@ foreach ($replacement in $replacements.GetEnumerator()) {
 $renderedManifest = Join-Path $root "deploy/rendered.yaml"
 Set-Content -Path $renderedManifest -Value $manifest -Encoding UTF8
 kubectl apply --filename $renderedManifest
+Assert-NativeCommandSucceeded "Applying the Kubernetes manifest"
+
+kubectl rollout restart `
+    --namespace spotvideo `
+    deployment/spotvideo-analysis `
+    deployment/spotvideo-completion `
+    deployment/spotvideo-job-watcher
+Assert-NativeCommandSucceeded "Restarting SpotVideo deployments to use the rebuilt images"
 
 Write-Host "Deployed SpotVideo to $($deployment.aksName.value) with image tag $ImageTag"
 Write-Host "Service Bus input queue: $serviceBusNamespace/video-submitted"
