@@ -57,6 +57,21 @@ public sealed class AnalysisWorker(
             {
                 throw new InvalidOperationException("FFprobe returned an invalid duration");
             }
+            var maxParallelism = configuration.GetValue("Encoding:MaxParallelism", 16);
+            if (maxParallelism < 1)
+            {
+                throw new InvalidOperationException("Encoding:MaxParallelism must be greater than zero");
+            }
+            var minParallelismPerJob = configuration.GetValue("Encoding:MinParallelismPerJob", 2);
+            if (minParallelismPerJob < 1 || minParallelismPerJob > maxParallelism)
+            {
+                throw new InvalidOperationException(
+                    "Encoding:MinParallelismPerJob must be between 1 and Encoding:MaxParallelism");
+            }
+            var segmentDurationSeconds = CalculateSegmentDurationSeconds(
+                media.Duration,
+                maxParallelism,
+                request.SegmentDurationSeconds);
             var sourceVideo = media.PrimaryVideoStream
                 ?? throw new InvalidOperationException("Input does not contain a video stream");
             var encodingProfile = EncodingProfileSelector.Select(
@@ -71,7 +86,7 @@ public sealed class AnalysisWorker(
             var segments = await parallelizationStrategy.CreateSegmentsAsync(
                 inputPath,
                 media.Duration,
-                request.SegmentDurationSeconds,
+                segmentDurationSeconds,
                 args.CancellationToken);
             if (segments.Count == 0)
                 throw new InvalidOperationException("Parallelization strategy produced no segments");
@@ -83,22 +98,27 @@ public sealed class AnalysisWorker(
                 workingContainer,
                 audioBlobName,
                 media.Duration,
-                request.SegmentDurationSeconds,
+                segmentDurationSeconds,
                 segments.Count,
                 segments,
                 videoCodec,
                 request.AudioCodec,
                 encodingProfile.Preset,
                 encodingProfile.Crf,
-                encodingProfile.MaxVideoBitrateKbps);
+                encodingProfile.MaxVideoBitrateKbps,
+                request.UseSpot,
+                request.CalculateVmaf);
             await WriteManifestAsync(manifest, outputMountPath, args.CancellationToken);
-            await SubmitEncodingJobAsync(manifest, outputAccount, outputContainer, inputAccount, inputContainer, outputMountPath, inputMountPath, args.CancellationToken);
+            await SubmitEncodingJobAsync(manifest, minParallelismPerJob, outputAccount, outputContainer, inputAccount, inputContainer, outputMountPath, inputMountPath, args.CancellationToken);
             await args.CompleteMessageAsync(args.Message, args.CancellationToken);
             logger.LogInformation(
-                "Submitted {SegmentCount} encoding indexes for {JobId} using {ParallelizationStrategy}; source={Width}x{Height} {SourceBitrateKbps}kbps, preset={Preset}, crf={Crf}, maxrate={MaxVideoBitrateKbps}kbps",
+                "Submitted {SegmentCount} encoding indexes for {JobId} using {ParallelizationStrategy}; segment duration={SegmentDurationSeconds}s, initial parallelism={InitialParallelism}, max parallelism={MaxParallelism}, source={Width}x{Height} {SourceBitrateKbps}kbps, preset={Preset}, crf={Crf}, maxrate={MaxVideoBitrateKbps}kbps",
                 segments.Count,
                 request.JobId,
                 parallelizationStrategy.Name,
+                segmentDurationSeconds,
+                Math.Min(segments.Count, minParallelismPerJob),
+                maxParallelism,
                 sourceVideo.Width,
                 sourceVideo.Height,
                 sourceVideo.BitRate / 1000,
@@ -139,6 +159,7 @@ public sealed class AnalysisWorker(
 
     private async Task SubmitEncodingJobAsync(
         VideoManifest manifest,
+        int minParallelismPerJob,
         string outputAccount,
         string outputContainer,
         string inputAccount,
@@ -163,21 +184,17 @@ public sealed class AnalysisWorker(
             new() { Name = "JOB_COMPLETION_INDEX", ValueFrom = new V1EnvVarSource { FieldRef = new V1ObjectFieldSelector { FieldPath = "metadata.annotations['batch.kubernetes.io/job-completion-index']" } } },
             Env("JOB_ID", manifest.JobId),
             Env("SOURCE_VIDEO_URI", manifest.InputVideoUri.ToString()),
-            Env("OUTPUT_CONTAINER", manifest.WorkingContainer),
-            Env("AUDIO_BLOB_NAME", manifest.AudioBlobName),
-            Env("OUTPUT_VIDEO_URI", manifest.OutputVideoUri.ToString()),
             Env("VIDEO_CODEC", manifest.VideoCodec),
             Env("PRESET", manifest.Preset),
             Env("CRF", manifest.Crf.ToString()),
             Env("MAX_VIDEO_BITRATE_KBPS", manifest.MaxVideoBitrateKbps.ToString()),
+            Env("CALCULATE_VMAF", manifest.CalculateVmaf.ToString()),
             Env("INPUT_STORAGE_ACCOUNT_NAME", inputAccount),
             Env("INPUT_STORAGE_CONTAINER", inputContainer),
             Env("INPUT_MOUNT_PATH", inputMountPath),
             Env("OUTPUT_STORAGE_ACCOUNT_NAME", outputAccount),
             Env("OUTPUT_STORAGE_CONTAINER", outputContainer),
-            Env("OUTPUT_MOUNT_PATH", outputMountPath),
-            Env("SERVICE_BUS_NAMESPACE", configuration["ServiceBus:Namespace"]!),
-            Env("COMPLETION_QUEUE", configuration["ServiceBus:CompletionQueue"] ?? "segment-completed")
+            Env("OUTPUT_MOUNT_PATH", outputMountPath)
         };
         var inputVolumeName = "input-storage";
         var outputVolumeName = "output-storage";
@@ -218,8 +235,13 @@ public sealed class AnalysisWorker(
                 ],
                 RestartPolicy = "Never",
                 ServiceAccountName = "spotvideo-worker",
-                Tolerations = [new V1Toleration { Effect = "NoSchedule", OperatorProperty = "Equal", Key = "kubernetes.azure.com/scalesetpriority", Value = "spot" }],
-                NodeSelector = new Dictionary<string, string> { ["kubernetes.azure.com/scalesetpriority"] = "spot" },
+                Tolerations = manifest.UseSpot
+                    ? [new V1Toleration { Effect = "NoSchedule", OperatorProperty = "Equal", Key = "kubernetes.azure.com/scalesetpriority", Value = "spot" }]
+                    : null,
+                NodeSelector = new Dictionary<string, string>
+                {
+                    ["kubernetes.azure.com/agentpool"] = manifest.UseSpot ? "spot" : "regular"
+                },
                 TerminationGracePeriodSeconds = 120
             }
         };
@@ -229,14 +251,21 @@ public sealed class AnalysisWorker(
             {
                 Name = jobName,
                 Labels = labels,
-                Annotations = new Dictionary<string, string> { ["spotvideo/job-id"] = manifest.JobId }
+                Annotations = new Dictionary<string, string>
+                {
+                    [JobNames.JobIdAnnotation] = manifest.JobId,
+                    [JobNames.SegmentCountAnnotation] = manifest.SegmentCount.ToString(),
+                    [JobNames.AudioBlobNameAnnotation] = manifest.AudioBlobName,
+                    [JobNames.OutputVideoUriAnnotation] = manifest.OutputVideoUri.ToString(),
+                    [JobNames.CalculateVmafAnnotation] = manifest.CalculateVmaf.ToString()
+                }
             },
             Spec = new V1JobSpec
             {
                 Template = pod,
                 CompletionMode = "Indexed",
                 Completions = manifest.SegmentCount,
-                Parallelism = Math.Min(manifest.SegmentCount, configuration.GetValue("Encoding:MaxParallelism", 16)),
+                Parallelism = Math.Min(manifest.SegmentCount, minParallelismPerJob),
                 BackoffLimitPerIndex = 5,
                 TtlSecondsAfterFinished = 86400
             }
@@ -245,6 +274,13 @@ public sealed class AnalysisWorker(
     }
 
     private static V1EnvVar Env(string name, string value) => new() { Name = name, Value = value };
+
+    private static int CalculateSegmentDurationSeconds(TimeSpan duration, int maxParallelism, int minimumSegmentDurationSeconds)
+    {
+        var durationPerWorker = (int)Math.Ceiling(duration.TotalSeconds / maxParallelism);
+        var maximumSegmentDurationSeconds = Math.Max(180, minimumSegmentDurationSeconds);
+        return Math.Clamp(durationPerWorker, minimumSegmentDurationSeconds, maximumSegmentDurationSeconds);
+    }
 
     private static V1Volume BlobFuseVolume(string name, string storageAccount, string containerName, string clientId, bool readOnly)
     {

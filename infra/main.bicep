@@ -8,6 +8,9 @@ param systemVmSize string = 'Standard_D2s_v5'
 param spotVmSize string = 'Standard_D8s_v5'
 param spotMinCount int = 0
 param spotMaxCount int = 20
+param regularVmSize string = 'Standard_D8s_v5'
+param regularMinCount int = 0
+param regularMaxCount int = 20
 param kubernetesVersion string = ''
 param inputContainerName string = 'input'
 param outputContainerName string = 'videos'
@@ -90,16 +93,6 @@ resource outputContainer 'Microsoft.Storage/storageAccounts/blobServices/contain
   properties: { publicAccess: 'None' }
 }
 
-resource tableService 'Microsoft.Storage/storageAccounts/tableServices@2025-01-01' = {
-  parent: outputStorage
-  name: 'default'
-}
-
-resource stateTable 'Microsoft.Storage/storageAccounts/tableServices/tables@2025-01-01' = {
-  parent: tableService
-  name: 'encodingstate'
-}
-
 resource serviceBus 'Microsoft.ServiceBus/namespaces@2024-01-01' = {
   name: serviceBusName
   location: location
@@ -125,27 +118,13 @@ resource submittedQueue 'Microsoft.ServiceBus/namespaces/queues@2024-01-01' = {
   }
 }
 
-resource completedQueue 'Microsoft.ServiceBus/namespaces/queues@2024-01-01' = {
-  parent: serviceBus
-  name: 'segment-completed'
-  properties: {
-    deadLetteringOnMessageExpiration: true
-    defaultMessageTimeToLive: 'P7D'
-    duplicateDetectionHistoryTimeWindow: 'PT10M'
-    enableBatchedOperations: true
-    lockDuration: 'PT5M'
-    maxDeliveryCount: 20
-    requiresDuplicateDetection: true
-  }
-}
-
 resource videoResultsQueue 'Microsoft.ServiceBus/namespaces/queues@2024-01-01' = {
   parent: serviceBus
   name: 'video-results'
   properties: {
     deadLetteringOnMessageExpiration: true
     defaultMessageTimeToLive: 'P14D'
-    duplicateDetectionHistoryTimeWindow: 'PT10M'
+    duplicateDetectionHistoryTimeWindow: 'P1D'
     enableBatchedOperations: true
     lockDuration: 'PT5M'
     maxDeliveryCount: 10
@@ -239,6 +218,20 @@ resource aks 'Microsoft.ContainerService/managedClusters@2025-05-01' = {
         nodeTaints: [ 'kubernetes.azure.com/scalesetpriority=spot:NoSchedule' ]
         nodeLabels: { workload: 'video-encoding' }
       }
+      {
+        name: 'regular'
+        count: regularMinCount
+        vmSize: regularVmSize
+        osType: 'Linux'
+        osSKU: 'Ubuntu'
+        mode: 'User'
+        type: 'VirtualMachineScaleSets'
+        enableAutoScaling: true
+        minCount: regularMinCount
+        maxCount: regularMaxCount
+        maxPods: 30
+        nodeLabels: { workload: 'video-encoding' }
+      }
     ]
     networkProfile: {
       networkPlugin: 'azure'
@@ -291,16 +284,6 @@ resource outputBlobContributor 'Microsoft.Authorization/roleAssignments@2022-04-
   }
 }
 
-resource tableContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(outputStorage.id, workloadIdentity.id, 'table-contributor')
-  scope: outputStorage
-  properties: {
-    principalId: workloadIdentity.properties.principalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3')
-  }
-}
-
 resource busReceiver 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(serviceBus.id, workloadIdentity.id, 'receiver')
   scope: serviceBus
@@ -341,9 +324,9 @@ output inputStorageName string = inputStorage.name
 output inputContainerName string = inputContainer.name
 output inputStorageServiceUri string = 'https://${inputStorage.name}.blob.${environment().suffixes.storage}'
 output outputStorageName string = outputStorage.name
+output outputStorageId string = outputStorage.id
 output outputContainerName string = outputContainer.name
 output outputStorageServiceUri string = 'https://${outputStorage.name}.blob.${environment().suffixes.storage}'
-output tableServiceUri string = 'https://${outputStorage.name}.table.${environment().suffixes.storage}'
 output serviceBusNamespace string = replace(replace(serviceBus.properties.serviceBusEndpoint, 'https://', ''), ':443/', '')
 output workloadClientId string = workloadIdentity.properties.clientId
 output workloadPrincipalId string = workloadIdentity.properties.principalId

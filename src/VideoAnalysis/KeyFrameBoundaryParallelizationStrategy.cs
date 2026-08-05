@@ -32,7 +32,7 @@ public sealed class KeyFrameBoundaryParallelizationStrategy : IParallelizationSt
     {
         var startInfo = new ProcessStartInfo
         {
-            FileName = "/usr/bin/ffprobe",
+            FileName = "ffprobe",
             Arguments = $"-v error -select_streams v:0 -skip_frame nokey -show_frames -show_entries frame=best_effort_timestamp_time -of csv=p=0:nk=1 \"{inputPath}\"",
             RedirectStandardOutput = true,
             RedirectStandardError = true,
@@ -76,7 +76,12 @@ public sealed class KeyFrameBoundaryParallelizationStrategy : IParallelizationSt
         while (start < durationSeconds - epsilon)
         {
             var target = start + targetSegmentDurationSeconds;
-            var boundary = keyFrames.FirstOrDefault(timestamp => timestamp >= target && timestamp > start + epsilon);
+            var boundary = keyFrames.LastOrDefault(timestamp =>
+                timestamp > start + epsilon && timestamp <= target + epsilon);
+            if (boundary <= start + epsilon)
+            {
+                boundary = keyFrames.FirstOrDefault(timestamp => timestamp > start + epsilon);
+            }
             if (boundary <= start + epsilon || boundary > durationSeconds)
                 boundary = durationSeconds;
 

@@ -7,7 +7,8 @@ using SpotVideo.Analysis;
 
 GlobalFFOptions.Configure(options =>
 {
-    options.BinaryFolder = "/usr/bin";
+    options.BinaryFolder = Environment.GetEnvironmentVariable("FFMPEG_BINARY_FOLDER")
+        ?? (Directory.Exists("/opt/ffmpeg/bin") ? "/opt/ffmpeg/bin" : "/usr/bin");
     options.TemporaryFilesFolder = "/tmp";
 });
 

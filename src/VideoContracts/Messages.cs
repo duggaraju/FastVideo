@@ -4,12 +4,14 @@ public sealed record VideoSubmitted(
     string JobId,
     Uri InputVideoUri,
     Uri OutputVideoUri,
-    int SegmentDurationSeconds = 20,
+    int SegmentDurationSeconds = 60,
     string VideoCodec = "libsvtav1",
     string AudioCodec = "copy",
     string? Preset = null,
     int? Crf = null,
-    int? MaxVideoBitrateKbps = null);
+    int? MaxVideoBitrateKbps = null,
+    bool UseSpot = true,
+    bool CalculateVmaf = false);
 
 public sealed record VideoManifest(
     string JobId,
@@ -25,24 +27,14 @@ public sealed record VideoManifest(
     string AudioCodec,
     string Preset,
     int Crf,
-    int MaxVideoBitrateKbps);
+    int MaxVideoBitrateKbps,
+    bool UseSpot,
+    bool CalculateVmaf);
 
 public sealed record VideoSegment(
     int Index,
     double StartSeconds,
     double DurationSeconds);
-
-public sealed record SegmentEncoded(
-    string JobId,
-    int SegmentIndex,
-    int SegmentCount,
-    string WorkingContainer,
-    string BlobName,
-    string AudioBlobName,
-    Uri OutputVideoUri,
-    long Length,
-    string Sha256,
-    DateTimeOffset CompletedAt);
 
 public sealed record VideoProcessingResult(
     string JobId,
@@ -56,4 +48,9 @@ public sealed record VideoStitched(
     string JobId,
     Uri OutputVideoUri,
     long Length,
-    DateTimeOffset CompletedAt);
+    DateTimeOffset CompletedAt,
+    double? VmafScore = null);
+
+public sealed record SegmentVmaf(
+    int SegmentIndex,
+    double Score);

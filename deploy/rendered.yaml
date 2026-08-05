@@ -19,7 +19,7 @@ metadata:
 rules:
   - apiGroups: ["batch"]
     resources: ["jobs"]
-    verbs: ["create", "delete", "get", "list", "watch"]
+    verbs: ["create", "delete", "get", "list", "patch", "watch"]
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
@@ -46,11 +46,8 @@ metadata:
 data:
   ServiceBus__Namespace: "spotvideo-sb-soudinndket2a.servicebus.windows.net"
   ServiceBus__InputQueue: "video-submitted"
-  ServiceBus__CompletionQueue: "segment-completed"
   ServiceBus__VideoResultQueue: "video-results"
   ServiceBus__StitchedQueue: "video-stitched"
-  Storage__TableServiceUri: "https://spotvideooutsoudinndket2.table.core.windows.net"
-  Storage__StateTable: "encodingstate"
   Storage__InputAccountName: "spotvideoinsoudinndket2a"
   Storage__InputContainer: "input"
   Storage__InputMountPath: "/mnt/input"
@@ -63,6 +60,7 @@ data:
   Images__Encoder: "spotvideoacrsoudinndket2a.azurecr.io/spotvideo-encoder:latest"
   Images__Stitcher: "spotvideoacrsoudinndket2a.azurecr.io/spotvideo-stitcher:latest"
   Encoding__MaxParallelism: "32"
+  Encoding__MinParallelismPerJob: "2"
   Encoding__ParallelizationStrategy: "fixed-duration"
 ---
 apiVersion: apps/v1
@@ -129,43 +127,6 @@ spec:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: spotvideo-completion
-  namespace: spotvideo
-spec:
-  replicas: 0
-  selector:
-    matchLabels:
-      app: spotvideo-completion
-  template:
-    metadata:
-      labels:
-        app: spotvideo-completion
-        azure.workload.identity/use: "true"
-    spec:
-      serviceAccountName: spotvideo-worker
-      nodeSelector:
-        kubernetes.io/os: linux
-        kubernetes.azure.com/mode: system
-      terminationGracePeriodSeconds: 60
-      containers:
-        - name: completion
-          image: "spotvideoacrsoudinndket2a.azurecr.io/spotvideo-completion:latest"
-          imagePullPolicy: Always
-          envFrom:
-            - configMapRef:
-                name: spotvideo-config
-          env:
-            - name: Completion__ProcessorEnabled
-              value: "true"
-            - name: Completion__WatcherEnabled
-              value: "false"
-          resources:
-            requests: { cpu: "100m", memory: "256Mi" }
-            limits: { cpu: "500m", memory: "1Gi" }
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
   name: spotvideo-job-watcher
   namespace: spotvideo
 spec:
@@ -191,11 +152,6 @@ spec:
           envFrom:
             - configMapRef:
                 name: spotvideo-config
-          env:
-            - name: Completion__ProcessorEnabled
-              value: "false"
-            - name: Completion__WatcherEnabled
-              value: "true"
           resources:
             requests: { cpu: "50m", memory: "128Mi" }
             limits: { cpu: "250m", memory: "512Mi" }
@@ -228,28 +184,6 @@ spec:
         namespace: "spotvideo-sb-soudinndket2a"
         queueName: video-submitted
         messageCount: "1"
-        activationMessageCount: "0"
-      authenticationRef:
-        name: spotvideo-workload-identity
----
-apiVersion: keda.sh/v1alpha1
-kind: ScaledObject
-metadata:
-  name: spotvideo-completion
-  namespace: spotvideo
-spec:
-  scaleTargetRef:
-    name: spotvideo-completion
-  pollingInterval: 10
-  cooldownPeriod: 120
-  minReplicaCount: 0
-  maxReplicaCount: 20
-  triggers:
-    - type: azure-servicebus
-      metadata:
-        namespace: "spotvideo-sb-soudinndket2a"
-        queueName: segment-completed
-        messageCount: "10"
         activationMessageCount: "0"
       authenticationRef:
         name: spotvideo-workload-identity

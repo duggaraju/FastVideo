@@ -7,6 +7,8 @@ param(
 
     [string] $Prefix = "spotvideo",
     [string] $ImageTag = "latest",
+    [ValidateSet("btbn", "ubuntu")]
+    [string] $FfmpegBuild = "btbn",
     [switch] $UseLocalDocker,
     [switch] $SkipInfrastructureDeployment
 )
@@ -86,6 +88,7 @@ foreach ($project in $projects) {
             --file (Join-Path $root "docker/Dockerfile") `
             --build-arg "PROJECT=$projectName" `
             --build-arg "APP_DLL=$projectName.dll" `
+            --build-arg "FFMPEG_BUILD=$FfmpegBuild" `
             --tag $fullImage `
             $root
         Assert-NativeCommandSucceeded "Building $projectName image"
@@ -100,6 +103,7 @@ foreach ($project in $projects) {
             --file (Join-Path $root "docker/Dockerfile") `
             --build-arg "PROJECT=$projectName" `
             --build-arg "APP_DLL=$projectName.dll" `
+            --build-arg "FFMPEG_BUILD=$FfmpegBuild" `
             $root
         Assert-NativeCommandSucceeded "Building $projectName image in Azure Container Registry"
     }
@@ -118,7 +122,6 @@ $replacements = @{
     "__WORKLOAD_CLIENT_ID__" = $deployment.workloadClientId.value
     "__SERVICE_BUS_NAMESPACE__" = $serviceBusNamespace
     "__SERVICE_BUS_NAMESPACE_SHORT__" = $serviceBusShortName
-    "__TABLE_SERVICE_URI__" = $deployment.tableServiceUri.value
     "__INPUT_STORAGE_ACCOUNT__" = $deployment.inputStorageName.value
     "__INPUT_STORAGE_CONTAINER__" = $deployment.inputContainerName.value
     "__OUTPUT_STORAGE_ACCOUNT__" = $deployment.outputStorageName.value
@@ -135,12 +138,59 @@ Set-Content -Path $renderedManifest -Value $manifest -Encoding UTF8
 kubectl apply --filename $renderedManifest
 Assert-NativeCommandSucceeded "Applying the Kubernetes manifest"
 
+kubectl delete deployment/spotvideo-completion scaledobject/spotvideo-completion `
+    --namespace spotvideo `
+    --ignore-not-found
+Assert-NativeCommandSucceeded "Removing the legacy completion processor"
+
 kubectl rollout restart `
     --namespace spotvideo `
     deployment/spotvideo-analysis `
-    deployment/spotvideo-completion `
     deployment/spotvideo-job-watcher
 Assert-NativeCommandSucceeded "Restarting SpotVideo deployments to use the rebuilt images"
+
+$legacyQueue = az servicebus queue list `
+    --resource-group $ResourceGroup `
+    --namespace-name $serviceBusShortName `
+    --query "[?name=='segment-completed'].name | [0]" `
+    --output tsv
+Assert-NativeCommandSucceeded "Checking for the legacy segment completion queue"
+if (-not [string]::IsNullOrWhiteSpace($legacyQueue)) {
+    az servicebus queue delete `
+        --resource-group $ResourceGroup `
+        --namespace-name $serviceBusShortName `
+        --name segment-completed
+    Assert-NativeCommandSucceeded "Removing the legacy segment completion queue"
+}
+
+$outputStorageId = az storage account show `
+    --resource-group $ResourceGroup `
+    --name $deployment.outputStorageName.value `
+    --query id `
+    --output tsv
+Assert-NativeCommandSucceeded "Reading the output storage account ID"
+$legacyTableRoleIds = @(az role assignment list `
+    --assignee $deployment.workloadPrincipalId.value `
+    --role "Storage Table Data Contributor" `
+    --scope $outputStorageId `
+    --query "[].id" `
+    --output tsv)
+Assert-NativeCommandSucceeded "Checking for the legacy table role assignment"
+if ($legacyTableRoleIds.Count -gt 0) {
+    az role assignment delete --ids $legacyTableRoleIds
+    Assert-NativeCommandSucceeded "Removing the legacy table role assignment"
+}
+
+$legacyTableId = az resource list `
+    --resource-group $ResourceGroup `
+    --resource-type "Microsoft.Storage/storageAccounts/tableServices/tables" `
+    --query "[?ends_with(id, '/tableServices/default/tables/encodingstate')].id | [0]" `
+    --output tsv
+Assert-NativeCommandSucceeded "Checking for the legacy encoding state table"
+if (-not [string]::IsNullOrWhiteSpace($legacyTableId)) {
+    az resource delete --ids $legacyTableId
+    Assert-NativeCommandSucceeded "Removing the legacy encoding state table"
+}
 
 Write-Host "Deployed SpotVideo to $($deployment.aksName.value) with image tag $ImageTag"
 Write-Host "Service Bus input queue: $serviceBusNamespace/video-submitted"
