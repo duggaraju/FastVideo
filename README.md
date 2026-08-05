@@ -66,7 +66,7 @@ Send the JSON shape in [samples/video-submitted.json](samples/video-submitted.js
 
 When encoding parameters are omitted, analysis uses the source codec, bitrate, resolution, and frame rate to select CRF, preset, and a maximum video bitrate. The default target codec is `libsvtav1`. Optional `crf`, `preset`, and `maxVideoBitrateKbps` values override the corresponding automatic choices.
 
-`useSpot` is optional and defaults to `true`. Set it to `false` to schedule all indexes for that video on the regular encoding pool. `calculateVmaf` is optional and defaults to `false`. When enabled, every encoder compares its output with the matching source interval. `VideoStitched.vmafScore` contains the unweighted arithmetic mean of the segment mean scores; it is `null` when VMAF was not requested.
+`useSpot` is optional and defaults to `true`. Set it to `false` to schedule all indexes for that video on the regular encoding pool. `calculateVmaf` is optional and defaults to `false`. When enabled, every encoder compares its output with the matching source interval. `VideoStitched.vmafScore` contains the unweighted arithmetic mean of the segment mean scores; it is `null` when VMAF was not requested. The final `.vmaf.json` beside the output video contains that overall `Score` and an ordered `Segments` array with the `Index` and `Score` for every segment.
 
 Job IDs must be unique for distinct work. Reusing a job ID deliberately resumes or deduplicates that workflow because Kubernetes Job names and output paths derive from it.
 
@@ -136,7 +136,7 @@ After the final video and completion event are published, the stitcher removes t
 - Stitch jobs mount only output storage; they cannot access the input mount.
 - This avoids large local downloads on node OS disks and keeps media I/O on Blob storage paths.
 
-Parallelization strategy is configured through `Encoding__ParallelizationStrategy`:
+Set `parallelizationStrategy` on a submitted message to select a strategy for that video. When omitted, the worker uses the strategy configured through `Encoding__ParallelizationStrategy`:
 
 - `fixed-duration` (default): split using `ceil(video duration / Encoding__MaxParallelism)`, clamped to `segmentDurationSeconds` (60 seconds by default) through 180 seconds
 - `keyframe-boundary`: accumulate one or more GOPs per segment and use the last keyframe at or before the target duration; a segment exceeds the target only when a single GOP is longer

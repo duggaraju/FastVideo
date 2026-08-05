@@ -11,7 +11,8 @@ public sealed record VideoSubmitted(
     int? Crf = null,
     int? MaxVideoBitrateKbps = null,
     bool UseSpot = true,
-    bool CalculateVmaf = false);
+    bool CalculateVmaf = false,
+    string? ParallelizationStrategy = null);
 
 public sealed record VideoManifest(
     string JobId,
@@ -52,5 +53,9 @@ public sealed record VideoStitched(
     double? VmafScore = null);
 
 public sealed record SegmentVmaf(
-    int SegmentIndex,
+    int Index,
     double Score);
+
+public sealed record VideoVmaf(
+    double Score,
+    IReadOnlyList<SegmentVmaf> Segments);

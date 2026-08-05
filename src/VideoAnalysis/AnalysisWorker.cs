@@ -10,7 +10,7 @@ namespace SpotVideo.Analysis;
 public sealed class AnalysisWorker(
     ServiceBusClient serviceBus,
     IKubernetes kubernetes,
-    IParallelizationStrategy parallelizationStrategy,
+    IParallelizationStrategyFactory parallelizationStrategyFactory,
     IConfiguration configuration,
     ILogger<AnalysisWorker> logger) : BackgroundService
 {
@@ -38,6 +38,7 @@ public sealed class AnalysisWorker(
             var request = args.Message.Body.ToObjectFromJson<VideoSubmitted>(JsonSerializerOptions.Web)
                 ?? throw new InvalidOperationException("Message body is empty");
             Validate(request);
+            var parallelizationStrategy = parallelizationStrategyFactory.GetStrategy(request.ParallelizationStrategy);
             var workingContainer = configuration["Storage:WorkingContainer"] ?? "videos";
             var inputAccount = RequiredConfig("Storage:InputAccountName");
             var inputContainer = RequiredConfig("Storage:InputContainer");

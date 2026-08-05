@@ -40,9 +40,10 @@ try
     var missingVmafPaths = vmafPaths.Where(path => !File.Exists(path)).ToList();
     if (missingVmafPaths.Count > 0)
         throw new InvalidOperationException($"Expected {segmentCount} VMAF results but {missingVmafPaths.Count} files are missing");
-    double? vmafScore = calculateVmaf
-        ? (await Task.WhenAll(vmafPaths.Select(ReadVmafAsync))).Average(result => result.Score)
-        : null;
+    var segmentVmafScores = calculateVmaf
+        ? (await Task.WhenAll(vmafPaths.Select(ReadVmafAsync))).OrderBy(result => result.Index).ToList()
+        : [];
+    double? vmafScore = calculateVmaf ? segmentVmafScores.Average(result => result.Score) : null;
 
     var stitchedVideoPath = Path.Combine(workingDirectory, "stitched-video.mp4");
     var concatListPath = Path.Combine(workingDirectory, "segments.txt");
@@ -72,7 +73,7 @@ try
         var outputVmafPath = Path.ChangeExtension(outputPath, ".vmaf.json");
         await File.WriteAllBytesAsync(
             outputVmafPath,
-            JsonSerializer.SerializeToUtf8Bytes(new { Score = vmafScore.Value }));
+            JsonSerializer.SerializeToUtf8Bytes(new VideoVmaf(vmafScore.Value, segmentVmafScores)));
     }
 
     await using var serviceBus = new ServiceBusClient(Required("SERVICE_BUS_NAMESPACE"), credential);
