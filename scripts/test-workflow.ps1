@@ -1,9 +1,11 @@
 [CmdletBinding()]
 param(
     [string] $ResourceGroup = "rg-spotvideo",
-    [uri] $InputVideoUri = "https://spotvideoinsoudinndket2a.blob.core.windows.net/input/bingshort.mp4",
+    [uri] $InputVideoUri = "https://spotvideoinsoudinndket2a.blob.core.windows.net/input/BigBuckBunny_1080p_10min.mp4",
     [ValidateRange(1, 86400)]
     [int] $SegmentDurationSeconds = 60,
+    [ValidateSet("fixed-duration", "keyframe-boundary")]
+    [string] $ParallelizationStrategy = "fixed-duration",
     [string] $AudioCodec = "copy",
     [Nullable[int]] $Crf,
     [Nullable[int]] $MaxVideoBitrateKbps,
@@ -90,6 +92,7 @@ $payload = [ordered]@{
     inputVideoUri = $InputVideoUri.AbsoluteUri
     outputVideoUri = $outputVideoUri
     segmentDurationSeconds = $SegmentDurationSeconds
+    parallelizationStrategy = $ParallelizationStrategy
     audioCodec = $AudioCodec
     useSpot = $UseSpot
     calculateVmaf = $CalculateVmaf.IsPresent

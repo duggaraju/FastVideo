@@ -86,6 +86,7 @@ The script discovers the latest successful deployment, creates one `test-yyyyMMd
 ./scripts/test-workflow.ps1 `
     -ResourceGroup rg-spotvideo `
     -InputVideoUri "https://spotvideoinsoudinndket2a.blob.core.windows.net/input/bingshort.mp4" `
+    -ParallelizationStrategy keyframe-boundary `
     -UseSpot $false `
     -CalculateVmaf `
     -TimeoutMinutes 90
