@@ -4,11 +4,11 @@ targetScope = 'resourceGroup'
 @maxLength(12)
 param prefix string = 'spotvideo'
 param location string = resourceGroup().location
-param systemVmSize string = 'Standard_D2s_v5'
-param spotVmSize string = 'Standard_D8s_v5'
+param systemVmSize string = 'Standard_D2ds_v5'
+param spotVmSize string = 'Standard_D8ds_v5'
 param spotMinCount int = 0
 param spotMaxCount int = 20
-param regularVmSize string = 'Standard_D8s_v5'
+param regularVmSize string = 'Standard_D8ds_v5'
 param regularMinCount int = 0
 param regularMaxCount int = 20
 param kubernetesVersion string = ''
@@ -192,7 +192,9 @@ resource aks 'Microsoft.ContainerService/managedClusters@2025-05-01' = {
         count: 2
         vmSize: systemVmSize
         osType: 'Linux'
-        osSKU: 'Ubuntu'
+        osSKU: 'AzureLinux'
+        osDiskType: 'Ephemeral'
+        osDiskSizeGB: 64
         mode: 'System'
         type: 'VirtualMachineScaleSets'
         enableAutoScaling: true
@@ -205,7 +207,9 @@ resource aks 'Microsoft.ContainerService/managedClusters@2025-05-01' = {
         count: spotMinCount
         vmSize: spotVmSize
         osType: 'Linux'
-        osSKU: 'Ubuntu'
+        osSKU: 'AzureLinux'
+        osDiskType: 'Ephemeral'
+        osDiskSizeGB: 64
         mode: 'User'
         type: 'VirtualMachineScaleSets'
         enableAutoScaling: true
@@ -223,7 +227,9 @@ resource aks 'Microsoft.ContainerService/managedClusters@2025-05-01' = {
         count: regularMinCount
         vmSize: regularVmSize
         osType: 'Linux'
-        osSKU: 'Ubuntu'
+        osSKU: 'AzureLinux'
+        osDiskType: 'Ephemeral'
+        osDiskSizeGB: 64
         mode: 'User'
         type: 'VirtualMachineScaleSets'
         enableAutoScaling: true

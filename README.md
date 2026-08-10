@@ -7,11 +7,11 @@ SpotVideo is a .NET 10 and FFmpeg pipeline for horizontally parallel video encod
 1. KEDA scales `SpotVideo.Analysis` from the `video-submitted` Service Bus queue.
 2. The service reads the source from the read-only input mount, probes it with FFMpegCore/FFprobe, extracts one audio track (copy or optional re-encode) to output storage, computes segment boundaries, writes the manifest to output storage, and creates a Kubernetes Indexed Job.
 3. Every `SpotVideo.Encoder` index reads the source from input storage, encodes only its deterministic video time range (no audio), and writes to a unique staging path on the output BlobFuse mount. After FFmpeg succeeds, it renames the staging file to the deterministic segment path. When requested, the index also compares the segment with its source interval using VMAF and writes a deterministic score sidecar. A retry skips each artifact that already exists. Each index gets up to five retries on interruption or encoding failure.
-4. Kubernetes marks the Indexed encode Job complete only after every index succeeds. The singleton Job watcher observes that condition and creates a deterministic stitch Job using metadata stored on the encode Job.
+4. Kubernetes marks the Indexed encode Job complete only after every index succeeds. The singleton Job watcher observes that condition and creates a deterministic stitch Job using metadata stored on the encode Job. Stitching follows the request's `useSpot` setting and runs on the same Spot or regular pool selected for encoding.
 5. `SpotVideo.Stitcher` constructs ordered segment paths directly from indexes `0..SegmentCount-1`, reads them and the extracted audio exclusively from output storage, writes the requested final output path, and sends `VideoStitched`. When VMAF was requested, the event includes the arithmetic mean of all segment VMAF means.
 6. A singleton Job watcher logs failed encode pod attempts and sends one terminal `VideoProcessingResult` per video to `video-results`: encode failure after all retries means failure, stitch success means success, and stitch failure means failure. Individual retry failures and encode success are not sent to Service Bus. After stitching succeeds, the watcher deletes the corresponding encode Job.
 
-Indexed encode Jobs use Spot nodes by default and tolerate eviction. A request can instead select the dedicated autoscaling regular encoding pool. Analysis, the Job watcher, and stitch workloads run on regular system nodes. Encoder retries remain safe because blob names are deterministic, while Kubernetes Job conditions provide durable fan-in state.
+Indexed encode Jobs use Spot nodes by default and tolerate eviction. A request can instead select the dedicated autoscaling regular encoding pool. Stitch Jobs use the same pool selected for encoding, while lightweight analysis and the Job watcher remain on regular system nodes. Encoder retries remain safe because blob names are deterministic, while Kubernetes Job conditions provide durable fan-in state.
 
 ## Projects
 
@@ -31,7 +31,7 @@ Indexed encode Jobs use Spot nodes by default and tolerate eviction. A request c
 - An Azure subscription where the deployer can create AKS, role assignments, ACR, Storage, Service Bus, and managed identities
 - Permission to write Azure role assignments on the target scope (for example, Owner or User Access Administrator)
 
-Runtime containers default to BtbN's latest Linux x64 GPL shared FFmpeg build with `libvmaf` on Ubuntu 26.04 and run as the non-root `app` user. The release archive is verified against BtbN's published SHA-256 checksums during each image build. Set the Docker build argument `FFMPEG_BUILD=ubuntu` (or deploy with `-FfmpegBuild ubuntu`) to use Ubuntu's packaged FFmpeg instead. VMAF requires the default `btbn` build. Azure access uses AKS Workload Identity; no connection strings or account keys are deployed.
+Runtime containers use the .NET 10 Azure Linux 3 image and run as the non-root `app` user. They default to BtbN's latest Linux x64 GPL shared FFmpeg build; the release archive is verified against BtbN's published SHA-256 checksums during each image build. Set the Docker build argument `FFMPEG_BUILD=custom` (or deploy with `-FfmpegBuild custom`) to compile FFmpeg 9.0 with native AAC, `libx264`, `libsvtav1`, `libdav1d`, and `libvmaf`. Override the custom version with the `FFMPEG_VERSION` Docker build argument or `-FfmpegVersion` deployment parameter. Both variants include the VMAF model. Azure access uses AKS Workload Identity; no connection strings or account keys are deployed.
 
 ## Build
 
@@ -46,7 +46,17 @@ dotnet build SpotVideo.slnx --no-restore --configuration Release
 ./scripts/deploy.ps1 -ResourceGroup rg-spotvideo -Location eastus
 ```
 
-The script deploys [infra/main.bicep](infra/main.bicep), builds four images with ACR Tasks, renders [deploy/k8s/spotvideo.yaml](deploy/k8s/spotvideo.yaml), applies it, and restarts the workload deployments so rebuilt images are used even with the default `latest` tag. The AKS system pool hosts analysis, the Job watcher, and stitch jobs. Dedicated Spot and regular encoding pools both autoscale from zero; requests use Spot unless `useSpot` is `false`.
+To compile a specific FFmpeg release from the official GitHub mirror:
+
+```powershell
+./scripts/deploy.ps1 `
+    -ResourceGroup rg-spotvideo `
+    -Location eastus `
+    -FfmpegBuild custom `
+    -FfmpegVersion 9.0
+```
+
+The script deploys [infra/main.bicep](infra/main.bicep), builds four images with ACR Tasks, renders [deploy/k8s/spotvideo.yaml](deploy/k8s/spotvideo.yaml), applies it, and restarts the workload deployments so rebuilt images are used even with the default `latest` tag. The AKS system pool hosts analysis and the Job watcher. Dedicated Spot and regular media-processing pools both autoscale from zero; encoding and stitching use Spot unless `useSpot` is `false`.
 
 The infrastructure also enables Container Insights with managed-identity authentication and retains container logs in Log Analytics for 30 days, including logs from pods deleted after KEDA scales a deployment to zero.
 

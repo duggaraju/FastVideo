@@ -7,8 +7,9 @@ param(
 
     [string] $Prefix = "spotvideo",
     [string] $ImageTag = "latest",
-    [ValidateSet("btbn", "ubuntu")]
+    [ValidateSet("btbn", "custom")]
     [string] $FfmpegBuild = "btbn",
+    [string] $FfmpegVersion = "9.0",
     [switch] $UseLocalDocker,
     [switch] $SkipInfrastructureDeployment
 )
@@ -89,6 +90,7 @@ foreach ($project in $projects) {
             --build-arg "PROJECT=$projectName" `
             --build-arg "APP_DLL=$projectName.dll" `
             --build-arg "FFMPEG_BUILD=$FfmpegBuild" `
+            --build-arg "FFMPEG_VERSION=$FfmpegVersion" `
             --tag $fullImage `
             $root
         Assert-NativeCommandSucceeded "Building $projectName image"
@@ -104,6 +106,7 @@ foreach ($project in $projects) {
             --build-arg "PROJECT=$projectName" `
             --build-arg "APP_DLL=$projectName.dll" `
             --build-arg "FFMPEG_BUILD=$FfmpegBuild" `
+            --build-arg "FFMPEG_VERSION=$FfmpegVersion" `
             $root
         Assert-NativeCommandSucceeded "Building $projectName image in Azure Container Registry"
     }

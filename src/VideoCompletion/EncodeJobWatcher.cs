@@ -185,6 +185,11 @@ public sealed class EncodeJobWatcher(
             ?? throw new InvalidOperationException($"Encode job {encodeJob.Metadata.Name} has no annotations");
         var jobId = RequiredAnnotation(annotations, JobNames.JobIdAnnotation);
         var stitchJobName = JobNames.For("stitch", jobId);
+        var useSpot = annotations.TryGetValue(JobNames.UseSpotAnnotation, out var useSpotValue)
+            ? bool.Parse(useSpotValue)
+            : encodeJob.Spec?.Template?.Spec?.NodeSelector?.TryGetValue(
+                "kubernetes.azure.com/agentpool",
+                out var agentPool) == true && agentPool == "spot";
         try
         {
             await kubernetes.BatchV1.ReadNamespacedJobAsync(stitchJobName, targetNamespace, cancellationToken: cancellationToken);
@@ -244,7 +249,14 @@ public sealed class EncodeJobWatcher(
                 ],
                 RestartPolicy = "Never",
                 ServiceAccountName = "spotvideo-worker",
-                NodeSelector = new Dictionary<string, string> { ["kubernetes.azure.com/mode"] = "system", ["kubernetes.io/os"] = "linux" },
+                Tolerations = useSpot
+                    ? [new V1Toleration { Effect = "NoSchedule", OperatorProperty = "Equal", Key = "kubernetes.azure.com/scalesetpriority", Value = "spot" }]
+                    : null,
+                NodeSelector = new Dictionary<string, string>
+                {
+                    ["kubernetes.azure.com/agentpool"] = useSpot ? "spot" : "regular",
+                    ["kubernetes.io/os"] = "linux"
+                },
                 TerminationGracePeriodSeconds = 120
             }
         };
@@ -254,7 +266,12 @@ public sealed class EncodeJobWatcher(
             {
                 Name = stitchJobName,
                 Labels = labels,
-                Annotations = new Dictionary<string, string> { [JobNames.JobIdAnnotation] = jobId }
+                Annotations = new Dictionary<string, string>
+                {
+                    [JobNames.JobIdAnnotation] = jobId,
+                    [JobNames.StageIdAnnotation] = stitchJobName,
+                    [JobNames.UseSpotAnnotation] = useSpot.ToString()
+                }
             },
             Spec = new V1JobSpec { Template = pod, BackoffLimit = 6, TtlSecondsAfterFinished = 3600 }
         };

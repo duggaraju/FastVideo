@@ -38,6 +38,8 @@ public sealed class AnalysisWorker(
             var request = args.Message.Body.ToObjectFromJson<VideoSubmitted>(JsonSerializerOptions.Web)
                 ?? throw new InvalidOperationException("Message body is empty");
             Validate(request);
+            var analysisStageId = JobNames.For("analysis", request.JobId);
+            logger.LogInformation("Started analysis stage {AnalysisStageId} for {JobId}", analysisStageId, request.JobId);
             var parallelizationStrategy = parallelizationStrategyFactory.GetStrategy(request.ParallelizationStrategy);
             var workingContainer = configuration["Storage:WorkingContainer"] ?? "videos";
             var inputAccount = RequiredConfig("Storage:InputAccountName");
@@ -224,7 +226,7 @@ public sealed class AnalysisWorker(
                         ],
                         Resources = new V1ResourceRequirements
                         {
-                            Requests = new Dictionary<string, ResourceQuantity> { ["cpu"] = new("2"), ["memory"] = new("4Gi") },
+                            Requests = new Dictionary<string, ResourceQuantity> { ["cpu"] = new("1750m"), ["memory"] = new("4Gi") },
                             Limits = new Dictionary<string, ResourceQuantity> { ["cpu"] = new("4"), ["memory"] = new("8Gi") }
                         }
                     }
@@ -255,6 +257,8 @@ public sealed class AnalysisWorker(
                 Annotations = new Dictionary<string, string>
                 {
                     [JobNames.JobIdAnnotation] = manifest.JobId,
+                    [JobNames.StageIdAnnotation] = jobName,
+                    [JobNames.UseSpotAnnotation] = manifest.UseSpot.ToString(),
                     [JobNames.SegmentCountAnnotation] = manifest.SegmentCount.ToString(),
                     [JobNames.AudioBlobNameAnnotation] = manifest.AudioBlobName,
                     [JobNames.OutputVideoUriAnnotation] = manifest.OutputVideoUri.ToString(),

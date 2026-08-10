@@ -1,10 +1,10 @@
 using './main.bicep'
 
 param prefix = 'spotvideo'
-param systemVmSize = 'Standard_D4s_v5'
-param spotVmSize = 'Standard_D8s_v5'
+param systemVmSize = 'Standard_D2ds_v5'
+param spotVmSize = 'Standard_D8ds_v5'
 param spotMinCount = 0
 param spotMaxCount = 20
-param regularVmSize = 'Standard_D8s_v5'
+param regularVmSize = 'Standard_D8ds_v5'
 param regularMinCount = 0
 param regularMaxCount = 20

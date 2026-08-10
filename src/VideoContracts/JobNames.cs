@@ -6,6 +6,8 @@ namespace SpotVideo.Contracts;
 public static class JobNames
 {
     public const string JobIdAnnotation = "spotvideo/job-id";
+    public const string StageIdAnnotation = "spotvideo/stage-id";
+    public const string UseSpotAnnotation = "spotvideo/use-spot";
     public const string SegmentCountAnnotation = "spotvideo/segment-count";
     public const string AudioBlobNameAnnotation = "spotvideo/audio-blob-name";
     public const string OutputVideoUriAnnotation = "spotvideo/output-video-uri";
