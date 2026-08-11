@@ -1,14 +1,22 @@
 ARG FFMPEG_BUILD=btbn
 
 FROM ubuntu:26.04 AS ffmpeg-btbn
-ARG FFMPEG_ARCHIVE=ffmpeg-master-latest-linux64-gpl-shared.tar.xz
+ARG TARGETARCH
+ARG FFMPEG_ARCHIVE
 ARG VMAF_VERSION=3.0.0
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
         ca-certificates curl xz-utils \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
-RUN curl --fail --location --silent --show-error \
+RUN if [ -z "${FFMPEG_ARCHIVE}" ]; then \
+        case "${TARGETARCH}" in \
+            amd64) FFMPEG_ARCHIVE=ffmpeg-master-latest-linux64-gpl-shared.tar.xz ;; \
+            arm64) FFMPEG_ARCHIVE=ffmpeg-master-latest-linuxarm64-gpl-shared.tar.xz ;; \
+            *) echo "Unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+        esac; \
+    fi \
+    && curl --fail --location --silent --show-error \
         "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/${FFMPEG_ARCHIVE}" \
         --output ffmpeg.tar.xz \
     && curl --fail --location --silent --show-error \
@@ -25,14 +33,16 @@ RUN curl --fail --location --silent --show-error \
         --output /opt/ffmpeg/share/vmaf/vmaf_v0.6.1.json
 
 FROM mcr.microsoft.com/azurelinux/base/core:3.0 AS ffmpeg-custom
+ARG TARGETARCH
 ARG FFMPEG_VERSION=9.0
 ARG DAV1D_VERSION=1.5.4
 ARG SVT_AV1_VERSION=4.0.1
 ARG VMAF_VERSION=3.0.0
 ARG X264_REF=stable
-RUN tdnf install --assumeyes \
-    autoconf automake binutils ca-certificates cmake curl gawk gcc gcc-c++ glibc-devel \
-    kernel-headers libtool make meson nasm ninja-build pkg-config python3 tar xz \
+RUN build_packages="autoconf automake binutils ca-certificates cmake curl gawk gcc gcc-c++ glibc-devel \
+        kernel-headers libtool make meson ninja-build pkg-config python3 tar xz" \
+    && if [ "${TARGETARCH}" = "amd64" ]; then build_packages="${build_packages} nasm"; fi \
+    && tdnf install --assumeyes ${build_packages} \
     && tdnf clean all
 WORKDIR /build
 RUN curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
@@ -116,12 +126,13 @@ RUN curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
 
 FROM ffmpeg-${FFMPEG_BUILD} AS ffmpeg
 
-FROM mcr.microsoft.com/dotnet/sdk:10.0-resolute AS build
+FROM --platform=$BUILDPLATFORM mcr.microsoft.com/dotnet/sdk:10.0-resolute AS build
 ARG PROJECT
+ARG TARGETARCH
 WORKDIR /source
 COPY . .
-RUN dotnet restore "src/${PROJECT}/${PROJECT}.csproj" \
-    && dotnet publish "src/${PROJECT}/${PROJECT}.csproj" --no-restore -c Release -o /app
+RUN dotnet restore "src/${PROJECT}/${PROJECT}.csproj" -a "${TARGETARCH}" \
+    && dotnet publish "src/${PROJECT}/${PROJECT}.csproj" --no-restore -c Release -a "${TARGETARCH}" -o /app
 
 FROM mcr.microsoft.com/dotnet/runtime:10.0-azurelinux3.0 AS runtime
 COPY --from=ffmpeg /opt/ffmpeg/bin/ffmpeg /opt/ffmpeg/bin/ffprobe /opt/ffmpeg/bin/

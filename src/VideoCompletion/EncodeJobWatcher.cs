@@ -188,8 +188,9 @@ public sealed class EncodeJobWatcher(
         var useSpot = annotations.TryGetValue(JobNames.UseSpotAnnotation, out var useSpotValue)
             ? bool.Parse(useSpotValue)
             : encodeJob.Spec?.Template?.Spec?.NodeSelector?.TryGetValue(
-                "kubernetes.azure.com/agentpool",
-                out var agentPool) == true && agentPool == "spot";
+                "kubernetes.azure.com/scalesetpriority",
+                out var scaleSetPriority) == true && scaleSetPriority == "spot";
+        var architecture = OptionalAnnotation(annotations, JobNames.ArchitectureAnnotation, string.Empty);
         try
         {
             await kubernetes.BatchV1.ReadNamespacedJobAsync(stitchJobName, targetNamespace, cancellationToken: cancellationToken);
@@ -207,6 +208,15 @@ public sealed class EncodeJobWatcher(
         };
         var outputVolumeName = "output-storage";
         var outputMountPath = configuration["Storage:OutputMountPath"] ?? "/mnt/output";
+        var nodeSelector = new Dictionary<string, string>
+        {
+            ["workload"] = "video-encoding",
+            ["kubernetes.azure.com/scalesetpriority"] = useSpot ? "spot" : "regular",
+            ["kubernetes.io/os"] = "linux"
+        };
+        if (!string.IsNullOrEmpty(architecture))
+            nodeSelector["kubernetes.io/arch"] = architecture;
+
         var pod = new V1PodTemplateSpec
         {
             Metadata = new V1ObjectMeta { Labels = labels },
@@ -252,11 +262,7 @@ public sealed class EncodeJobWatcher(
                 Tolerations = useSpot
                     ? [new V1Toleration { Effect = "NoSchedule", OperatorProperty = "Equal", Key = "kubernetes.azure.com/scalesetpriority", Value = "spot" }]
                     : null,
-                NodeSelector = new Dictionary<string, string>
-                {
-                    ["kubernetes.azure.com/agentpool"] = useSpot ? "spot" : "regular",
-                    ["kubernetes.io/os"] = "linux"
-                },
+                NodeSelector = nodeSelector,
                 TerminationGracePeriodSeconds = 120
             }
         };
@@ -275,6 +281,8 @@ public sealed class EncodeJobWatcher(
             },
             Spec = new V1JobSpec { Template = pod, BackoffLimit = 6, TtlSecondsAfterFinished = 3600 }
         };
+        if (!string.IsNullOrEmpty(architecture))
+            stitchJob.Metadata.Annotations[JobNames.ArchitectureAnnotation] = architecture;
         await kubernetes.BatchV1.CreateNamespacedJobAsync(stitchJob, targetNamespace, cancellationToken: cancellationToken);
         logger.LogInformation("Submitted stitch job for {JobId}", jobId);
     }

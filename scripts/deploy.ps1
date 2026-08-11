@@ -1,7 +1,6 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)]
-    [string] $ResourceGroup,
+    [string] $ResourceGroup = "$([Environment]::UserName)-spotvideo",
 
     [string] $Location,
 
@@ -10,6 +9,7 @@ param(
     [ValidateSet("btbn", "custom")]
     [string] $FfmpegBuild = "btbn",
     [string] $FfmpegVersion = "9.0",
+    [string] $Platforms = "linux/amd64,linux/arm64",
     [switch] $UseLocalDocker,
     [switch] $SkipInfrastructureDeployment
 )
@@ -85,30 +85,67 @@ foreach ($project in $projects) {
     $imageName = "spotvideo-$($project.ToLowerInvariant())"
     $fullImage = "${acrLoginServer}/${imageName}:${ImageTag}"
     if ($UseLocalDocker) {
-        docker build `
-            --file (Join-Path $root "docker/Dockerfile") `
-            --build-arg "PROJECT=$projectName" `
-            --build-arg "APP_DLL=$projectName.dll" `
-            --build-arg "FFMPEG_BUILD=$FfmpegBuild" `
-            --build-arg "FFMPEG_VERSION=$FfmpegVersion" `
-            --tag $fullImage `
-            $root
-        Assert-NativeCommandSucceeded "Building $projectName image"
         az acr login --name $acrName
         Assert-NativeCommandSucceeded "Logging in to Azure Container Registry '$acrName'"
-        docker push $fullImage
-        Assert-NativeCommandSucceeded "Pushing $projectName image"
+        if ($Platforms.Contains(',')) {
+            docker buildx build `
+                --platform $Platforms `
+                --file (Join-Path $root "docker/Dockerfile") `
+                --build-arg "PROJECT=$projectName" `
+                --build-arg "APP_DLL=$projectName.dll" `
+                --build-arg "FFMPEG_BUILD=$FfmpegBuild" `
+                --build-arg "FFMPEG_VERSION=$FfmpegVersion" `
+                --tag $fullImage `
+                --push `
+                $root
+            Assert-NativeCommandSucceeded "Building and pushing multi-platform $projectName image"
+        } else {
+            docker build `
+                --platform $Platforms `
+                --file (Join-Path $root "docker/Dockerfile") `
+                --build-arg "PROJECT=$projectName" `
+                --build-arg "APP_DLL=$projectName.dll" `
+                --build-arg "FFMPEG_BUILD=$FfmpegBuild" `
+                --build-arg "FFMPEG_VERSION=$FfmpegVersion" `
+                --tag $fullImage `
+                $root
+            Assert-NativeCommandSucceeded "Building $projectName image"
+            docker push $fullImage
+            Assert-NativeCommandSucceeded "Pushing $projectName image"
+        }
     } else {
-        az acr build `
-            --registry $acrName `
-            --image "${imageName}:${ImageTag}" `
-            --file (Join-Path $root "docker/Dockerfile") `
-            --build-arg "PROJECT=$projectName" `
-            --build-arg "APP_DLL=$projectName.dll" `
-            --build-arg "FFMPEG_BUILD=$FfmpegBuild" `
-            --build-arg "FFMPEG_VERSION=$FfmpegVersion" `
-            $root
-        Assert-NativeCommandSucceeded "Building $projectName image in Azure Container Registry"
+        $platformList = @($Platforms.Split(',', [StringSplitOptions]::RemoveEmptyEntries) | ForEach-Object { $_.Trim() })
+        $platformImages = @()
+        foreach ($platform in $platformList) {
+            $platformSuffix = $platform.Replace('linux/', '')
+            $platformImage = "${imageName}:${ImageTag}-${platformSuffix}"
+            az acr build `
+                --registry $acrName `
+                --image $platformImage `
+                --platform $platform `
+                --file (Join-Path $root "docker/Dockerfile") `
+                --build-arg "TARGETARCH=$platformSuffix" `
+                --build-arg "PROJECT=$projectName" `
+                --build-arg "APP_DLL=$projectName.dll" `
+                --build-arg "FFMPEG_BUILD=$FfmpegBuild" `
+                --build-arg "FFMPEG_VERSION=$FfmpegVersion" `
+                $root
+            Assert-NativeCommandSucceeded "Building $projectName image for $platform in Azure Container Registry"
+            $platformImages += "${acrLoginServer}/${platformImage}"
+        }
+        if ($platformImages.Count -gt 1) {
+            az acr login --name $acrName
+            Assert-NativeCommandSucceeded "Logging in to Azure Container Registry '$acrName'"
+            docker buildx imagetools create --tag $fullImage @platformImages
+            Assert-NativeCommandSucceeded "Creating multi-platform manifest for $projectName"
+        } else {
+            az acr import `
+                --name $acrName `
+                --source $platformImages[0] `
+                --image "${imageName}:${ImageTag}" `
+                --force
+            Assert-NativeCommandSucceeded "Tagging $projectName image"
+        }
     }
 }
 

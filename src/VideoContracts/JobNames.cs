@@ -5,6 +5,8 @@ namespace SpotVideo.Contracts;
 
 public static class JobNames
 {
+    public const string BenchmarkArchitectureProperty = "spotvideo-benchmark-architecture";
+    public const string ArchitectureAnnotation = "spotvideo/architecture";
     public const string JobIdAnnotation = "spotvideo/job-id";
     public const string StageIdAnnotation = "spotvideo/stage-id";
     public const string UseSpotAnnotation = "spotvideo/use-spot";

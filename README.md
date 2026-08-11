@@ -43,20 +43,21 @@ dotnet build SpotVideo.slnx --no-restore --configuration Release
 ## Deploy
 
 ```powershell
-./scripts/deploy.ps1 -ResourceGroup rg-spotvideo -Location eastus
+./scripts/deploy.ps1 -Location westus2
 ```
+
+The resource group defaults to `<current-user-id>-spotvideo`, so each user gets an isolated deployment. Pass `-ResourceGroup` to override it.
 
 To compile a specific FFmpeg release from the official GitHub mirror:
 
 ```powershell
 ./scripts/deploy.ps1 `
-    -ResourceGroup rg-spotvideo `
-    -Location eastus `
+    -Location westus2 `
     -FfmpegBuild custom `
     -FfmpegVersion 9.0
 ```
 
-The script deploys [infra/main.bicep](infra/main.bicep), builds four images with ACR Tasks, renders [deploy/k8s/spotvideo.yaml](deploy/k8s/spotvideo.yaml), applies it, and restarts the workload deployments so rebuilt images are used even with the default `latest` tag. The AKS system pool hosts analysis and the Job watcher. Dedicated Spot and regular media-processing pools both autoscale from zero; encoding and stitching use Spot unless `useSpot` is `false`.
+The script deploys [infra/main.bicep](infra/main.bicep), builds four `linux/amd64` and `linux/arm64` images with ACR Tasks, publishes one multi-architecture manifest per worker, renders [deploy/k8s/spotvideo.yaml](deploy/k8s/spotvideo.yaml), applies it, and restarts the workload deployments so rebuilt images are used even with the default `latest` tag. The AKS system pool hosts analysis and the Job watcher. Dedicated x64 Spot, ARM64 Spot, and regular media-processing pools autoscale from zero. Encoding and stitching use any available Spot media architecture unless `useSpot` is `false`; no architecture-specific application code or image tag is required.
 
 The infrastructure also enables Container Insights with managed-identity authentication and retains container logs in Log Analytics for 30 days, including logs from pods deleted after KEDA scales a deployment to zero.
 
@@ -64,7 +65,6 @@ When the infrastructure has not changed, skip the Bicep deployment and reuse the
 
 ```powershell
 ./scripts/deploy.ps1 `
-    -ResourceGroup rg-spotvideo `
     -SkipInfrastructureDeployment
 ```
 
@@ -87,14 +87,13 @@ Use the timestamp format `test-yyyyMMdd-HHmm` for manual tests. For example, a t
 The signed-in Azure identity needs `Azure Service Bus Data Sender` on the namespace, `Storage Blob Data Reader` on the input and output accounts, and access to retrieve AKS credentials. Run the test script:
 
 ```powershell
-./scripts/test-workflow.ps1 -ResourceGroup rg-spotvideo
+./scripts/test-workflow.ps1
 ```
 
 The script discovers the latest successful deployment, creates one `test-yyyyMMdd-HHmm` job ID, verifies the input blob, submits the message without an account key, and waits up to 60 minutes for a nonzero final blob. Override the source or timeout when needed:
 
 ```powershell
 ./scripts/test-workflow.ps1 `
-    -ResourceGroup rg-spotvideo `
     -InputVideoUri "https://spotvideoinsoudinndket2a.blob.core.windows.net/input/bingshort.mp4" `
     -ParallelizationStrategy keyframe-boundary `
     -UseSpot $false `
@@ -103,6 +102,26 @@ The script discovers the latest successful deployment, creates one `test-yyyyMMd
 ```
 
 After the blob validation succeeds, the script reports the active `video-results` message count. Inspect that queue with Service Bus Explorer using **Peek** and confirm the matching `VideoProcessingResult` has `succeeded` set to `true` and `terminalStage` set to `stitch`; peeking avoids removing the result. On timeout, the script prints the current KEDA, pod, and Job state.
+
+### Compare AMD64 and ARM64
+
+The benchmark script can pin encoder and stitch Jobs to either architecture without adding architecture to the production message contract. It sends a benchmark-only Service Bus application property, and the analysis worker translates that property into the standard Kubernetes `kubernetes.io/arch` node selector. Normal submissions remain portable and use any matching architecture.
+
+Run the same source, encoding settings, Spot priority, and run count for both architectures:
+
+```powershell
+./scripts/benchmark-workflow.ps1 -Architecture amd64 -Runs 5 -UseSpot $true -OutputPath ./scripts/amd64.json
+./scripts/benchmark-workflow.ps1 -Architecture arm64 -Runs 5 -UseSpot $true -OutputPath ./scripts/arm64.json
+```
+
+Pass the effective hourly price for each VM SKU to include a node-active-time estimate:
+
+```powershell
+./scripts/benchmark-workflow.ps1 -Architecture amd64 -NodeHourlyPriceUsd <amd64-spot-price> -OutputPath ./scripts/amd64.json
+./scripts/benchmark-workflow.ps1 -Architecture arm64 -NodeHourlyPriceUsd <arm64-spot-price> -OutputPath ./scripts/arm64.json
+```
+
+Each result records requested and actual architecture, node pool, VM SKU, encoder and stitch pod duration, end-to-end duration, node-active seconds, and estimated compute cost. Compare median `encodeQueueAndRunSeconds`, `totalSeconds`, and `estimatedComputeUsd`; also report throughput as input video duration divided by encode runtime. The estimate merges overlapping pod intervals on each node, but excludes autoscaler startup/idle time, the shared system pool, storage, Service Bus, and Log Analytics. Use Azure Cost Management amortized or actual cost filtered by the benchmark window and node-pool VM scale set for the authoritative cost comparison. Run architectures in alternating order and use at least five runs to reduce Spot-capacity, cache, and autoscaling bias.
 
 ### Test from Azure Portal
 

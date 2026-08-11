@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string] $ResourceGroup = "rg-spotvideo",
+    [string] $ResourceGroup = "$([Environment]::UserName)-spotvideo",
     [uri] $InputVideoUri = "https://spotvideoinsoudinndket2a.blob.core.windows.net/input/BigBuckBunny_1080p_10min.mp4",
     [ValidateRange(1, 86400)]
     [int] $SegmentDurationSeconds = 60,

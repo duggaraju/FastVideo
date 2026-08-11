@@ -50,6 +50,7 @@ public sealed class AnalysisWorker(
             var outputMountPath = configuration["Storage:OutputMountPath"] ?? "/mnt/output";
             var audioBlobName = $"{request.JobId}/segments/audio.m4a";
             var videoCodec = string.IsNullOrWhiteSpace(request.VideoCodec) ? "libsvtav1" : request.VideoCodec;
+            var architecture = GetBenchmarkArchitecture(args.Message);
 
             var inputPath = BlobMountPaths.FromUri(request.InputVideoUri, inputAccount, inputContainer, inputMountPath);
             var audioPath = BlobMountPaths.FromBlobName(audioBlobName, outputMountPath);
@@ -112,7 +113,7 @@ public sealed class AnalysisWorker(
                 request.UseSpot,
                 request.CalculateVmaf);
             await WriteManifestAsync(manifest, outputMountPath, args.CancellationToken);
-            await SubmitEncodingJobAsync(manifest, minParallelismPerJob, outputAccount, outputContainer, inputAccount, inputContainer, outputMountPath, inputMountPath, args.CancellationToken);
+            await SubmitEncodingJobAsync(manifest, minParallelismPerJob, outputAccount, outputContainer, inputAccount, inputContainer, outputMountPath, inputMountPath, architecture, args.CancellationToken);
             await args.CompleteMessageAsync(args.Message, args.CancellationToken);
             logger.LogInformation(
                 "Submitted {SegmentCount} encoding indexes for {JobId} using {ParallelizationStrategy}; segment duration={SegmentDurationSeconds}s, initial parallelism={InitialParallelism}, max parallelism={MaxParallelism}, source={Width}x{Height} {SourceBitrateKbps}kbps, preset={Preset}, crf={Crf}, maxrate={MaxVideoBitrateKbps}kbps",
@@ -169,6 +170,7 @@ public sealed class AnalysisWorker(
         string inputContainer,
         string outputMountPath,
         string inputMountPath,
+        string? architecture,
         CancellationToken cancellationToken)
     {
         var jobName = JobNames.For("encode", manifest.JobId);
@@ -207,6 +209,14 @@ public sealed class AnalysisWorker(
             ["spotvideo/job-id"] = JobNames.LabelValue(manifest.JobId),
             ["azure.workload.identity/use"] = "true"
         };
+        var nodeSelector = new Dictionary<string, string>
+        {
+            ["workload"] = "video-encoding",
+            ["kubernetes.azure.com/scalesetpriority"] = manifest.UseSpot ? "spot" : "regular"
+        };
+        if (architecture is not null)
+            nodeSelector["kubernetes.io/arch"] = architecture;
+
         var pod = new V1PodTemplateSpec
         {
             Metadata = new V1ObjectMeta { Labels = labels },
@@ -241,10 +251,7 @@ public sealed class AnalysisWorker(
                 Tolerations = manifest.UseSpot
                     ? [new V1Toleration { Effect = "NoSchedule", OperatorProperty = "Equal", Key = "kubernetes.azure.com/scalesetpriority", Value = "spot" }]
                     : null,
-                NodeSelector = new Dictionary<string, string>
-                {
-                    ["kubernetes.azure.com/agentpool"] = manifest.UseSpot ? "spot" : "regular"
-                },
+                NodeSelector = nodeSelector,
                 TerminationGracePeriodSeconds = 120
             }
         };
@@ -275,7 +282,20 @@ public sealed class AnalysisWorker(
                 TtlSecondsAfterFinished = 86400
             }
         };
+        if (architecture is not null)
+            job.Metadata.Annotations[JobNames.ArchitectureAnnotation] = architecture;
         await kubernetes.BatchV1.CreateNamespacedJobAsync(job, targetNamespace, cancellationToken: cancellationToken);
+    }
+
+    private static string? GetBenchmarkArchitecture(ServiceBusReceivedMessage message)
+    {
+        if (!message.ApplicationProperties.TryGetValue(JobNames.BenchmarkArchitectureProperty, out var value))
+            return null;
+
+        var architecture = Convert.ToString(value);
+        return architecture is "amd64" or "arm64"
+            ? architecture
+            : throw new ArgumentException($"{JobNames.BenchmarkArchitectureProperty} must be amd64 or arm64");
     }
 
     private static V1EnvVar Env(string name, string value) => new() { Name = name, Value = value };

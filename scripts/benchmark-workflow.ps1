@@ -1,10 +1,14 @@
 [CmdletBinding()]
 param(
-    [string] $ResourceGroup = "krishndu-spotvideo",
+    [string] $ResourceGroup = "$([Environment]::UserName)-spotvideo",
     [uri] $InputVideoUri = "https://spotvideoinsoudinndket2a.blob.core.windows.net/input/BigBuckBunny_1080p_10min.mp4",
     [ValidateRange(1, 20)]
     [int] $Runs = 5,
     [bool] $UseSpot = $true,
+    [ValidateSet("any", "amd64", "arm64")]
+    [string] $Architecture = "any",
+    [ValidateRange(0, 1000)]
+    [decimal] $NodeHourlyPriceUsd = 0,
     [ValidateRange(1, 180)]
     [int] $TimeoutMinutes = 90,
     [string] $OutputPath
@@ -26,6 +30,37 @@ function Get-LabelValue([string] $Value) {
     $available = 52 - $hash.Length
     $prefix = $normalized.Substring(0, [Math]::Min($normalized.Length, $available)).TrimEnd('-', '.')
     return "$prefix-$hash"
+}
+
+function Measure-NodeActiveSeconds([object[]] $PodRuns) {
+    $totalSeconds = 0.0
+    foreach ($nodeGroup in @($PodRuns | Where-Object { $_.node -and $_.startedAt -and $_.finishedAt } | Group-Object node)) {
+        $intervals = @($nodeGroup.Group | ForEach-Object {
+            [pscustomobject]@{
+                Start = [DateTimeOffset]$_.startedAt
+                End = [DateTimeOffset]$_.finishedAt
+            }
+        } | Sort-Object Start)
+        if ($intervals.Count -eq 0) {
+            continue
+        }
+
+        $intervalStart = $intervals[0].Start
+        $intervalEnd = $intervals[0].End
+        foreach ($interval in $intervals | Select-Object -Skip 1) {
+            if ($interval.Start -le $intervalEnd) {
+                if ($interval.End -gt $intervalEnd) {
+                    $intervalEnd = $interval.End
+                }
+            } else {
+                $totalSeconds += ($intervalEnd - $intervalStart).TotalSeconds
+                $intervalStart = $interval.Start
+                $intervalEnd = $interval.End
+            }
+        }
+        $totalSeconds += ($intervalEnd - $intervalStart).TotalSeconds
+    }
+    return $totalSeconds
 }
 
 foreach ($command in @("az", "kubectl")) {
@@ -74,7 +109,8 @@ Assert-NativeCommandSucceeded "Getting AKS credentials"
 $serviceBusNamespace = $deployment.serviceBusNamespace.value
 $outputStorageAccount = $deployment.outputStorageName.value
 $outputContainer = $deployment.outputContainerName.value
-$mode = if ($UseSpot) { "spot" } else { "regular" }
+$priority = if ($UseSpot) { "spot" } else { "regular" }
+$mode = "$priority-$Architecture"
 $batchId = "bench-$mode-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
 if ([string]::IsNullOrWhiteSpace($OutputPath)) {
     $OutputPath = Join-Path $PSScriptRoot "$batchId.json"
@@ -104,6 +140,10 @@ for ($run = 1; $run -le $Runs; $run++) {
         CorrelationId = $jobId
     } | ConvertTo-Json -Compress
     $brokerPropertiesHeader = "BrokerProperties=$($brokerProperties.Replace('"', '\"'))"
+    $messageHeaders = @("Content-Type=application/json", $brokerPropertiesHeader)
+    if ($Architecture -ne "any") {
+        $messageHeaders += "spotvideo-benchmark-architecture=$Architecture"
+    }
 
     $submittedAt = [DateTimeOffset]::UtcNow
     Write-Host "[$run/$Runs] Submitting $jobId ($mode) at $submittedAt"
@@ -111,7 +151,7 @@ for ($run = 1; $run -le $Runs; $run++) {
         --method post `
         --url "https://$serviceBusNamespace/video-submitted/messages" `
         --resource "https://servicebus.azure.net" `
-        --headers "Content-Type=application/json" $brokerPropertiesHeader `
+        --headers $messageHeaders `
         --body $payloadArgument `
         --output none
     Assert-NativeCommandSucceeded "Submitting $jobId"
@@ -134,6 +174,10 @@ for ($run = 1; $run -le $Runs; $run++) {
     Assert-NativeCommandSucceeded "Waiting for stitch job completion"
     $stitchJob = kubectl get job $stitchJobName --namespace spotvideo --output json | ConvertFrom-Json
     Assert-NativeCommandSucceeded "Reading stitch job"
+    $stitchPods = kubectl get pods --namespace spotvideo `
+        --selector "app.kubernetes.io/name=spotvideo-stitcher,spotvideo/job-id=$labelValue" `
+        --output json | ConvertFrom-Json
+    Assert-NativeCommandSucceeded "Reading stitch pods"
 
     $finalBlob = az storage blob show `
         --account-name $outputStorageAccount `
@@ -150,24 +194,65 @@ for ($run = 1; $run -le $Runs; $run++) {
     $stitchCreatedAt = [DateTimeOffset]$stitchJob.metadata.creationTimestamp
     $stitchStartedAt = [DateTimeOffset]$stitchJob.status.startTime
     $stitchCompletedAt = [DateTimeOffset]$stitchJob.status.completionTime
-    $podRuns = @($encoderPods.items | ForEach-Object {
+    $allPods = @($encoderPods.items) + @($stitchPods.items)
+    $nodeDetails = @{}
+    foreach ($nodeName in @($allPods.spec.nodeName | Where-Object { $_ } | Sort-Object -Unique)) {
+        $node = kubectl get node $nodeName --output json | ConvertFrom-Json
+        Assert-NativeCommandSucceeded "Reading node $nodeName"
+        $nodeDetails[$nodeName] = [pscustomobject]@{
+            architecture = $node.metadata.labels.'kubernetes.io/arch'
+            instanceType = $node.metadata.labels.'node.kubernetes.io/instance-type'
+            nodePool = $node.metadata.labels.'kubernetes.azure.com/agentpool'
+        }
+    }
+    $encoderPodRuns = @($encoderPods.items | ForEach-Object {
         $containerStatus = @($_.status.containerStatuses)[0]
         $terminated = $containerStatus.state.terminated
+        $node = $nodeDetails[$_.spec.nodeName]
         [ordered]@{
             name = $_.metadata.name
             node = $_.spec.nodeName
+            architecture = $node.architecture
+            instanceType = $node.instanceType
+            nodePool = $node.nodePool
             completionIndex = $_.metadata.annotations.'batch.kubernetes.io/job-completion-index'
             podStartedAt = $_.status.startTime
             startedAt = $terminated?.startedAt
             finishedAt = $terminated?.finishedAt
+            durationSeconds = if ($terminated?.startedAt -and $terminated?.finishedAt) { (([DateTimeOffset]$terminated.finishedAt) - ([DateTimeOffset]$terminated.startedAt)).TotalSeconds } else { $null }
             exitCode = $terminated?.exitCode
         }
     })
+    $stitchPodRuns = @($stitchPods.items | ForEach-Object {
+        $containerStatus = @($_.status.containerStatuses)[0]
+        $terminated = $containerStatus.state.terminated
+        $node = $nodeDetails[$_.spec.nodeName]
+        [ordered]@{
+            name = $_.metadata.name
+            node = $_.spec.nodeName
+            architecture = $node.architecture
+            instanceType = $node.instanceType
+            nodePool = $node.nodePool
+            startedAt = $terminated?.startedAt
+            finishedAt = $terminated?.finishedAt
+            durationSeconds = if ($terminated?.startedAt -and $terminated?.finishedAt) { (([DateTimeOffset]$terminated.finishedAt) - ([DateTimeOffset]$terminated.startedAt)).TotalSeconds } else { $null }
+            exitCode = $terminated?.exitCode
+        }
+    })
+    $workloadPodRuns = @($encoderPodRuns) + @($stitchPodRuns)
+    if ($Architecture -ne "any") {
+        $unexpectedArchitectures = @($workloadPodRuns | Where-Object { $_.architecture -ne $Architecture })
+        if ($unexpectedArchitectures.Count -gt 0) {
+            throw "One or more workload pods did not run on requested architecture '$Architecture'."
+        }
+    }
+    $nodeActiveSeconds = Measure-NodeActiveSeconds $workloadPodRuns
 
     $result = [pscustomobject][ordered]@{
         run = $run
         jobId = $jobId
         mode = $mode
+        requestedArchitecture = $Architecture
         submittedAt = $submittedAt
         encodeCreatedAt = $encodeCreatedAt
         encodeStartedAt = $encodeStartedAt
@@ -181,13 +266,17 @@ for ($run = 1; $run -le $Runs; $run++) {
         stitchHandoffSeconds = ($stitchCreatedAt - $encodeCompletedAt).TotalSeconds
         stitchSeconds = ($stitchCompletedAt - $stitchCreatedAt).TotalSeconds
         totalSeconds = ($stitchCompletedAt - $submittedAt).TotalSeconds
+        nodeActiveSeconds = $nodeActiveSeconds
+        nodeHourlyPriceUsd = $NodeHourlyPriceUsd
+        estimatedComputeUsd = if ($NodeHourlyPriceUsd -gt 0) { [Math]::Round($nodeActiveSeconds / 3600 * [double]$NodeHourlyPriceUsd, 6) } else { $null }
         outputBytes = $finalBlob.properties.contentLength
-        encoderPods = $podRuns
+        encoderPods = $encoderPodRuns
+        stitchPods = $stitchPodRuns
     }
     $results += $result
     $results | ConvertTo-Json -Depth 8 | Set-Content -Path $OutputPath -Encoding utf8
     Write-Host "[$run/$Runs] Completed $jobId in $([Math]::Round($result.totalSeconds, 1)) seconds"
 }
 
-$results | Format-Table run, mode, analysisSeconds, encodeQueueAndRunSeconds, stitchSeconds, totalSeconds
+$results | Format-Table run, mode, analysisSeconds, encodeQueueAndRunSeconds, stitchSeconds, totalSeconds, nodeActiveSeconds, estimatedComputeUsd
 Write-Host "Results: $OutputPath"

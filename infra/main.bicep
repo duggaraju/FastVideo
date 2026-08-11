@@ -7,10 +7,13 @@ param location string = resourceGroup().location
 param systemVmSize string = 'Standard_D2ds_v5'
 param spotVmSize string = 'Standard_D8ds_v5'
 param spotMinCount int = 0
-param spotMaxCount int = 20
+param spotMaxCount int = 10
+param armSpotVmSize string = 'Standard_D8pds_v5'
+param armSpotMinCount int = 0
+param armSpotMaxCount int = 10
 param regularVmSize string = 'Standard_D8ds_v5'
 param regularMinCount int = 0
-param regularMaxCount int = 20
+param regularMaxCount int = 10
 param kubernetesVersion string = ''
 param inputContainerName string = 'input'
 param outputContainerName string = 'videos'
@@ -246,6 +249,30 @@ resource aks 'Microsoft.ContainerService/managedClusters@2025-05-01' = {
       loadBalancerSku: 'standard'
       outboundType: 'loadBalancer'
     }
+  }
+}
+
+resource armSpotPool 'Microsoft.ContainerService/managedClusters/agentPools@2025-05-01' = {
+  parent: aks
+  name: 'armspot'
+  properties: {
+    count: armSpotMinCount
+    vmSize: armSpotVmSize
+    osType: 'Linux'
+    osSKU: 'AzureLinux'
+    osDiskType: 'Ephemeral'
+    osDiskSizeGB: 64
+    mode: 'User'
+    type: 'VirtualMachineScaleSets'
+    enableAutoScaling: true
+    minCount: armSpotMinCount
+    maxCount: armSpotMaxCount
+    maxPods: 30
+    scaleSetPriority: 'Spot'
+    scaleSetEvictionPolicy: 'Delete'
+    spotMaxPrice: -1
+    nodeTaints: [ 'kubernetes.azure.com/scalesetpriority=spot:NoSchedule' ]
+    nodeLabels: { workload: 'video-encoding' }
   }
 }
 
