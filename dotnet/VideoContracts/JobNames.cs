@@ -14,6 +14,7 @@ public static class JobNames
     public const string AudioBlobNameAnnotation = "spotvideo/audio-blob-name";
     public const string OutputVideoUriAnnotation = "spotvideo/output-video-uri";
     public const string CalculateVmafAnnotation = "spotvideo/calculate-vmaf";
+    public const string MediaRuntimeAnnotation = "spotvideo/media-runtime";
     public const string ResultReportedAnnotation = "spotvideo/result-reported";
 
     public static string For(string prefix, string jobId) => $"{prefix}-{LabelValue(jobId)}";

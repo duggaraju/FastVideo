@@ -135,20 +135,6 @@ resource videoResultsQueue 'Microsoft.ServiceBus/namespaces/queues@2024-01-01' =
   }
 }
 
-resource stitchedQueue 'Microsoft.ServiceBus/namespaces/queues@2024-01-01' = {
-  parent: serviceBus
-  name: 'video-stitched'
-  properties: {
-    deadLetteringOnMessageExpiration: true
-    defaultMessageTimeToLive: 'P14D'
-    duplicateDetectionHistoryTimeWindow: 'PT10M'
-    enableBatchedOperations: true
-    lockDuration: 'PT5M'
-    maxDeliveryCount: 10
-    requiresDuplicateDetection: true
-  }
-}
-
 resource workloadIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: workloadIdentityName
   location: location

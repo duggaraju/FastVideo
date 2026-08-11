@@ -12,6 +12,7 @@ public sealed record VideoSubmitted(
     int? MaxVideoBitrateKbps = null,
     bool UseSpot = true,
     bool CalculateVmaf = false,
+    string? MediaRuntime = null,
     string? ParallelizationStrategy = null);
 
 public sealed record VideoManifest(
@@ -30,7 +31,8 @@ public sealed record VideoManifest(
     int Crf,
     int MaxVideoBitrateKbps,
     bool UseSpot,
-    bool CalculateVmaf);
+    bool CalculateVmaf,
+    string MediaRuntime);
 
 public sealed record VideoSegment(
     int Index,
@@ -44,13 +46,6 @@ public sealed record VideoProcessingResult(
     string? FailedIndexes,
     string? FailureReason,
     DateTimeOffset CompletedAt);
-
-public sealed record VideoStitched(
-    string JobId,
-    Uri OutputVideoUri,
-    long Length,
-    DateTimeOffset CompletedAt,
-    double? VmafScore = null);
 
 public sealed record SegmentVmaf(
     int Index,

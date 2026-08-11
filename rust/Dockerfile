@@ -1,4 +1,4 @@
-ARG FFMPEG_BUILD=btbn
+ARG FFMPEG_BUILD=custom
 
 FROM ubuntu:26.04 AS ffmpeg-btbn
 ARG TARGETARCH
@@ -126,26 +126,41 @@ RUN curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
 
 FROM ffmpeg-${FFMPEG_BUILD} AS ffmpeg
 
-FROM --platform=$BUILDPLATFORM mcr.microsoft.com/dotnet/sdk:10.0-resolute AS build
-ARG PROJECT
-ARG TARGETARCH
+FROM rust:1.97.0-bookworm AS build
+ARG BINARY
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends clang pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=ffmpeg /opt/ffmpeg /opt/ffmpeg
+ENV PKG_CONFIG_PATH=/opt/ffmpeg/lib/pkgconfig \
+    LD_LIBRARY_PATH=/opt/ffmpeg/lib
 WORKDIR /source
-COPY . .
-RUN dotnet restore "dotnet/${PROJECT}/${PROJECT}.csproj" -a "${TARGETARCH}" \
-    && dotnet publish "dotnet/${PROJECT}/${PROJECT}.csproj" --no-restore -c Release -a "${TARGETARCH}" -o /app
+COPY rust/Cargo.toml rust/Cargo.lock ./
+RUN mkdir -p src/bin \
+    && printf '' > src/lib.rs \
+    && printf 'fn main() {}\n' > src/bin/encoder.rs \
+    && printf 'fn main() {}\n' > src/bin/stitcher.rs \
+    && cargo check --locked --lib --bins \
+    && rm -rf src
+COPY rust/src ./src
+RUN test -n "${BINARY}" \
+    && cargo test --locked --lib \
+    && cargo build --locked --release --bin "${BINARY}" \
+    && strip "target/release/${BINARY}" \
+    && cp "target/release/${BINARY}" /app
 
-FROM mcr.microsoft.com/dotnet/runtime:10.0-azurelinux3.0 AS runtime
+FROM mcr.microsoft.com/azurelinux/base/core:3.0 AS final
+RUN tdnf install --assumeyes ca-certificates shadow-utils \
+    && tdnf clean all \
+    && groupadd --system --gid 1654 app \
+    && useradd --system --uid 1654 --gid app --home-dir /app app
 COPY --from=ffmpeg /opt/ffmpeg/bin/ffmpeg /opt/ffmpeg/bin/ffprobe /opt/ffmpeg/bin/
 COPY --from=ffmpeg /opt/ffmpeg/lib /opt/ffmpeg/lib
 COPY --from=ffmpeg /opt/ffmpeg/share/vmaf/vmaf_v0.6.1.json /opt/ffmpeg/share/vmaf/vmaf_v0.6.1.json
+COPY --from=build /app /app/spotvideo
 ENV PATH="/opt/ffmpeg/bin:${PATH}" \
-    LD_LIBRARY_PATH="/opt/ffmpeg/lib"
-
-FROM runtime AS final
-ARG APP_DLL
-ENV APP_DLL=${APP_DLL} \
-    DOTNET_EnableDiagnostics=0
+    LD_LIBRARY_PATH="/opt/ffmpeg/lib" \
+    RUST_LOG=spotvideo=info
 WORKDIR /app
-COPY --from=build /app .
 USER app
-ENTRYPOINT ["sh", "-c", "exec dotnet \"$APP_DLL\""]
+ENTRYPOINT ["/app/spotvideo"]

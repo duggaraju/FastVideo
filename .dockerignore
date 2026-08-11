@@ -1,5 +1,10 @@
 **/bin
 **/obj
+!rust/src/bin
+!rust/src/bin/**
+rust/target
+artifacts
+TestResults
 .git
 .vs
 .vscode

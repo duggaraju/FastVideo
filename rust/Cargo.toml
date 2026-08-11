@@ -1,0 +1,26 @@
+[package]
+name = "spotvideo"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.97"
+
+[dependencies]
+anyhow = "1.0"
+ffmpeg-sidecar = { version = "2.5.2", default-features = false }
+percent-encoding = "2.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.11"
+tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = { version = "2.5", features = ["serde"] }
+uuid = { version = "1.18", features = ["v4"] }
+
+[[bin]]
+name = "encoder"
+path = "src/bin/encoder.rs"
+
+[[bin]]
+name = "stitcher"
+path = "src/bin/stitcher.rs"

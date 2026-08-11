@@ -6,6 +6,10 @@ param(
 
     [string] $Prefix = "spotvideo",
     [string] $ImageTag = "latest",
+    [string] $DotNetMediaImageTag,
+    [string] $RustMediaImageTag,
+    [ValidateSet("dotnet", "rust")]
+    [string] $MediaRuntime = "rust",
     [ValidateSet("btbn", "custom")]
     [string] $FfmpegBuild = "btbn",
     [string] $FfmpegVersion = "9.0",
@@ -79,22 +83,41 @@ if ($legacyInputWriteGrantIds.Count -gt 0) {
 
 $acrName = $deployment.acrName.value
 $acrLoginServer = $deployment.acrLoginServer.value
+if ([string]::IsNullOrWhiteSpace($DotNetMediaImageTag)) {
+    $DotNetMediaImageTag = $ImageTag
+}
+if ([string]::IsNullOrWhiteSpace($RustMediaImageTag)) {
+    $RustMediaImageTag = $ImageTag
+}
 $projects = @("Analysis", "Completion", "Encoder", "Stitcher")
 foreach ($project in $projects) {
     $projectName = "Video$project"
     $imageName = "spotvideo-$($project.ToLowerInvariant())"
     $fullImage = "${acrLoginServer}/${imageName}:${ImageTag}"
+    $isRustWorker = $MediaRuntime -eq "rust" -and $project -in @("Encoder", "Stitcher")
+    $dockerfile = Join-Path $root $(if ($isRustWorker) { "rust/Dockerfile" } else { "docker/Dockerfile" })
+    $buildArguments = if ($isRustWorker) {
+        @(
+            "--build-arg", "BINARY=$($project.ToLowerInvariant())",
+            "--build-arg", "FFMPEG_BUILD=$FfmpegBuild",
+            "--build-arg", "FFMPEG_VERSION=$FfmpegVersion"
+        )
+    } else {
+        @(
+            "--build-arg", "PROJECT=$projectName",
+            "--build-arg", "APP_DLL=$projectName.dll",
+            "--build-arg", "FFMPEG_BUILD=$FfmpegBuild",
+            "--build-arg", "FFMPEG_VERSION=$FfmpegVersion"
+        )
+    }
     if ($UseLocalDocker) {
         az acr login --name $acrName
         Assert-NativeCommandSucceeded "Logging in to Azure Container Registry '$acrName'"
         if ($Platforms.Contains(',')) {
             docker buildx build `
                 --platform $Platforms `
-                --file (Join-Path $root "docker/Dockerfile") `
-                --build-arg "PROJECT=$projectName" `
-                --build-arg "APP_DLL=$projectName.dll" `
-                --build-arg "FFMPEG_BUILD=$FfmpegBuild" `
-                --build-arg "FFMPEG_VERSION=$FfmpegVersion" `
+                --file $dockerfile `
+                @buildArguments `
                 --tag $fullImage `
                 --push `
                 $root
@@ -102,11 +125,8 @@ foreach ($project in $projects) {
         } else {
             docker build `
                 --platform $Platforms `
-                --file (Join-Path $root "docker/Dockerfile") `
-                --build-arg "PROJECT=$projectName" `
-                --build-arg "APP_DLL=$projectName.dll" `
-                --build-arg "FFMPEG_BUILD=$FfmpegBuild" `
-                --build-arg "FFMPEG_VERSION=$FfmpegVersion" `
+                --file $dockerfile `
+                @buildArguments `
                 --tag $fullImage `
                 $root
             Assert-NativeCommandSucceeded "Building $projectName image"
@@ -123,12 +143,9 @@ foreach ($project in $projects) {
                 --registry $acrName `
                 --image $platformImage `
                 --platform $platform `
-                --file (Join-Path $root "docker/Dockerfile") `
+                --file $dockerfile `
                 --build-arg "TARGETARCH=$platformSuffix" `
-                --build-arg "PROJECT=$projectName" `
-                --build-arg "APP_DLL=$projectName.dll" `
-                --build-arg "FFMPEG_BUILD=$FfmpegBuild" `
-                --build-arg "FFMPEG_VERSION=$FfmpegVersion" `
+                @buildArguments `
                 $root
             Assert-NativeCommandSucceeded "Building $projectName image for $platform in Azure Container Registry"
             $platformImages += "${acrLoginServer}/${platformImage}"
@@ -168,6 +185,9 @@ $replacements = @{
     "__OUTPUT_STORAGE_CONTAINER__" = $deployment.outputContainerName.value
     "__ACR_LOGIN_SERVER__" = $acrLoginServer
     "__IMAGE_TAG__" = $ImageTag
+    "__DOTNET_MEDIA_IMAGE_TAG__" = $DotNetMediaImageTag
+    "__RUST_MEDIA_IMAGE_TAG__" = $RustMediaImageTag
+    "__MEDIA_RUNTIME__" = $MediaRuntime
 }
 foreach ($replacement in $replacements.GetEnumerator()) {
     $manifest = $manifest.Replace($replacement.Key, $replacement.Value)
@@ -232,7 +252,7 @@ if (-not [string]::IsNullOrWhiteSpace($legacyTableId)) {
     Assert-NativeCommandSucceeded "Removing the legacy encoding state table"
 }
 
-Write-Host "Deployed SpotVideo to $($deployment.aksName.value) with image tag $ImageTag"
+Write-Host "Deployed SpotVideo to $($deployment.aksName.value) with $MediaRuntime media workers and image tag $ImageTag"
 Write-Host "Service Bus input queue: $serviceBusNamespace/video-submitted"
 Write-Host "Input blob container: $($deployment.inputStorageServiceUri.value)/$($deployment.inputContainerName.value)"
 Write-Host "Output blob container: $($deployment.outputStorageServiceUri.value)/$($deployment.outputContainerName.value)"

@@ -8,7 +8,7 @@ SpotVideo is a .NET 10 and FFmpeg pipeline for horizontally parallel video encod
 2. The service reads the source from the read-only input mount, probes it with FFMpegCore/FFprobe, extracts one audio track (copy or optional re-encode) to output storage, computes segment boundaries, writes the manifest to output storage, and creates a Kubernetes Indexed Job.
 3. Every `SpotVideo.Encoder` index reads the source from input storage, encodes only its deterministic video time range (no audio), and writes to a unique staging path on the output BlobFuse mount. After FFmpeg succeeds, it renames the staging file to the deterministic segment path. When requested, the index also compares the segment with its source interval using VMAF and writes a deterministic score sidecar. A retry skips each artifact that already exists. Each index gets up to five retries on interruption or encoding failure.
 4. Kubernetes marks the Indexed encode Job complete only after every index succeeds. The singleton Job watcher observes that condition and creates a deterministic stitch Job using metadata stored on the encode Job. Stitching follows the request's `useSpot` setting and runs on the same Spot or regular pool selected for encoding.
-5. `SpotVideo.Stitcher` constructs ordered segment paths directly from indexes `0..SegmentCount-1`, reads them and the extracted audio exclusively from output storage, writes the requested final output path, and sends `VideoStitched`. When VMAF was requested, the event includes the arithmetic mean of all segment VMAF means.
+5. `SpotVideo.Stitcher` constructs ordered segment paths directly from indexes `0..SegmentCount-1`, reads them and the extracted audio exclusively from output storage, and writes the requested final output path. When VMAF was requested, it also writes the arithmetic mean of all segment VMAF means beside the output video.
 6. A singleton Job watcher logs failed encode pod attempts and sends one terminal `VideoProcessingResult` per video to `video-results`: encode failure after all retries means failure, stitch success means success, and stitch failure means failure. Individual retry failures and encode success are not sent to Service Bus. After stitching succeeds, the watcher deletes the corresponding encode Job.
 
 Indexed encode Jobs use Spot nodes by default and tolerate eviction. A request can instead select the dedicated autoscaling regular encoding pool. Stitch Jobs use the same pool selected for encoding, while lightweight analysis and the Job watcher remain on regular system nodes. Encoder retries remain safe because blob names are deterministic, while Kubernetes Job conditions provide durable fan-in state.
@@ -21,7 +21,7 @@ Indexed encode Jobs use Spot nodes by default and tolerate eviction. A request c
 | `SpotVideo.Analysis` | KEDA-scaled intake listener, FFprobe analysis, Indexed Job submission |
 | `SpotVideo.Encoder` | One FFmpeg time-range encode per Kubernetes completion index |
 | `SpotVideo.Completion` | Kubernetes Job watcher, stitch Job submission, terminal result publishing |
-| `SpotVideo.Stitcher` | FFmpeg segment concatenation and final event publishing |
+| `SpotVideo.Stitcher` | FFmpeg segment concatenation and output publishing |
 
 ## Prerequisites
 
@@ -38,6 +38,22 @@ Runtime containers use the .NET 10 Azure Linux 3 image and run as the non-root `
 ```powershell
 dotnet restore SpotVideo.slnx
 dotnet build SpotVideo.slnx --no-restore --configuration Release
+```
+
+The Rust implementation in `rust` provides the media-processing workers. Analysis and completion remain on .NET because Azure Service Bus does not have an officially supported Rust SDK:
+
+```powershell
+Push-Location rust
+cargo build --release
+Pop-Location
+```
+
+Build a Rust worker image with the separate Dockerfile by selecting `encoder` or `stitcher`:
+
+```powershell
+docker build -f rust/Dockerfile `
+    --build-arg BINARY=encoder `
+    -t spotvideo-encoder:rust .
 ```
 
 ## Deploy
@@ -57,7 +73,7 @@ To compile a specific FFmpeg release from the official GitHub mirror:
     -FfmpegVersion 9.0
 ```
 
-The script deploys [infra/main.bicep](infra/main.bicep), builds four `linux/amd64` and `linux/arm64` images with ACR Tasks, publishes one multi-architecture manifest per worker, renders [deploy/k8s/spotvideo.yaml](deploy/k8s/spotvideo.yaml), applies it, and restarts the workload deployments so rebuilt images are used even with the default `latest` tag. The AKS system pool hosts analysis and the Job watcher. Dedicated x64 Spot, ARM64 Spot, and regular media-processing pools autoscale from zero. Encoding and stitching use any available Spot media architecture unless `useSpot` is `false`; no architecture-specific application code or image tag is required.
+The script deploys [infra/main.bicep](infra/main.bicep), builds the .NET analysis and completion images with [docker/Dockerfile](docker/Dockerfile), builds the Rust encoder and stitcher images with [rust/Dockerfile](rust/Dockerfile), publishes one multi-architecture manifest per worker, renders [deploy/k8s/spotvideo.yaml](deploy/k8s/spotvideo.yaml), applies it, and restarts the workload deployments so rebuilt images are used even with the default `latest` tag. The AKS system pool hosts analysis and the Job watcher. Dedicated x64 Spot, ARM64 Spot, and regular media-processing pools autoscale from zero. Encoding and stitching use any available Spot media architecture unless `useSpot` is `false`; no architecture-specific application code or image tag is required.
 
 The infrastructure also enables Container Insights with managed-identity authentication and retains container logs in Log Analytics for 30 days, including logs from pods deleted after KEDA scales a deployment to zero.
 
@@ -76,7 +92,7 @@ Send the JSON shape in [samples/video-submitted.json](samples/video-submitted.js
 
 When encoding parameters are omitted, analysis uses the source codec, bitrate, resolution, and frame rate to select CRF, preset, and a maximum video bitrate. The default target codec is `libsvtav1`. Optional `crf`, `preset`, and `maxVideoBitrateKbps` values override the corresponding automatic choices.
 
-`useSpot` is optional and defaults to `true`. Set it to `false` to schedule all indexes for that video on the regular encoding pool. `calculateVmaf` is optional and defaults to `false`. When enabled, every encoder compares its output with the matching source interval. `VideoStitched.vmafScore` contains the unweighted arithmetic mean of the segment mean scores; it is `null` when VMAF was not requested. The final `.vmaf.json` beside the output video contains that overall `Score` and an ordered `Segments` array with the `Index` and `Score` for every segment.
+`useSpot` is optional and defaults to `true`. Set it to `false` to schedule all indexes for that video on the regular encoding pool. `calculateVmaf` is optional and defaults to `false`. When enabled, every encoder compares its output with the matching source interval. The final `.vmaf.json` beside the output video contains the overall unweighted arithmetic mean and an ordered `Segments` array with the `Index` and `Score` for every segment.
 
 Job IDs must be unique for distinct work. Reusing a job ID deliberately resumes or deduplicates that workflow because Kubernetes Job names and output paths derive from it.
 
@@ -105,14 +121,33 @@ After the blob validation succeeds, the script reports the active `video-results
 
 ### Compare AMD64 and ARM64
 
-The benchmark script can pin encoder and stitch Jobs to either architecture without adding architecture to the production message contract. It sends a benchmark-only Service Bus application property, and the analysis worker translates that property into the standard Kubernetes `kubernetes.io/arch` node selector. Normal submissions remain portable and use any matching architecture.
+The benchmark script can pin encoder and stitch Jobs to either architecture without adding architecture to the production message contract. It sends a benchmark-only Service Bus application property, and the analysis worker translates that property into the standard Kubernetes `kubernetes.io/arch` node selector. Use `-Architecture any` or omit `-Architecture` to leave the architecture selector empty so Jobs remain eligible for any matching media-processing architecture. Normal submissions use the same architecture-independent behavior.
 
 Run the same source, encoding settings, Spot priority, and run count for both architectures:
 
 ```powershell
 ./scripts/benchmark-workflow.ps1 -Architecture amd64 -Runs 5 -UseSpot $true -OutputPath ./scripts/amd64.json
 ./scripts/benchmark-workflow.ps1 -Architecture arm64 -Runs 5 -UseSpot $true -OutputPath ./scripts/arm64.json
+./scripts/benchmark-workflow.ps1 -Architecture any -Runs 1 -UseSpot $true -OutputPath ./scripts/any-arch.json
 ```
+
+To compare .NET and Rust encoding/stitching on the x64 Spot pool, deploy and benchmark each implementation with distinct immutable image tags. Use the custom FFmpeg build and the same FFmpeg version for both:
+
+```powershell
+./scripts/deploy.ps1 -SkipInfrastructureDeployment `
+    -MediaRuntime dotnet -ImageTag bench-dotnet `
+    -FfmpegBuild custom -FfmpegVersion 8.1 -Platforms linux/amd64
+./scripts/benchmark-workflow.ps1 -MediaRuntime dotnet `
+    -Architecture amd64 -Runs 5 -UseSpot $true -OutputPath ./scripts/dotnet-amd64.json
+
+./scripts/deploy.ps1 -SkipInfrastructureDeployment `
+    -MediaRuntime rust -ImageTag bench-rust `
+    -FfmpegBuild custom -FfmpegVersion 8.1 -Platforms linux/amd64
+./scripts/benchmark-workflow.ps1 -MediaRuntime rust `
+    -Architecture amd64 -Runs 5 -UseSpot $true -OutputPath ./scripts/rust-amd64.json
+```
+
+The two runs use the same input URI by default and are pinned to the x64 Spot node pool. Each pod result records its image and resolved image ID; verify those fields before comparing medians. Alternate deployment order across repeated batches to reduce node warm-up, image-pull, storage-cache, autoscaler, and changing Spot-capacity bias.
 
 Pass the effective hourly price for each VM SKU to include a node-active-time estimate:
 
@@ -171,7 +206,7 @@ Set `parallelizationStrategy` on a submitted message to select a strategy for th
 - `fixed-duration` (default): split using `ceil(video duration / Encoding__MaxParallelism)`, clamped to `segmentDurationSeconds` (60 seconds by default) through 180 seconds
 - `keyframe-boundary`: accumulate one or more GOPs per segment and use the last keyframe at or before the target duration; a segment exceeds the target only when a single GOP is longer
 
-`Encoding__MaxParallelism` defaults to 16 in the application and controls adaptive segment sizing and the global encoder concurrency budget. `Encoding__MinParallelismPerJob` defaults to 2 and controls each Indexed Job's initial parallelism, capped by its segment count. The job watcher then shares the global budget across unfinished Jobs and lends unused slots to Jobs that can use them. It can reduce a Job below the configured minimum when capacity is oversubscribed or fewer segments remain. A single Job can use the full budget when no other encoding work is active.
+`Encoding__MaxParallelism` controls adaptive segment sizing and the global encoder concurrency budget. Its application fallback is 16, while the deployment configures 32. `Encoding__MinParallelismPerJob` controls each Indexed Job's initial parallelism, capped by its segment count. Its application fallback is 2, while the deployment configures 2 so a Job can start up to 60 indexes without waiting for watcher reallocation. The job watcher still shares the global budget across unfinished Jobs and lends unused slots to Jobs that can use them. It can reduce a Job below 2 when capacity is oversubscribed or fewer segments remain. A single Job can use the full budget when no other encoding work is active.
 
 ## Production Notes
 

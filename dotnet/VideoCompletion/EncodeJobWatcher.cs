@@ -190,6 +190,10 @@ public sealed class EncodeJobWatcher(
             : encodeJob.Spec?.Template?.Spec?.NodeSelector?.TryGetValue(
                 "kubernetes.azure.com/scalesetpriority",
                 out var scaleSetPriority) == true && scaleSetPriority == "spot";
+        var mediaRuntime = OptionalAnnotation(
+            annotations,
+            JobNames.MediaRuntimeAnnotation,
+            configuration["Encoding:MediaRuntimeDefault"] ?? "dotnet");
         var architecture = OptionalAnnotation(annotations, JobNames.ArchitectureAnnotation, string.Empty);
         try
         {
@@ -227,7 +231,7 @@ public sealed class EncodeJobWatcher(
                     new V1Container
                     {
                         Name = "stitcher",
-                        Image = configuration["Images:Stitcher"] ?? throw new InvalidOperationException("Images:Stitcher is required"),
+                        Image = RequiredImage(mediaRuntime, "Stitcher"),
                         Env =
                         [
                             Env("JOB_ID", jobId),
@@ -237,9 +241,7 @@ public sealed class EncodeJobWatcher(
                             Env("CALCULATE_VMAF", OptionalAnnotation(annotations, JobNames.CalculateVmafAnnotation, "false")),
                             Env("OUTPUT_STORAGE_ACCOUNT_NAME", RequiredConfig("Storage:OutputAccountName")),
                             Env("OUTPUT_STORAGE_CONTAINER", RequiredConfig("Storage:OutputContainer")),
-                            Env("OUTPUT_MOUNT_PATH", outputMountPath),
-                            Env("SERVICE_BUS_NAMESPACE", configuration["ServiceBus:Namespace"]!),
-                            Env("STITCHED_QUEUE", configuration["ServiceBus:StitchedQueue"] ?? "video-stitched")
+                            Env("OUTPUT_MOUNT_PATH", outputMountPath)
                         ],
                         VolumeMounts = [new V1VolumeMount { Name = outputVolumeName, MountPath = outputMountPath }],
                         Resources = new V1ResourceRequirements
@@ -276,7 +278,8 @@ public sealed class EncodeJobWatcher(
                 {
                     [JobNames.JobIdAnnotation] = jobId,
                     [JobNames.StageIdAnnotation] = stitchJobName,
-                    [JobNames.UseSpotAnnotation] = useSpot.ToString()
+                    [JobNames.UseSpotAnnotation] = useSpot.ToString(),
+                    [JobNames.MediaRuntimeAnnotation] = mediaRuntime
                 }
             },
             Spec = new V1JobSpec { Template = pod, BackoffLimit = 6, TtlSecondsAfterFinished = 3600 }
@@ -368,6 +371,20 @@ public sealed class EncodeJobWatcher(
             : defaultValue;
 
     private static V1EnvVar Env(string name, string value) => new() { Name = name, Value = value };
+
+    private string RequiredImage(string mediaRuntime, string role)
+    {
+        var normalizedRuntime = mediaRuntime.ToLowerInvariant() switch
+        {
+            "dotnet" => "dotnet",
+            "rust" => "rust",
+            _ => throw new InvalidOperationException($"Media runtime '{mediaRuntime}' must be dotnet or rust")
+        };
+        var key = $"Images:{normalizedRuntime}:{role}";
+        return configuration[key]
+            ?? configuration[$"Images:{role}"]
+            ?? throw new InvalidOperationException($"{key} is required");
+    }
 
     private static V1Volume BlobFuseVolume(string name, string storageAccount, string containerName, string clientId) =>
         new()

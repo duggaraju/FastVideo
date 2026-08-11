@@ -1,6 +1,7 @@
 # .NET build output
 [Bb]in/
 [Oo]bj/
+rust/target/
 artifacts/
 TestResults/
 *.nupkg
@@ -49,3 +50,5 @@ deploy/k8s/spotvideo.rendered.yaml
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+!rust/src/bin/

@@ -5,12 +5,16 @@ param(
     [ValidateRange(1, 20)]
     [int] $Runs = 5,
     [bool] $UseSpot = $true,
+    [ValidateSet("dotnet", "rust")]
+    [string] $MediaRuntime = "rust",
     [ValidateSet("any", "amd64", "arm64")]
     [string] $Architecture = "any",
+    [bool] $CalculateVmaf = $false,
     [ValidateRange(0, 1000)]
     [decimal] $NodeHourlyPriceUsd = 0,
     [ValidateRange(1, 180)]
     [int] $TimeoutMinutes = 90,
+    [string] $BatchId,
     [string] $OutputPath
 )
 
@@ -110,15 +114,17 @@ $serviceBusNamespace = $deployment.serviceBusNamespace.value
 $outputStorageAccount = $deployment.outputStorageName.value
 $outputContainer = $deployment.outputContainerName.value
 $priority = if ($UseSpot) { "spot" } else { "regular" }
-$mode = "$priority-$Architecture"
-$batchId = "bench-$mode-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+$mode = "$MediaRuntime-$priority-$Architecture"
+if ([string]::IsNullOrWhiteSpace($BatchId)) {
+    $BatchId = "bench-$mode-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+}
 if ([string]::IsNullOrWhiteSpace($OutputPath)) {
-    $OutputPath = Join-Path $PSScriptRoot "$batchId.json"
+    $OutputPath = Join-Path $PSScriptRoot "$BatchId.json"
 }
 
 $results = @()
 for ($run = 1; $run -le $Runs; $run++) {
-    $jobId = "$batchId-$run"
+    $jobId = "$BatchId-$run"
     $labelValue = Get-LabelValue $jobId
     $encodeJobName = "encode-$labelValue"
     $stitchJobName = "stitch-$labelValue"
@@ -132,7 +138,8 @@ for ($run = 1; $run -le $Runs; $run++) {
         parallelizationStrategy = "fixed-duration"
         audioCodec = "copy"
         useSpot = $UseSpot
-        calculateVmaf = $false
+        calculateVmaf = $CalculateVmaf
+        mediaRuntime = $MediaRuntime
     } | ConvertTo-Json -Compress
     $payloadArgument = $payload.Replace('"', '\"')
     $brokerProperties = [ordered]@{
@@ -216,6 +223,8 @@ for ($run = 1; $run -le $Runs; $run++) {
             instanceType = $node.instanceType
             nodePool = $node.nodePool
             completionIndex = $_.metadata.annotations.'batch.kubernetes.io/job-completion-index'
+            image = $containerStatus.image
+            imageId = $containerStatus.imageID
             podStartedAt = $_.status.startTime
             startedAt = $terminated?.startedAt
             finishedAt = $terminated?.finishedAt
@@ -233,6 +242,8 @@ for ($run = 1; $run -le $Runs; $run++) {
             architecture = $node.architecture
             instanceType = $node.instanceType
             nodePool = $node.nodePool
+            image = $containerStatus.image
+            imageId = $containerStatus.imageID
             startedAt = $terminated?.startedAt
             finishedAt = $terminated?.finishedAt
             durationSeconds = if ($terminated?.startedAt -and $terminated?.finishedAt) { (([DateTimeOffset]$terminated.finishedAt) - ([DateTimeOffset]$terminated.startedAt)).TotalSeconds } else { $null }
@@ -252,6 +263,7 @@ for ($run = 1; $run -le $Runs; $run++) {
         run = $run
         jobId = $jobId
         mode = $mode
+        mediaRuntime = $MediaRuntime
         requestedArchitecture = $Architecture
         submittedAt = $submittedAt
         encodeCreatedAt = $encodeCreatedAt

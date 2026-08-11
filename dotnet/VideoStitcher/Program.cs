@@ -1,6 +1,4 @@
 using System.Text.Json;
-using Azure.Identity;
-using Azure.Messaging.ServiceBus;
 using FFMpegCore;
 using SpotVideo.Contracts;
 
@@ -11,7 +9,6 @@ GlobalFFOptions.Configure(options =>
     options.TemporaryFilesFolder = "/tmp";
 });
 
-var credential = new DefaultAzureCredential();
 var jobId = Required("JOB_ID");
 var segmentCount = int.Parse(Required("SEGMENT_COUNT"));
 var outputMountPath = Required("OUTPUT_MOUNT_PATH");
@@ -52,7 +49,7 @@ try
         paths.Select(path => $"file '{path.Replace("'", "'\\''")}'"));
     await FFMpegArguments
         .FromFileInput(concatListPath, false, options => options.WithCustomArgument("-f concat -safe 0"))
-        .OutputToFile(stitchedVideoPath, false, options => options.WithCustomArgument("-c copy -movflags +faststart"))
+        .OutputToFile(stitchedVideoPath, true, options => options.WithCustomArgument("-c copy -movflags +faststart"))
         .ProcessAsynchronously();
     var audioPath = BlobMountPaths.FromBlobName(audioBlobName, outputMountPath);
 
@@ -67,7 +64,6 @@ try
         .AddFileInput(audioPath)
         .OutputToFile(outputPath, true, options => options.WithCustomArgument("-map 0:v:0 -map 1:a:0 -c:v copy -c:a copy -movflags +faststart"))
         .ProcessAsynchronously();
-    var length = new FileInfo(outputPath).Length;
     if (vmafScore is not null)
     {
         var outputVmafPath = Path.ChangeExtension(outputPath, ".vmaf.json");
@@ -76,16 +72,6 @@ try
             JsonSerializer.SerializeToUtf8Bytes(new VideoVmaf(vmafScore.Value, segmentVmafScores)));
     }
 
-    await using var serviceBus = new ServiceBusClient(Required("SERVICE_BUS_NAMESPACE"), credential);
-    await using var sender = serviceBus.CreateSender(Required("STITCHED_QUEUE"));
-    var completed = new VideoStitched(jobId, outputVideoUri, length, DateTimeOffset.UtcNow, vmafScore);
-    var message = new ServiceBusMessage(BinaryData.FromObjectAsJson(completed))
-    {
-        MessageId = $"{jobId}:stitched",
-        CorrelationId = jobId,
-        Subject = nameof(VideoStitched)
-    };
-    await sender.SendMessageAsync(message);
     stitchCompleted = true;
     await DeleteIntermediateFilesAsync(
         paths.Concat(vmafPaths).Append(audioPath)

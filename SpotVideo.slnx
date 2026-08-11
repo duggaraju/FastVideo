@@ -1,9 +1,9 @@
 <Solution>
-  <Folder Name="/src/">
-    <Project Path="src/VideoAnalysis/VideoAnalysis.csproj" />
-    <Project Path="src/VideoCompletion/VideoCompletion.csproj" />
-    <Project Path="src/VideoEncoder/VideoEncoder.csproj" />
-    <Project Path="src/VideoContracts/VideoContracts.csproj" />
-    <Project Path="src/VideoStitcher/VideoStitcher.csproj" />
+  <Folder Name="/dotnet/">
+    <Project Path="dotnet/VideoAnalysis/VideoAnalysis.csproj" />
+    <Project Path="dotnet/VideoCompletion/VideoCompletion.csproj" />
+    <Project Path="dotnet/VideoEncoder/VideoEncoder.csproj" />
+    <Project Path="dotnet/VideoContracts/VideoContracts.csproj" />
+    <Project Path="dotnet/VideoStitcher/VideoStitcher.csproj" />
   </Folder>
 </Solution>

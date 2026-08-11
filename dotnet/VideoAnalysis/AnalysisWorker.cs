@@ -50,6 +50,7 @@ public sealed class AnalysisWorker(
             var outputMountPath = configuration["Storage:OutputMountPath"] ?? "/mnt/output";
             var audioBlobName = $"{request.JobId}/segments/audio.m4a";
             var videoCodec = string.IsNullOrWhiteSpace(request.VideoCodec) ? "libsvtav1" : request.VideoCodec;
+            var mediaRuntime = GetMediaRuntime(request.MediaRuntime, configuration["Encoding:MediaRuntimeDefault"] ?? "dotnet");
             var architecture = GetBenchmarkArchitecture(args.Message);
 
             var inputPath = BlobMountPaths.FromUri(request.InputVideoUri, inputAccount, inputContainer, inputMountPath);
@@ -111,7 +112,8 @@ public sealed class AnalysisWorker(
                 encodingProfile.Crf,
                 encodingProfile.MaxVideoBitrateKbps,
                 request.UseSpot,
-                request.CalculateVmaf);
+                request.CalculateVmaf,
+                mediaRuntime);
             await WriteManifestAsync(manifest, outputMountPath, args.CancellationToken);
             await SubmitEncodingJobAsync(manifest, minParallelismPerJob, outputAccount, outputContainer, inputAccount, inputContainer, outputMountPath, inputMountPath, architecture, args.CancellationToken);
             await args.CompleteMessageAsync(args.Message, args.CancellationToken);
@@ -193,7 +195,7 @@ public sealed class AnalysisWorker(
             Env("PRESET", manifest.Preset),
             Env("CRF", manifest.Crf.ToString()),
             Env("MAX_VIDEO_BITRATE_KBPS", manifest.MaxVideoBitrateKbps.ToString()),
-            Env("CALCULATE_VMAF", manifest.CalculateVmaf.ToString()),
+            Env("CALCULATE_VMAF", manifest.CalculateVmaf ? "true" : "false"),
             Env("INPUT_STORAGE_ACCOUNT_NAME", inputAccount),
             Env("INPUT_STORAGE_CONTAINER", inputContainer),
             Env("INPUT_MOUNT_PATH", inputMountPath),
@@ -227,7 +229,7 @@ public sealed class AnalysisWorker(
                     new V1Container
                     {
                         Name = "encoder",
-                        Image = configuration["Images:Encoder"] ?? throw new InvalidOperationException("Images:Encoder is required"),
+                        Image = RequiredImage(manifest.MediaRuntime, "Encoder"),
                         Env = environment,
                         VolumeMounts =
                         [
@@ -269,7 +271,8 @@ public sealed class AnalysisWorker(
                     [JobNames.SegmentCountAnnotation] = manifest.SegmentCount.ToString(),
                     [JobNames.AudioBlobNameAnnotation] = manifest.AudioBlobName,
                     [JobNames.OutputVideoUriAnnotation] = manifest.OutputVideoUri.ToString(),
-                    [JobNames.CalculateVmafAnnotation] = manifest.CalculateVmaf.ToString()
+                    [JobNames.CalculateVmafAnnotation] = manifest.CalculateVmaf ? "true" : "false",
+                    [JobNames.MediaRuntimeAnnotation] = manifest.MediaRuntime
                 }
             },
             Spec = new V1JobSpec
@@ -285,6 +288,25 @@ public sealed class AnalysisWorker(
         if (architecture is not null)
             job.Metadata.Annotations[JobNames.ArchitectureAnnotation] = architecture;
         await kubernetes.BatchV1.CreateNamespacedJobAsync(job, targetNamespace, cancellationToken: cancellationToken);
+    }
+
+    private string RequiredImage(string mediaRuntime, string role)
+    {
+        var key = $"Images:{mediaRuntime}:{role}";
+        return configuration[key]
+            ?? configuration[$"Images:{role}"]
+            ?? throw new InvalidOperationException($"{key} is required");
+    }
+
+    private static string GetMediaRuntime(string? requestedRuntime, string defaultRuntime)
+    {
+        var mediaRuntime = string.IsNullOrWhiteSpace(requestedRuntime) ? defaultRuntime : requestedRuntime;
+        return mediaRuntime?.ToLowerInvariant() switch
+        {
+            "dotnet" => "dotnet",
+            "rust" => "rust",
+            _ => throw new ArgumentException("MediaRuntime must be dotnet or rust")
+        };
     }
 
     private static string? GetBenchmarkArchitecture(ServiceBusReceivedMessage message)
