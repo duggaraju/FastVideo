@@ -1,6 +1,6 @@
-using SpotVideo.Contracts;
+using Video.Contracts;
 
-namespace SpotVideo.Analysis;
+namespace Video.Analysis;
 
 public interface IParallelizationStrategy
 {

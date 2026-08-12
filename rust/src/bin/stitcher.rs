@@ -1,18 +1,14 @@
 use anyhow::{bail, Result};
-use spotvideo::{
-    config,
-    contracts::VideoVmaf,
-    media, paths,
-};
 use std::{
     collections::HashSet,
     fs,
     path::{Path, PathBuf},
 };
+use video::{config, contracts::VideoVmaf, media, paths};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    spotvideo::init_tracing();
+    video::init_tracing();
     let job_id = config::required("JOB_ID")?;
     let segment_count: usize = config::parse("SEGMENT_COUNT")?;
     let output_mount = PathBuf::from(config::required("OUTPUT_MOUNT_PATH")?);

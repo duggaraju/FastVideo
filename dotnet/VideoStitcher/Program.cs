@@ -1,6 +1,6 @@
 using System.Text.Json;
 using FFMpegCore;
-using SpotVideo.Contracts;
+using Video.Contracts;
 
 GlobalFFOptions.Configure(options =>
 {

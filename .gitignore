@@ -44,7 +44,8 @@ appsettings.*.local.json
 infra/main.json
 
 # Generated deployment manifests
-deploy/k8s/spotvideo.rendered.yaml
+deploy/k8s/video.rendered.yaml
+deploy/rendered.yaml
 
 # Operating system files
 .DS_Store

@@ -3,7 +3,7 @@ using Azure.Identity;
 using Azure.Messaging.ServiceBus;
 using FFMpegCore;
 using k8s;
-using SpotVideo.Analysis;
+using Video.Analysis;
 
 GlobalFFOptions.Configure(options =>
 {

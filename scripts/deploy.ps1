@@ -1,25 +1,33 @@
 [CmdletBinding()]
 param(
-    [string] $ResourceGroup = "$([Environment]::UserName)-spotvideo",
+    [string] $ResourceGroup = "$([Environment]::UserName)-video",
 
     [string] $Location,
 
-    [string] $Prefix = "spotvideo",
+    [string] $Prefix = "video",
     [string] $ImageTag = "latest",
     [string] $DotNetMediaImageTag,
     [string] $RustMediaImageTag,
     [ValidateSet("dotnet", "rust")]
     [string] $MediaRuntime = "rust",
+    [ValidateSet("storagequeue", "servicebus")]
+    [string] $MessageTransport = "storagequeue",
+    [string] $KubernetesNamespace,
     [ValidateSet("btbn", "custom")]
     [string] $FfmpegBuild = "btbn",
     [string] $FfmpegVersion = "9.0",
     [string] $Platforms = "linux/amd64,linux/arm64",
-    [switch] $UseLocalDocker,
+    [string] $ControlPlanePlatforms = "linux/amd64",
+    [switch] $UseLocalDocker = $true,
     [switch] $SkipInfrastructureDeployment
 )
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
+
+if ([string]::IsNullOrWhiteSpace($KubernetesNamespace)) {
+    $KubernetesNamespace = "video-$MessageTransport"
+}
 
 function Assert-NativeCommandSucceeded([string] $Operation) {
     if ($LASTEXITCODE -ne 0) {
@@ -30,11 +38,11 @@ function Assert-NativeCommandSucceeded([string] $Operation) {
 if ($SkipInfrastructureDeployment) {
     $deploymentName = az deployment group list `
         --resource-group $ResourceGroup `
-        --query "sort_by([?properties.provisioningState=='Succeeded' && properties.outputs.acrName != null], &properties.timestamp)[-1].name" `
+        --query "sort_by([?properties.provisioningState=='Succeeded' && properties.outputs.acrName != null && properties.outputs.messageTransport.value=='$MessageTransport'], &properties.timestamp)[-1].name" `
         --output tsv
-    Assert-NativeCommandSucceeded "Finding the latest successful SpotVideo infrastructure deployment"
+    Assert-NativeCommandSucceeded "Finding the latest successful video infrastructure deployment"
     if ([string]::IsNullOrWhiteSpace($deploymentName)) {
-        throw "No successful SpotVideo infrastructure deployment was found in resource group '$ResourceGroup'."
+        throw "No successful video infrastructure deployment was found in resource group '$ResourceGroup'."
     }
 
     $deploymentJson = az deployment group show `
@@ -54,8 +62,9 @@ if ($SkipInfrastructureDeployment) {
 
     $deploymentJson = az deployment group create `
         --resource-group $ResourceGroup `
+        --name "video-$MessageTransport" `
         --template-file (Join-Path $root "infra/main.bicep") `
-        --parameters prefix=$Prefix `
+        --parameters prefix=$Prefix messageTransport=$MessageTransport kubernetesNamespace=$KubernetesNamespace `
         --query properties.outputs `
         --output json
     Assert-NativeCommandSucceeded "Deploying Azure resources; image builds and Kubernetes deployment were not started"
@@ -64,21 +73,24 @@ if ([string]::IsNullOrWhiteSpace($deploymentJson)) {
     throw "Azure resource deployment outputs are empty."
 }
 $deployment = $deploymentJson | ConvertFrom-Json
-
-# Remove the write grant created by deployments predating input-storage read-only RBAC.
-$legacyInputWriteGrantIds = @(az role assignment list `
-    --assignee $deployment.workloadPrincipalId.value `
-    --role "Storage Blob Data Contributor" `
-    --scope $deployment.inputStorageId.value `
-    --query "[].id" `
-    --output tsv)
-Assert-NativeCommandSucceeded "Checking for the legacy input-storage write role assignment"
-if ($legacyInputWriteGrantIds.Count -gt 0) {
-    az role assignment delete `
-        --assignee $deployment.workloadPrincipalId.value `
-        --role "Storage Blob Data Contributor" `
-        --scope $deployment.inputStorageId.value
-    Assert-NativeCommandSucceeded "Removing the legacy input-storage write role assignment"
+$deployedTransport = [string]$deployment.messageTransport.value
+if ([string]::IsNullOrWhiteSpace($deployedTransport)) {
+    $deployedTransport = if (-not [string]::IsNullOrWhiteSpace([string]$deployment.outputQueueServiceUri.value)) {
+        "storagequeue"
+    } elseif (-not [string]::IsNullOrWhiteSpace([string]$deployment.serviceBusNamespace.value)) {
+        "servicebus"
+    } else {
+        throw "Deployment outputs do not identify a supported message transport."
+    }
+}
+if ($deployedTransport -ne $MessageTransport) {
+    throw "Deployment uses '$deployedTransport' but -MessageTransport requested '$MessageTransport'. Deploy infrastructure without -SkipInfrastructureDeployment to change it."
+}
+$deployedKubernetesNamespace = [string]$deployment.kubernetesNamespace.value
+if ($SkipInfrastructureDeployment -and
+    -not [string]::IsNullOrWhiteSpace($deployedKubernetesNamespace) -and
+    $deployedKubernetesNamespace -ne $KubernetesNamespace) {
+    throw "Deployment '$deploymentName' federates namespace '$deployedKubernetesNamespace', not '$KubernetesNamespace'. Deploy infrastructure without -SkipInfrastructureDeployment to add the namespace federation."
 }
 
 $acrName = $deployment.acrName.value
@@ -92,13 +104,25 @@ if ([string]::IsNullOrWhiteSpace($RustMediaImageTag)) {
 $projects = @("Analysis", "Completion", "Encoder", "Stitcher")
 foreach ($project in $projects) {
     $projectName = "Video$project"
-    $imageName = "spotvideo-$($project.ToLowerInvariant())"
+    $isControlPlaneWorker = $project -in @("Analysis", "Completion")
+    $imageName = if ($isControlPlaneWorker) {
+        "video-$($project.ToLowerInvariant())-$MessageTransport"
+    } else {
+        "video-$($project.ToLowerInvariant())-$MediaRuntime"
+    }
     $fullImage = "${acrLoginServer}/${imageName}:${ImageTag}"
-    $isRustWorker = $MediaRuntime -eq "rust" -and $project -in @("Encoder", "Stitcher")
+    $projectPlatforms = if ($isControlPlaneWorker) { $ControlPlanePlatforms } else { $Platforms }
+    $isRustWorker = ($isControlPlaneWorker -and $MessageTransport -eq "storagequeue") -or `
+        (-not $isControlPlaneWorker -and $MediaRuntime -eq "rust")
     $dockerfile = Join-Path $root $(if ($isRustWorker) { "rust/Dockerfile" } else { "docker/Dockerfile" })
     $buildArguments = if ($isRustWorker) {
+        $binary = switch ($project) {
+            "Analysis" { "analyzer" }
+            "Completion" { "completion" }
+            default { $project.ToLowerInvariant() }
+        }
         @(
-            "--build-arg", "BINARY=$($project.ToLowerInvariant())",
+            "--build-arg", "BINARY=$binary",
             "--build-arg", "FFMPEG_BUILD=$FfmpegBuild",
             "--build-arg", "FFMPEG_VERSION=$FfmpegVersion"
         )
@@ -110,12 +134,17 @@ foreach ($project in $projects) {
             "--build-arg", "FFMPEG_VERSION=$FfmpegVersion"
         )
     }
+    if ($isRustWorker -and $project -in @("Analysis", "Completion")) {
+        $buildArguments += @("--build-arg", "CARGO_FEATURES=--features=control-plane")
+    }
     if ($UseLocalDocker) {
         az acr login --name $acrName
         Assert-NativeCommandSucceeded "Logging in to Azure Container Registry '$acrName'"
-        if ($Platforms.Contains(',')) {
+        if ($projectPlatforms.Contains(',')) {
             docker buildx build `
-                --platform $Platforms `
+            --platform $projectPlatforms `
+                --provenance=false `
+                --sbom=false `
                 --file $dockerfile `
                 @buildArguments `
                 --tag $fullImage `
@@ -124,7 +153,9 @@ foreach ($project in $projects) {
             Assert-NativeCommandSucceeded "Building and pushing multi-platform $projectName image"
         } else {
             docker build `
-                --platform $Platforms `
+                --platform $projectPlatforms `
+                --provenance=false `
+                --sbom=false `
                 --file $dockerfile `
                 @buildArguments `
                 --tag $fullImage `
@@ -134,7 +165,7 @@ foreach ($project in $projects) {
             Assert-NativeCommandSucceeded "Pushing $projectName image"
         }
     } else {
-        $platformList = @($Platforms.Split(',', [StringSplitOptions]::RemoveEmptyEntries) | ForEach-Object { $_.Trim() })
+        $platformList = @($projectPlatforms.Split(',', [StringSplitOptions]::RemoveEmptyEntries) | ForEach-Object { $_.Trim() })
         $platformImages = @()
         foreach ($platform in $platformList) {
             $platformSuffix = $platform.Replace('linux/', '')
@@ -172,9 +203,11 @@ az aks get-credentials `
     --overwrite-existing
 Assert-NativeCommandSucceeded "Getting AKS credentials"
 
-$serviceBusNamespace = $deployment.serviceBusNamespace.value
-$serviceBusShortName = $serviceBusNamespace.Split('.')[0]
-$manifest = Get-Content (Join-Path $root "deploy/k8s/spotvideo.yaml") -Raw
+$serviceBusNamespace = [string]$deployment.serviceBusNamespace.value
+$serviceBusShortName = if ([string]::IsNullOrWhiteSpace($serviceBusNamespace)) { "" } else { $serviceBusNamespace.Split('.')[0] }
+$manifest = (Get-Content (Join-Path $root "deploy/k8s/video.yaml") -Raw) + `
+    "`n---`n" + `
+    (Get-Content (Join-Path $root "deploy/k8s/video-$MessageTransport.yaml") -Raw)
 $replacements = @{
     "__WORKLOAD_CLIENT_ID__" = $deployment.workloadClientId.value
     "__SERVICE_BUS_NAMESPACE__" = $serviceBusNamespace
@@ -188,6 +221,7 @@ $replacements = @{
     "__DOTNET_MEDIA_IMAGE_TAG__" = $DotNetMediaImageTag
     "__RUST_MEDIA_IMAGE_TAG__" = $RustMediaImageTag
     "__MEDIA_RUNTIME__" = $MediaRuntime
+    "__KUBERNETES_NAMESPACE__" = $KubernetesNamespace
 }
 foreach ($replacement in $replacements.GetEnumerator()) {
     $manifest = $manifest.Replace($replacement.Key, $replacement.Value)
@@ -198,61 +232,25 @@ Set-Content -Path $renderedManifest -Value $manifest -Encoding UTF8
 kubectl apply --filename $renderedManifest
 Assert-NativeCommandSucceeded "Applying the Kubernetes manifest"
 
-kubectl delete deployment/spotvideo-completion scaledobject/spotvideo-completion `
-    --namespace spotvideo `
-    --ignore-not-found
-Assert-NativeCommandSucceeded "Removing the legacy completion processor"
+$analysisDeployment = if ($MessageTransport -eq "storagequeue") { "video-analyzer-storagequeue" } else { "video-analysis-servicebus" }
+$completionDeployment = if ($MessageTransport -eq "storagequeue") { "video-completion-storagequeue" } else { "video-completion-servicebus" }
+$unpausePatch = '{"metadata":{"annotations":{"autoscaling.keda.sh/paused":null,"autoscaling.keda.sh/paused-replicas":null}}}'
+kubectl patch "scaledobject/$analysisDeployment" --namespace $KubernetesNamespace --type merge --patch $unpausePatch
+Assert-NativeCommandSucceeded "Unpausing selected ScaledObject '$analysisDeployment'"
 
 kubectl rollout restart `
-    --namespace spotvideo `
-    deployment/spotvideo-analysis `
-    deployment/spotvideo-job-watcher
-Assert-NativeCommandSucceeded "Restarting SpotVideo deployments to use the rebuilt images"
+    --namespace $KubernetesNamespace `
+    "deployment/$analysisDeployment" `
+    "deployment/$completionDeployment"
+Assert-NativeCommandSucceeded "Restarting video deployments to use the rebuilt images"
 
-$legacyQueue = az servicebus queue list `
-    --resource-group $ResourceGroup `
-    --namespace-name $serviceBusShortName `
-    --query "[?name=='segment-completed'].name | [0]" `
-    --output tsv
-Assert-NativeCommandSucceeded "Checking for the legacy segment completion queue"
-if (-not [string]::IsNullOrWhiteSpace($legacyQueue)) {
-    az servicebus queue delete `
-        --resource-group $ResourceGroup `
-        --namespace-name $serviceBusShortName `
-        --name segment-completed
-    Assert-NativeCommandSucceeded "Removing the legacy segment completion queue"
+Write-Host "Deployed video pipeline to $($deployment.aksName.value) in namespace $KubernetesNamespace with $MessageTransport control plane, $MediaRuntime media workers, and image tag $ImageTag"
+if ($MessageTransport -eq "storagequeue") {
+    Write-Host "Storage Queue input queue: https://$($deployment.outputStorageName.value).queue.core.windows.net/video-submitted"
+    Write-Host "Storage Queue result queue: https://$($deployment.outputStorageName.value).queue.core.windows.net/video-results"
+} else {
+    Write-Host "Service Bus input queue: $serviceBusNamespace/video-submitted"
+    Write-Host "Service Bus result queue: $serviceBusNamespace/video-results"
 }
-
-$outputStorageId = az storage account show `
-    --resource-group $ResourceGroup `
-    --name $deployment.outputStorageName.value `
-    --query id `
-    --output tsv
-Assert-NativeCommandSucceeded "Reading the output storage account ID"
-$legacyTableRoleIds = @(az role assignment list `
-    --assignee $deployment.workloadPrincipalId.value `
-    --role "Storage Table Data Contributor" `
-    --scope $outputStorageId `
-    --query "[].id" `
-    --output tsv)
-Assert-NativeCommandSucceeded "Checking for the legacy table role assignment"
-if ($legacyTableRoleIds.Count -gt 0) {
-    az role assignment delete --ids $legacyTableRoleIds
-    Assert-NativeCommandSucceeded "Removing the legacy table role assignment"
-}
-
-$legacyTableId = az resource list `
-    --resource-group $ResourceGroup `
-    --resource-type "Microsoft.Storage/storageAccounts/tableServices/tables" `
-    --query "[?ends_with(id, '/tableServices/default/tables/encodingstate')].id | [0]" `
-    --output tsv
-Assert-NativeCommandSucceeded "Checking for the legacy encoding state table"
-if (-not [string]::IsNullOrWhiteSpace($legacyTableId)) {
-    az resource delete --ids $legacyTableId
-    Assert-NativeCommandSucceeded "Removing the legacy encoding state table"
-}
-
-Write-Host "Deployed SpotVideo to $($deployment.aksName.value) with $MediaRuntime media workers and image tag $ImageTag"
-Write-Host "Service Bus input queue: $serviceBusNamespace/video-submitted"
 Write-Host "Input blob container: $($deployment.inputStorageServiceUri.value)/$($deployment.inputContainerName.value)"
 Write-Host "Output blob container: $($deployment.outputStorageServiceUri.value)/$($deployment.outputContainerName.value)"

@@ -1,4 +1,4 @@
-namespace SpotVideo.Contracts;
+namespace Video.Contracts;
 
 public static class BlobMountPaths
 {

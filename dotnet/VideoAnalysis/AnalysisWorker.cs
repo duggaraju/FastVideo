@@ -3,9 +3,9 @@ using Azure.Messaging.ServiceBus;
 using FFMpegCore;
 using k8s;
 using k8s.Models;
-using SpotVideo.Contracts;
+using Video.Contracts;
 
-namespace SpotVideo.Analysis;
+namespace Video.Analysis;
 
 public sealed class AnalysisWorker(
     ServiceBusClient serviceBus,
@@ -51,7 +51,7 @@ public sealed class AnalysisWorker(
             var audioBlobName = $"{request.JobId}/segments/audio.m4a";
             var videoCodec = string.IsNullOrWhiteSpace(request.VideoCodec) ? "libsvtav1" : request.VideoCodec;
             var mediaRuntime = GetMediaRuntime(request.MediaRuntime, configuration["Encoding:MediaRuntimeDefault"] ?? "dotnet");
-            var architecture = GetBenchmarkArchitecture(args.Message);
+            var architecture = GetArchitecture(request.Architecture);
 
             var inputPath = BlobMountPaths.FromUri(request.InputVideoUri, inputAccount, inputContainer, inputMountPath);
             var audioPath = BlobMountPaths.FromBlobName(audioBlobName, outputMountPath);
@@ -176,7 +176,7 @@ public sealed class AnalysisWorker(
         CancellationToken cancellationToken)
     {
         var jobName = JobNames.For("encode", manifest.JobId);
-        var targetNamespace = configuration["Kubernetes:Namespace"] ?? "spotvideo";
+        var targetNamespace = configuration["Kubernetes:Namespace"] ?? "video-servicebus";
         try
         {
             await kubernetes.BatchV1.ReadNamespacedJobAsync(jobName, targetNamespace, cancellationToken: cancellationToken);
@@ -207,8 +207,8 @@ public sealed class AnalysisWorker(
         var outputVolumeName = "output-storage";
         var labels = new Dictionary<string, string>
         {
-            ["app.kubernetes.io/name"] = "spotvideo-encoder",
-            ["spotvideo/job-id"] = JobNames.LabelValue(manifest.JobId),
+            ["app.kubernetes.io/name"] = "video-encoder",
+            ["video/job-id"] = JobNames.LabelValue(manifest.JobId),
             ["azure.workload.identity/use"] = "true"
         };
         var nodeSelector = new Dictionary<string, string>
@@ -249,7 +249,7 @@ public sealed class AnalysisWorker(
                     BlobFuseVolume(outputVolumeName, outputAccount, outputContainer, RequiredConfig("WorkloadIdentity:ClientId"), readOnly: false)
                 ],
                 RestartPolicy = "Never",
-                ServiceAccountName = "spotvideo-worker",
+                ServiceAccountName = "video-worker",
                 Tolerations = manifest.UseSpot
                     ? [new V1Toleration { Effect = "NoSchedule", OperatorProperty = "Equal", Key = "kubernetes.azure.com/scalesetpriority", Value = "spot" }]
                     : null,
@@ -309,15 +309,15 @@ public sealed class AnalysisWorker(
         };
     }
 
-    private static string? GetBenchmarkArchitecture(ServiceBusReceivedMessage message)
+    private static string? GetArchitecture(string? requestedArchitecture)
     {
-        if (!message.ApplicationProperties.TryGetValue(JobNames.BenchmarkArchitectureProperty, out var value))
+        if (string.IsNullOrWhiteSpace(requestedArchitecture))
             return null;
 
-        var architecture = Convert.ToString(value);
+        var architecture = requestedArchitecture.ToLowerInvariant();
         return architecture is "amd64" or "arm64"
             ? architecture
-            : throw new ArgumentException($"{JobNames.BenchmarkArchitectureProperty} must be amd64 or arm64");
+            : throw new ArgumentException("Architecture must be amd64 or arm64");
     }
 
     private static V1EnvVar Env(string name, string value) => new() { Name = name, Value = value };

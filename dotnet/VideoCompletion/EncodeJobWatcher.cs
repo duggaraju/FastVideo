@@ -2,9 +2,9 @@ using System.Text.Json;
 using Azure.Messaging.ServiceBus;
 using k8s;
 using k8s.Models;
-using SpotVideo.Contracts;
+using Video.Contracts;
 
-namespace SpotVideo.Completion;
+namespace Video.Completion;
 
 public sealed class EncodeJobWatcher(
     ServiceBusClient serviceBus,
@@ -41,10 +41,10 @@ public sealed class EncodeJobWatcher(
 
     private async Task LogFailedPodsAsync(CancellationToken cancellationToken)
     {
-        var targetNamespace = configuration["Kubernetes:Namespace"] ?? "spotvideo";
+        var targetNamespace = configuration["Kubernetes:Namespace"] ?? "video-servicebus";
         var pods = await kubernetes.CoreV1.ListNamespacedPodAsync(
             targetNamespace,
-            labelSelector: "app.kubernetes.io/name=spotvideo-encoder",
+            labelSelector: "app.kubernetes.io/name=video-encoder",
             cancellationToken: cancellationToken);
 
         foreach (var pod in pods.Items.Where(pod => pod.Status?.Phase == "Failed"))
@@ -66,10 +66,10 @@ public sealed class EncodeJobWatcher(
 
     private async Task ReportTerminalVideosAsync(ServiceBusSender sender, CancellationToken cancellationToken)
     {
-        var targetNamespace = configuration["Kubernetes:Namespace"] ?? "spotvideo";
+        var targetNamespace = configuration["Kubernetes:Namespace"] ?? "video-servicebus";
         var encodeJobs = await kubernetes.BatchV1.ListNamespacedJobAsync(
             targetNamespace,
-            labelSelector: "app.kubernetes.io/name=spotvideo-encoder",
+            labelSelector: "app.kubernetes.io/name=video-encoder",
             cancellationToken: cancellationToken);
 
         await RebalanceEncodingJobsAsync(encodeJobs.Items, targetNamespace, cancellationToken);
@@ -108,7 +108,7 @@ public sealed class EncodeJobWatcher(
 
         var stitchJobs = await kubernetes.BatchV1.ListNamespacedJobAsync(
             targetNamespace,
-            labelSelector: "app.kubernetes.io/name=spotvideo-stitcher",
+            labelSelector: "app.kubernetes.io/name=video-stitcher",
             cancellationToken: cancellationToken);
 
         foreach (var stitchJob in stitchJobs.Items)
@@ -206,8 +206,8 @@ public sealed class EncodeJobWatcher(
 
         var labels = new Dictionary<string, string>
         {
-            ["app.kubernetes.io/name"] = "spotvideo-stitcher",
-            ["spotvideo/job-id"] = JobNames.LabelValue(jobId),
+            ["app.kubernetes.io/name"] = "video-stitcher",
+            ["video/job-id"] = JobNames.LabelValue(jobId),
             ["azure.workload.identity/use"] = "true"
         };
         var outputVolumeName = "output-storage";
@@ -260,7 +260,7 @@ public sealed class EncodeJobWatcher(
                         RequiredConfig("WorkloadIdentity:ClientId"))
                 ],
                 RestartPolicy = "Never",
-                ServiceAccountName = "spotvideo-worker",
+                ServiceAccountName = "video-worker",
                 Tolerations = useSpot
                     ? [new V1Toleration { Effect = "NoSchedule", OperatorProperty = "Equal", Key = "kubernetes.azure.com/scalesetpriority", Value = "spot" }]
                     : null,

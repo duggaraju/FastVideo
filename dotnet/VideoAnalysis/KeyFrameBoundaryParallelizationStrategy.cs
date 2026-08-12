@@ -1,8 +1,8 @@
 using System.Diagnostics;
 using System.Globalization;
-using SpotVideo.Contracts;
+using Video.Contracts;
 
-namespace SpotVideo.Analysis;
+namespace Video.Analysis;
 
 public sealed class KeyFrameBoundaryParallelizationStrategy : IParallelizationStrategy
 {

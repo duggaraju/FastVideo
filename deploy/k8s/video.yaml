@@ -1,0 +1,85 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: __KUBERNETES_NAMESPACE__
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: video-worker
+  namespace: __KUBERNETES_NAMESPACE__
+  annotations:
+    azure.workload.identity/client-id: "__WORKLOAD_CLIENT_ID__"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: video-job-manager
+  namespace: __KUBERNETES_NAMESPACE__
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "delete", "get", "list", "patch", "watch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: video-job-manager
+  namespace: __KUBERNETES_NAMESPACE__
+subjects:
+  - kind: ServiceAccount
+    name: video-worker
+    namespace: __KUBERNETES_NAMESPACE__
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: video-job-manager
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: video-config
+  namespace: __KUBERNETES_NAMESPACE__
+data:
+  ServiceBus__Namespace: "__SERVICE_BUS_NAMESPACE__"
+  ServiceBus__InputQueue: "video-submitted"
+  ServiceBus__VideoResultQueue: "video-results"
+  Storage__InputAccountName: "__INPUT_STORAGE_ACCOUNT__"
+  Storage__InputContainer: "__INPUT_STORAGE_CONTAINER__"
+  Storage__InputMountPath: "/mnt/input"
+  Storage__OutputAccountName: "__OUTPUT_STORAGE_ACCOUNT__"
+  Storage__OutputContainer: "__OUTPUT_STORAGE_CONTAINER__"
+  Storage__OutputMountPath: "/mnt/output"
+  Storage__WorkingContainer: "__OUTPUT_STORAGE_CONTAINER__"
+  Storage__SubmissionQueue: "video-submitted"
+  Storage__ResultQueue: "video-results"
+  Storage__QueuePollSeconds: "3"
+  Storage__QueueVisibilityTimeoutSeconds: "900"
+  Storage__QueueVisibilityRenew: "true"
+  Storage__QueueVisibilityRenewalSeconds: "120"
+  Completion__PollSeconds: "10"
+  WorkloadIdentity__ClientId: "__WORKLOAD_CLIENT_ID__"
+  Kubernetes__Namespace: "__KUBERNETES_NAMESPACE__"
+  Images__Encoder: "__ACR_LOGIN_SERVER__/video-encoder-__MEDIA_RUNTIME__:__IMAGE_TAG__"
+  Images__Stitcher: "__ACR_LOGIN_SERVER__/video-stitcher-__MEDIA_RUNTIME__:__IMAGE_TAG__"
+  Images__Dotnet__Encoder: "__ACR_LOGIN_SERVER__/video-encoder-dotnet:__DOTNET_MEDIA_IMAGE_TAG__"
+  Images__Dotnet__Stitcher: "__ACR_LOGIN_SERVER__/video-stitcher-dotnet:__DOTNET_MEDIA_IMAGE_TAG__"
+  Images__Rust__Encoder: "__ACR_LOGIN_SERVER__/video-encoder-rust:__RUST_MEDIA_IMAGE_TAG__"
+  Images__Rust__Stitcher: "__ACR_LOGIN_SERVER__/video-stitcher-rust:__RUST_MEDIA_IMAGE_TAG__"
+  Encoding__MediaRuntimeDefault: "__MEDIA_RUNTIME__"
+  Encoding__MaxParallelism: "32"
+  Encoding__MinParallelismPerJob: "2"
+  Encoding__ParallelizationStrategy: "fixed-duration"
+---
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: video-workload-identity
+  namespace: __KUBERNETES_NAMESPACE__
+spec:
+  podIdentity:
+    provider: azure-workload
+    identityId: "__WORKLOAD_CLIENT_ID__"

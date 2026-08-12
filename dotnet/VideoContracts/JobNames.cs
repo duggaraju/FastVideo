@@ -1,21 +1,20 @@
 using System.Security.Cryptography;
 using System.Text;
 
-namespace SpotVideo.Contracts;
+namespace Video.Contracts;
 
 public static class JobNames
 {
-    public const string BenchmarkArchitectureProperty = "spotvideo-benchmark-architecture";
-    public const string ArchitectureAnnotation = "spotvideo/architecture";
-    public const string JobIdAnnotation = "spotvideo/job-id";
-    public const string StageIdAnnotation = "spotvideo/stage-id";
-    public const string UseSpotAnnotation = "spotvideo/use-spot";
-    public const string SegmentCountAnnotation = "spotvideo/segment-count";
-    public const string AudioBlobNameAnnotation = "spotvideo/audio-blob-name";
-    public const string OutputVideoUriAnnotation = "spotvideo/output-video-uri";
-    public const string CalculateVmafAnnotation = "spotvideo/calculate-vmaf";
-    public const string MediaRuntimeAnnotation = "spotvideo/media-runtime";
-    public const string ResultReportedAnnotation = "spotvideo/result-reported";
+    public const string ArchitectureAnnotation = "video/architecture";
+    public const string JobIdAnnotation = "video/job-id";
+    public const string StageIdAnnotation = "video/stage-id";
+    public const string UseSpotAnnotation = "video/use-spot";
+    public const string SegmentCountAnnotation = "video/segment-count";
+    public const string AudioBlobNameAnnotation = "video/audio-blob-name";
+    public const string OutputVideoUriAnnotation = "video/output-video-uri";
+    public const string CalculateVmafAnnotation = "video/calculate-vmaf";
+    public const string MediaRuntimeAnnotation = "video/media-runtime";
+    public const string ResultReportedAnnotation = "video/result-reported";
 
     public static string For(string prefix, string jobId) => $"{prefix}-{LabelValue(jobId)}";
 

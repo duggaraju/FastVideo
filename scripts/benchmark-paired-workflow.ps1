@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string] $ResourceGroup = "$([Environment]::UserName)-spotvideo",
+    [string] $ResourceGroup = "$([Environment]::UserName)-video",
     [ValidateRange(1, 10)]
     [int] $Pairs = 5,
     [ValidateRange(0, 100)]
@@ -8,12 +8,14 @@ param(
     [string] $AcrLoginServer,
     [string] $DotNetMediaImageTag = "latest",
     [string] $RustMediaImageTag = "latest",
+    [ValidateSet("auto", "storagequeue", "servicebus")]
+    [string] $MessageTransport = "auto",
+    [string] $KubernetesNamespace,
     [string] $BatchPrefix = "paired-$(Get-Date -Format 'yyyyMMdd-HHmmss')",
     [string] $OutputPath = (Join-Path $PSScriptRoot "bench-paired-dotnet-rust-loopback-vmaf.json")
 )
 
 $ErrorActionPreference = "Stop"
-$namespace = "spotvideo"
 $workspaceRoot = Split-Path $PSScriptRoot -Parent
 
 function Assert-NativeCommandSucceeded([string] $Operation) {
@@ -32,32 +34,32 @@ function Get-LabelValue([string] $Value) {
     return "$prefix-$hash"
 }
 
-function Set-MediaRuntimeImages([string] $LoginServer, [string] $DotNetTag, [string] $RustTag) {
+function Set-MediaRuntimeImages([string] $LoginServer, [string] $DotNetTag, [string] $RustTag, [string] $AnalysisDeployment, [string] $CompletionDeployment) {
     $patch = @{
         data = @{
-            Images__Dotnet__Encoder = "$LoginServer/spotvideo-encoder:$DotNetTag"
-            Images__Dotnet__Stitcher = "$LoginServer/spotvideo-stitcher:$DotNetTag"
-            Images__Rust__Encoder = "$LoginServer/spotvideo-encoder:$RustTag"
-            Images__Rust__Stitcher = "$LoginServer/spotvideo-stitcher:$RustTag"
+            Images__Dotnet__Encoder = "$LoginServer/video-encoder-dotnet:$DotNetTag"
+            Images__Dotnet__Stitcher = "$LoginServer/video-stitcher-dotnet:$DotNetTag"
+            Images__Rust__Encoder = "$LoginServer/video-encoder-rust:$RustTag"
+            Images__Rust__Stitcher = "$LoginServer/video-stitcher-rust:$RustTag"
         }
     } | ConvertTo-Json -Compress
-    kubectl patch configmap spotvideo-config --namespace $namespace --type merge --patch $patch | Out-Host
+    kubectl patch configmap video-config --namespace $KubernetesNamespace --type merge --patch $patch | Out-Host
     Assert-NativeCommandSucceeded "Updating media runtime images"
-    kubectl rollout restart deployment/spotvideo-analysis --namespace $namespace | Out-Host
+    kubectl rollout restart "deployment/$AnalysisDeployment" --namespace $KubernetesNamespace | Out-Host
     Assert-NativeCommandSucceeded "Restarting analysis"
-    kubectl rollout restart deployment/spotvideo-job-watcher --namespace $namespace | Out-Host
-    Assert-NativeCommandSucceeded "Restarting job watcher"
-    kubectl scale deployment/spotvideo-analysis --namespace $namespace --replicas=1 | Out-Host
+    kubectl rollout restart "deployment/$CompletionDeployment" --namespace $KubernetesNamespace | Out-Host
+    Assert-NativeCommandSucceeded "Restarting completion"
+    kubectl scale "deployment/$AnalysisDeployment" --namespace $KubernetesNamespace --replicas=1 | Out-Host
     Assert-NativeCommandSucceeded "Scaling analysis"
-    kubectl rollout status deployment/spotvideo-analysis --namespace $namespace --timeout=5m | Out-Host
+    kubectl rollout status "deployment/$AnalysisDeployment" --namespace $KubernetesNamespace --timeout=5m | Out-Host
     Assert-NativeCommandSucceeded "Waiting for analysis"
-    kubectl rollout status deployment/spotvideo-job-watcher --namespace $namespace --timeout=5m | Out-Host
-    Assert-NativeCommandSucceeded "Waiting for job watcher"
+    kubectl rollout status "deployment/$CompletionDeployment" --namespace $KubernetesNamespace --timeout=5m | Out-Host
+    Assert-NativeCommandSucceeded "Waiting for completion"
 }
 
 function Start-Benchmark([string] $Runtime, [string] $BatchId, [string] $ResultPath) {
     Start-Job -ScriptBlock {
-        param($Root, $Group, $MediaRuntime, $Batch, $Path, $InheritedPath)
+        param($Root, $Group, $MediaRuntime, $Transport, $Batch, $Path, $InheritedPath)
         $env:PATH = $InheritedPath
         Set-Location $Root
         & .\scripts\benchmark-workflow.ps1 `
@@ -65,12 +67,13 @@ function Start-Benchmark([string] $Runtime, [string] $BatchId, [string] $ResultP
             -Runs 1 `
             -UseSpot $true `
             -MediaRuntime $MediaRuntime `
+            -MessageTransport $Transport `
             -Architecture amd64 `
             -CalculateVmaf $true `
             -TimeoutMinutes 30 `
             -BatchId $Batch `
             -OutputPath $Path
-    } -ArgumentList $workspaceRoot, $ResourceGroup, $Runtime, $BatchId, $ResultPath, $env:PATH
+    } -ArgumentList $workspaceRoot, $ResourceGroup, $Runtime, $MessageTransport, $BatchId, $ResultPath, $env:PATH
 }
 
 foreach ($command in @("az", "kubectl")) {
@@ -79,16 +82,44 @@ foreach ($command in @("az", "kubectl")) {
     }
 }
 
-if ([string]::IsNullOrWhiteSpace($AcrLoginServer)) {
-    $deploymentName = az deployment group list `
-        --resource-group $ResourceGroup `
-        --query "sort_by([?properties.provisioningState=='Succeeded' && properties.outputs.acrLoginServer != null], &properties.timestamp)[-1].name" `
-        --output tsv
-    Assert-NativeCommandSucceeded "Finding the latest successful SpotVideo infrastructure deployment"
-    if ([string]::IsNullOrWhiteSpace($deploymentName)) {
-        throw "No successful SpotVideo infrastructure deployment was found in resource group '$ResourceGroup'."
-    }
+$deploymentQuery = if ($MessageTransport -eq "auto") {
+    "sort_by([?properties.provisioningState=='Succeeded' && properties.outputs.acrLoginServer != null], &properties.timestamp)[-1].name"
+} else {
+    "sort_by([?properties.provisioningState=='Succeeded' && properties.outputs.acrLoginServer != null && properties.outputs.messageTransport.value=='$MessageTransport'], &properties.timestamp)[-1].name"
+}
+$deploymentName = az deployment group list `
+    --resource-group $ResourceGroup `
+    --query $deploymentQuery `
+    --output tsv
+Assert-NativeCommandSucceeded "Finding the latest successful video infrastructure deployment"
+if ([string]::IsNullOrWhiteSpace($deploymentName)) {
+    throw "No successful video infrastructure deployment was found in resource group '$ResourceGroup'."
+}
 
+$deploymentJson = az deployment group show `
+    --resource-group $ResourceGroup `
+    --name $deploymentName `
+    --query properties.outputs `
+    --output json
+Assert-NativeCommandSucceeded "Reading deployment outputs"
+$deployment = $deploymentJson | ConvertFrom-Json
+$deployedTransport = [string]$deployment.messageTransport.value
+if ([string]::IsNullOrWhiteSpace($deployedTransport)) {
+    $deployedTransport = if (-not [string]::IsNullOrWhiteSpace([string]$deployment.outputQueueServiceUri.value)) { "storagequeue" } else { "servicebus" }
+}
+if ($MessageTransport -eq "auto") {
+    $MessageTransport = $deployedTransport
+} elseif ($MessageTransport -ne $deployedTransport) {
+    throw "Deployment '$deploymentName' uses '$deployedTransport', not '$MessageTransport'."
+}
+if ([string]::IsNullOrWhiteSpace($KubernetesNamespace)) {
+    $KubernetesNamespace = [string]$deployment.kubernetesNamespace.value
+    if ([string]::IsNullOrWhiteSpace($KubernetesNamespace)) {
+        $KubernetesNamespace = "video-$MessageTransport"
+    }
+}
+
+if ([string]::IsNullOrWhiteSpace($AcrLoginServer)) {
     $AcrLoginServer = az deployment group show `
         --resource-group $ResourceGroup `
         --name $deploymentName `
@@ -96,9 +127,12 @@ if ([string]::IsNullOrWhiteSpace($AcrLoginServer)) {
         --output tsv
     Assert-NativeCommandSucceeded "Reading ACR login server from deployment '$deploymentName'"
 }
+$analysisDeployment = if ($MessageTransport -eq "storagequeue") { "video-analyzer-storagequeue" } else { "video-analysis-servicebus" }
+$completionDeployment = if ($MessageTransport -eq "storagequeue") { "video-completion-storagequeue" } else { "video-completion-servicebus" }
+$analysisScaledObject = $analysisDeployment
 $results = @()
-Set-MediaRuntimeImages $AcrLoginServer $DotNetMediaImageTag $RustMediaImageTag
-kubectl patch scaledobject spotvideo-analysis --namespace $namespace --type merge --patch '{"spec":{"minReplicaCount":1}}' | Out-Host
+Set-MediaRuntimeImages $AcrLoginServer $DotNetMediaImageTag $RustMediaImageTag $analysisDeployment $completionDeployment
+kubectl patch "scaledobject/$analysisScaledObject" --namespace $KubernetesNamespace --type merge --patch '{"spec":{"minReplicaCount":1}}' | Out-Host
 Assert-NativeCommandSucceeded "Holding analysis at one replica"
 
 try {
@@ -119,7 +153,7 @@ try {
         try {
             $firstJobId = "$($pairRuns[$order[0]].BatchId)-1"
             $firstJobName = "encode-$(Get-LabelValue $firstJobId)"
-            kubectl wait --namespace $namespace --for=create "job/$firstJobName" --timeout=10m | Out-Host
+            kubectl wait --namespace $KubernetesNamespace --for=create "job/$firstJobName" --timeout=10m | Out-Host
             Assert-NativeCommandSucceeded "Waiting for the first encode job"
 
             & "$PSScriptRoot\benchmark-workflow.ps1" `
@@ -127,6 +161,7 @@ try {
                 -Runs 1 `
                 -UseSpot $true `
                 -MediaRuntime $order[1] `
+                -MessageTransport $MessageTransport `
                 -Architecture amd64 `
                 -CalculateVmaf $true `
                 -TimeoutMinutes 30 `
@@ -172,8 +207,8 @@ try {
     }
 }
 finally {
-    kubectl patch scaledobject spotvideo-analysis --namespace $namespace --type merge --patch '{"spec":{"minReplicaCount":0}}' | Out-Host
-    kubectl scale deployment/spotvideo-analysis --namespace $namespace --replicas=0 | Out-Host
+    kubectl patch "scaledobject/$analysisScaledObject" --namespace $KubernetesNamespace --type merge --patch '{"spec":{"minReplicaCount":0}}' | Out-Host
+    kubectl scale "deployment/$analysisDeployment" --namespace $KubernetesNamespace --replicas=0 | Out-Host
 }
 
 Write-Host "Paired results: $OutputPath"

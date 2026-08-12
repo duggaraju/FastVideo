@@ -2,7 +2,7 @@ targetScope = 'resourceGroup'
 
 @minLength(3)
 @maxLength(12)
-param prefix string = 'spotvideo'
+param prefix string = 'video'
 param location string = resourceGroup().location
 param systemVmSize string = 'Standard_D2ds_v5'
 param spotVmSize string = 'Standard_D8ds_v5'
@@ -17,6 +17,12 @@ param regularMaxCount int = 10
 param kubernetesVersion string = ''
 param inputContainerName string = 'input'
 param outputContainerName string = 'videos'
+param kubernetesNamespace string = 'video-${messageTransport}'
+@allowed([
+  'storagequeue'
+  'servicebus'
+])
+param messageTransport string = 'storagequeue'
 
 var suffix = uniqueString(subscription().subscriptionId, resourceGroup().id)
 var compactPrefix = replace(toLower(prefix), '-', '')
@@ -27,7 +33,7 @@ var acrName = take('${compactPrefix}acr${suffix}', 50)
 var serviceBusName = take('${prefix}-sb-${suffix}', 50)
 var logAnalyticsName = take('${prefix}-logs-${suffix}', 63)
 var workloadIdentityName = '${prefix}-workload-${suffix}'
-var serviceAccountSubject = 'system:serviceaccount:spotvideo:spotvideo-worker'
+var serviceAccountSubject = 'system:serviceaccount:${kubernetesNamespace}:video-worker'
 var kedaOperatorSubject = 'system:serviceaccount:kube-system:keda-operator'
 
 resource acr 'Microsoft.ContainerRegistry/registries@2025-04-01' = {
@@ -94,45 +100,6 @@ resource outputContainer 'Microsoft.Storage/storageAccounts/blobServices/contain
   parent: outputBlobService
   name: outputContainerName
   properties: { publicAccess: 'None' }
-}
-
-resource serviceBus 'Microsoft.ServiceBus/namespaces@2024-01-01' = {
-  name: serviceBusName
-  location: location
-  sku: { name: 'Standard', tier: 'Standard' }
-  properties: {
-    disableLocalAuth: true
-    minimumTlsVersion: '1.2'
-    publicNetworkAccess: 'Enabled'
-  }
-}
-
-resource submittedQueue 'Microsoft.ServiceBus/namespaces/queues@2024-01-01' = {
-  parent: serviceBus
-  name: 'video-submitted'
-  properties: {
-    deadLetteringOnMessageExpiration: true
-    defaultMessageTimeToLive: 'P7D'
-    duplicateDetectionHistoryTimeWindow: 'PT10M'
-    enableBatchedOperations: true
-    lockDuration: 'PT5M'
-    maxDeliveryCount: 10
-    requiresDuplicateDetection: true
-  }
-}
-
-resource videoResultsQueue 'Microsoft.ServiceBus/namespaces/queues@2024-01-01' = {
-  parent: serviceBus
-  name: 'video-results'
-  properties: {
-    deadLetteringOnMessageExpiration: true
-    defaultMessageTimeToLive: 'P14D'
-    duplicateDetectionHistoryTimeWindow: 'P1D'
-    enableBatchedOperations: true
-    lockDuration: 'PT5M'
-    maxDeliveryCount: 10
-    requiresDuplicateDetection: true
-  }
 }
 
 resource workloadIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
@@ -264,7 +231,7 @@ resource armSpotPool 'Microsoft.ContainerService/managedClusters/agentPools@2025
 
 resource federation 'Microsoft.ManagedIdentity/userAssignedIdentities/federatedIdentityCredentials@2023-01-31' = {
   parent: workloadIdentity
-  name: 'spotvideo-worker'
+  name: '${messageTransport}-video-worker'
   properties: {
     audiences: [ 'api://AzureADTokenExchange' ]
     issuer: aks.properties.oidcIssuerProfile.issuerURL
@@ -280,6 +247,23 @@ resource kedaOperatorFederation 'Microsoft.ManagedIdentity/userAssignedIdentitie
     audiences: [ 'api://AzureADTokenExchange' ]
     issuer: aks.properties.oidcIssuerProfile.issuerURL
     subject: kedaOperatorSubject
+  }
+}
+
+module storageQueue './modules/storagequeue.bicep' = if (messageTransport == 'storagequeue') {
+  params: {
+    outputStorageName: outputStorage.name
+    workloadIdentityId: workloadIdentity.id
+    workloadPrincipalId: workloadIdentity.properties.principalId
+  }
+}
+
+module serviceBus './modules/servicebus.bicep' = if (messageTransport == 'servicebus') {
+  params: {
+    serviceBusName: serviceBusName
+    location: location
+    workloadIdentityId: workloadIdentity.id
+    workloadPrincipalId: workloadIdentity.properties.principalId
   }
 }
 
@@ -300,26 +284,6 @@ resource outputBlobContributor 'Microsoft.Authorization/roleAssignments@2022-04-
     principalId: workloadIdentity.properties.principalId
     principalType: 'ServicePrincipal'
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
-  }
-}
-
-resource busReceiver 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(serviceBus.id, workloadIdentity.id, 'receiver')
-  scope: serviceBus
-  properties: {
-    principalId: workloadIdentity.properties.principalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4f6d3b9b-027b-4f4c-9142-0e5a2a2247e0')
-  }
-}
-
-resource busSender 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(serviceBus.id, workloadIdentity.id, 'sender')
-  scope: serviceBus
-  properties: {
-    principalId: workloadIdentity.properties.principalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '69a216fc-b8fb-44d8-bc22-1f3c2cd27a39')
   }
 }
 
@@ -346,6 +310,9 @@ output outputStorageName string = outputStorage.name
 output outputStorageId string = outputStorage.id
 output outputContainerName string = outputContainer.name
 output outputStorageServiceUri string = 'https://${outputStorage.name}.blob.${environment().suffixes.storage}'
-output serviceBusNamespace string = replace(replace(serviceBus.properties.serviceBusEndpoint, 'https://', ''), ':443/', '')
+output messageTransport string = messageTransport
+output kubernetesNamespace string = kubernetesNamespace
+output outputQueueServiceUri string = storageQueue.?outputs.queueServiceUri ?? ''
+output serviceBusNamespace string = serviceBus.?outputs.fullyQualifiedNamespace ?? ''
 output workloadClientId string = workloadIdentity.properties.clientId
 output workloadPrincipalId string = workloadIdentity.properties.principalId

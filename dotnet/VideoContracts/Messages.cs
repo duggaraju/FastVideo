@@ -1,4 +1,4 @@
-namespace SpotVideo.Contracts;
+namespace Video.Contracts;
 
 public sealed record VideoSubmitted(
     string JobId,
@@ -13,7 +13,8 @@ public sealed record VideoSubmitted(
     bool UseSpot = true,
     bool CalculateVmaf = false,
     string? MediaRuntime = null,
-    string? ParallelizationStrategy = null);
+    string? ParallelizationStrategy = null,
+    string? Architecture = null);
 
 public sealed record VideoManifest(
     string JobId,

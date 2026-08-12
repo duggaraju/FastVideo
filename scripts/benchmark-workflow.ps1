@@ -1,12 +1,15 @@
 [CmdletBinding()]
 param(
-    [string] $ResourceGroup = "$([Environment]::UserName)-spotvideo",
-    [uri] $InputVideoUri = "https://spotvideoinsoudinndket2a.blob.core.windows.net/input/BigBuckBunny_1080p_10min.mp4",
+    [string] $ResourceGroup = "$([Environment]::UserName)-video",
+    [uri] $InputVideoUri = "https://videoinsoudinndket2a.blob.core.windows.net/input/BigBuckBunny_1080p_10min.mp4",
     [ValidateRange(1, 20)]
     [int] $Runs = 5,
     [bool] $UseSpot = $true,
     [ValidateSet("dotnet", "rust")]
     [string] $MediaRuntime = "rust",
+    [ValidateSet("auto", "storagequeue", "servicebus")]
+    [string] $MessageTransport = "auto",
+    [string] $KubernetesNamespace,
     [ValidateSet("any", "amd64", "arm64")]
     [string] $Architecture = "any",
     [bool] $CalculateVmaf = $false,
@@ -73,9 +76,14 @@ foreach ($command in @("az", "kubectl")) {
     }
 }
 
+$deploymentQuery = if ($MessageTransport -eq "auto") {
+    "sort_by([?properties.provisioningState=='Succeeded'], &properties.timestamp)[-1].name"
+} else {
+    "sort_by([?properties.provisioningState=='Succeeded' && properties.outputs.messageTransport.value=='$MessageTransport'], &properties.timestamp)[-1].name"
+}
 $deploymentName = az deployment group list `
     --resource-group $ResourceGroup `
-    --query "sort_by([?properties.provisioningState=='Succeeded'], &properties.timestamp)[-1].name" `
+    --query $deploymentQuery `
     --output tsv
 Assert-NativeCommandSucceeded "Finding the latest successful deployment"
 $deployment = az deployment group show `
@@ -84,6 +92,28 @@ $deployment = az deployment group show `
     --query properties.outputs `
     --output json | ConvertFrom-Json
 Assert-NativeCommandSucceeded "Reading deployment outputs"
+
+$deployedTransport = [string]$deployment.messageTransport.value
+if ([string]::IsNullOrWhiteSpace($deployedTransport)) {
+    $deployedTransport = if (-not [string]::IsNullOrWhiteSpace([string]$deployment.outputQueueServiceUri.value)) {
+        "storagequeue"
+    } elseif (-not [string]::IsNullOrWhiteSpace([string]$deployment.serviceBusNamespace.value)) {
+        "servicebus"
+    } else {
+        throw "Deployment '$deploymentName' does not identify a supported message transport."
+    }
+}
+if ($MessageTransport -eq "auto") {
+    $MessageTransport = $deployedTransport
+} elseif ($MessageTransport -ne $deployedTransport) {
+    throw "Deployment '$deploymentName' uses '$deployedTransport', not '$MessageTransport'."
+}
+if ([string]::IsNullOrWhiteSpace($KubernetesNamespace)) {
+    $KubernetesNamespace = [string]$deployment.kubernetesNamespace.value
+    if ([string]::IsNullOrWhiteSpace($KubernetesNamespace)) {
+        $KubernetesNamespace = "video-$MessageTransport"
+    }
+}
 
 $inputPath = $InputVideoUri.AbsolutePath.TrimStart('/').Split('/', 2)
 if ($InputVideoUri.Scheme -ne "https" -or $inputPath.Count -ne 2 -or
@@ -110,7 +140,6 @@ az aks get-credentials `
     --output none
 Assert-NativeCommandSucceeded "Getting AKS credentials"
 
-$serviceBusNamespace = $deployment.serviceBusNamespace.value
 $outputStorageAccount = $deployment.outputStorageName.value
 $outputContainer = $deployment.outputContainerName.value
 $priority = if ($UseSpot) { "spot" } else { "regular" }
@@ -140,49 +169,63 @@ for ($run = 1; $run -le $Runs; $run++) {
         useSpot = $UseSpot
         calculateVmaf = $CalculateVmaf
         mediaRuntime = $MediaRuntime
-    } | ConvertTo-Json -Compress
-    $payloadArgument = $payload.Replace('"', '\"')
-    $brokerProperties = [ordered]@{
-        MessageId = $jobId
-        CorrelationId = $jobId
-    } | ConvertTo-Json -Compress
-    $brokerPropertiesHeader = "BrokerProperties=$($brokerProperties.Replace('"', '\"'))"
-    $messageHeaders = @("Content-Type=application/json", $brokerPropertiesHeader)
-    if ($Architecture -ne "any") {
-        $messageHeaders += "spotvideo-benchmark-architecture=$Architecture"
     }
+    if ($Architecture -ne "any") {
+        $payload.architecture = $Architecture
+    }
+    $payload = $payload | ConvertTo-Json -Compress
+    $payloadArgument = $payload.Replace('"', '\"')
 
     $submittedAt = [DateTimeOffset]::UtcNow
     Write-Host "[$run/$Runs] Submitting $jobId ($mode) at $submittedAt"
-    az rest `
-        --method post `
-        --url "https://$serviceBusNamespace/video-submitted/messages" `
-        --resource "https://servicebus.azure.net" `
-        --headers $messageHeaders `
-        --body $payloadArgument `
-        --output none
+    if ($MessageTransport -eq "storagequeue") {
+        az storage message put `
+            --account-name $outputStorageAccount `
+            --queue-name video-submitted `
+            --content $payloadArgument `
+            --auth-mode login `
+            --only-show-errors `
+            --output none
+    } else {
+        $serviceBusNamespace = [string]$deployment.serviceBusNamespace.value
+        $brokerProperties = [ordered]@{
+            MessageId = $jobId
+            CorrelationId = $jobId
+        } | ConvertTo-Json -Compress
+        $messageHeaders = @(
+            "Content-Type=application/json",
+            "BrokerProperties=$($brokerProperties.Replace('"', '\"'))"
+        )
+        az rest `
+            --method post `
+            --url "https://$serviceBusNamespace/video-submitted/messages" `
+            --resource "https://servicebus.azure.net" `
+            --headers $messageHeaders `
+            --body $payloadArgument `
+            --output none
+    }
     Assert-NativeCommandSucceeded "Submitting $jobId"
 
-    kubectl wait --namespace spotvideo --for=create "job/$encodeJobName" --timeout="${TimeoutMinutes}m"
+    kubectl wait --namespace $KubernetesNamespace --for=create "job/$encodeJobName" --timeout="${TimeoutMinutes}m"
     Assert-NativeCommandSucceeded "Waiting for encode job creation"
-    kubectl wait --namespace spotvideo --for=condition=complete "job/$encodeJobName" --timeout="${TimeoutMinutes}m"
+    kubectl wait --namespace $KubernetesNamespace --for=condition=complete "job/$encodeJobName" --timeout="${TimeoutMinutes}m"
     Assert-NativeCommandSucceeded "Waiting for encode job completion"
 
-    $encodeJob = kubectl get job $encodeJobName --namespace spotvideo --output json | ConvertFrom-Json
+    $encodeJob = kubectl get job $encodeJobName --namespace $KubernetesNamespace --output json | ConvertFrom-Json
     Assert-NativeCommandSucceeded "Reading encode job"
-    $encoderPods = kubectl get pods --namespace spotvideo `
-        --selector "app.kubernetes.io/name=spotvideo-encoder,spotvideo/job-id=$labelValue" `
+    $encoderPods = kubectl get pods --namespace $KubernetesNamespace `
+        --selector "app.kubernetes.io/name=video-encoder,video/job-id=$labelValue" `
         --output json | ConvertFrom-Json
     Assert-NativeCommandSucceeded "Reading encoder pods"
 
-    kubectl wait --namespace spotvideo --for=create "job/$stitchJobName" --timeout="${TimeoutMinutes}m"
+    kubectl wait --namespace $KubernetesNamespace --for=create "job/$stitchJobName" --timeout="${TimeoutMinutes}m"
     Assert-NativeCommandSucceeded "Waiting for stitch job creation"
-    kubectl wait --namespace spotvideo --for=condition=complete "job/$stitchJobName" --timeout="${TimeoutMinutes}m"
+    kubectl wait --namespace $KubernetesNamespace --for=condition=complete "job/$stitchJobName" --timeout="${TimeoutMinutes}m"
     Assert-NativeCommandSucceeded "Waiting for stitch job completion"
-    $stitchJob = kubectl get job $stitchJobName --namespace spotvideo --output json | ConvertFrom-Json
+    $stitchJob = kubectl get job $stitchJobName --namespace $KubernetesNamespace --output json | ConvertFrom-Json
     Assert-NativeCommandSucceeded "Reading stitch job"
-    $stitchPods = kubectl get pods --namespace spotvideo `
-        --selector "app.kubernetes.io/name=spotvideo-stitcher,spotvideo/job-id=$labelValue" `
+    $stitchPods = kubectl get pods --namespace $KubernetesNamespace `
+        --selector "app.kubernetes.io/name=video-stitcher,video/job-id=$labelValue" `
         --output json | ConvertFrom-Json
     Assert-NativeCommandSucceeded "Reading stitch pods"
 

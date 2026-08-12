@@ -2,15 +2,16 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
 
-pub const ARCHITECTURE_ANNOTATION: &str = "spotvideo/architecture";
-pub const JOB_ID_ANNOTATION: &str = "spotvideo/job-id";
-pub const STAGE_ID_ANNOTATION: &str = "spotvideo/stage-id";
-pub const USE_SPOT_ANNOTATION: &str = "spotvideo/use-spot";
-pub const SEGMENT_COUNT_ANNOTATION: &str = "spotvideo/segment-count";
-pub const AUDIO_BLOB_NAME_ANNOTATION: &str = "spotvideo/audio-blob-name";
-pub const OUTPUT_VIDEO_URI_ANNOTATION: &str = "spotvideo/output-video-uri";
-pub const CALCULATE_VMAF_ANNOTATION: &str = "spotvideo/calculate-vmaf";
-pub const RESULT_REPORTED_ANNOTATION: &str = "spotvideo/result-reported";
+pub const ARCHITECTURE_ANNOTATION: &str = "video/architecture";
+pub const JOB_ID_ANNOTATION: &str = "video/job-id";
+pub const STAGE_ID_ANNOTATION: &str = "video/stage-id";
+pub const USE_SPOT_ANNOTATION: &str = "video/use-spot";
+pub const SEGMENT_COUNT_ANNOTATION: &str = "video/segment-count";
+pub const AUDIO_BLOB_NAME_ANNOTATION: &str = "video/audio-blob-name";
+pub const OUTPUT_VIDEO_URI_ANNOTATION: &str = "video/output-video-uri";
+pub const CALCULATE_VMAF_ANNOTATION: &str = "video/calculate-vmaf";
+pub const MEDIA_RUNTIME_ANNOTATION: &str = "video/media-runtime";
+pub const RESULT_REPORTED_ANNOTATION: &str = "video/result-reported";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -31,6 +32,8 @@ pub struct VideoSubmitted {
     pub use_spot: bool,
     #[serde(default)]
     pub calculate_vmaf: bool,
+    pub media_runtime: Option<String>,
+    pub architecture: Option<String>,
     pub parallelization_strategy: Option<String>,
 }
 
@@ -96,6 +99,17 @@ pub struct SegmentVmaf {
 pub struct VideoVmaf {
     pub score: f64,
     pub segments: Vec<SegmentVmaf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoProcessingResult {
+    pub job_id: String,
+    pub succeeded: bool,
+    pub terminal_stage: String,
+    pub failed_indexes: Option<String>,
+    pub failure_reason: Option<String>,
+    pub completed_at: String,
 }
 
 pub fn job_name(prefix: &str, job_id: &str) -> String {

@@ -252,9 +252,7 @@ pub fn encode_segment_with_vmaf(
     log_path: &Path,
     segment: &VideoSegment,
     codec: &str,
-    preset: &str,
-    crf: u32,
-    max_bitrate_kbps: u32,
+    profile: &EncodingProfile,
 ) -> Result<f64> {
     ensure_parent(output)?;
     let filter = format!(
@@ -270,14 +268,22 @@ pub fn encode_segment_with_vmaf(
         .args(["-t", &segment.duration_seconds.to_string()])
         .arg("-i")
         .arg(source)
-        .args(["-map", "0:v:0", "-an", "-c:v", codec, "-preset", preset])
-        .args(["-crf", &crf.to_string()]);
-    if max_bitrate_kbps > 0 {
+        .args([
+            "-map",
+            "0:v:0",
+            "-an",
+            "-c:v",
+            codec,
+            "-preset",
+            &profile.preset,
+        ])
+        .args(["-crf", &profile.crf.to_string()]);
+    if profile.max_video_bitrate_kbps > 0 {
         command.args([
             "-maxrate",
-            &format!("{max_bitrate_kbps}k"),
+            &format!("{}k", profile.max_video_bitrate_kbps),
             "-bufsize",
-            &format!("{}k", max_bitrate_kbps * 2),
+            &format!("{}k", profile.max_video_bitrate_kbps * 2),
         ]);
     }
     let status = command

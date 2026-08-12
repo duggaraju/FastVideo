@@ -40,8 +40,7 @@ pub fn keyframe_segments(duration: f64, target: u32, mut keyframes: Vec<f64>) ->
         let next = keyframes
             .iter()
             .copied()
-            .filter(|value| *value > start + 0.0001 && *value <= wanted + 0.0001)
-            .next_back()
+            .rfind(|value| *value > start + 0.0001 && *value <= wanted + 0.0001)
             .or_else(|| {
                 keyframes
                     .iter()

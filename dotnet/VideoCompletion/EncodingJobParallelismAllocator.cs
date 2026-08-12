@@ -1,4 +1,4 @@
-namespace SpotVideo.Completion;
+namespace Video.Completion;
 
 internal sealed record EncodingJobDemand(string Name, int RemainingSegments);
 

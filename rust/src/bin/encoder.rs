@@ -1,14 +1,14 @@
 use anyhow::{bail, Context, Result};
-use spotvideo::{
+use std::{fs, path::PathBuf};
+use uuid::Uuid;
+use video::{
     config,
     contracts::{SegmentVmaf, VideoManifest},
     media, paths,
 };
-use std::{fs, path::PathBuf};
-use uuid::Uuid;
 
 fn main() -> Result<()> {
-    spotvideo::init_tracing();
+    video::init_tracing();
     let job_id = config::required("JOB_ID")?;
     let index: usize = config::parse("JOB_COMPLETION_INDEX")?;
     let source_uri = url::Url::parse(&config::required("SOURCE_VIDEO_URI")?)?;
@@ -56,9 +56,11 @@ fn main() -> Result<()> {
     let raw_vmaf_path = staging_dir.join(format!("{staging_id}.libvmaf.json"));
     let result = (|| -> Result<()> {
         let codec = config::required("VIDEO_CODEC")?;
-        let preset = config::required("PRESET")?;
-        let crf = config::parse("CRF")?;
-        let max_bitrate_kbps = config::parse("MAX_VIDEO_BITRATE_KBPS")?;
+        let profile = media::EncodingProfile {
+            preset: config::required("PRESET")?,
+            crf: config::parse("CRF")?,
+            max_video_bitrate_kbps: config::parse("MAX_VIDEO_BITRATE_KBPS")?,
+        };
         if calculate_vmaf {
             let score = media::encode_segment_with_vmaf(
                 &input_path,
@@ -66,9 +68,7 @@ fn main() -> Result<()> {
                 &raw_vmaf_path,
                 segment,
                 &codec,
-                &preset,
-                crf,
-                max_bitrate_kbps,
+                &profile,
             )?;
             fs::write(
                 &staging_vmaf_path,
@@ -81,9 +81,9 @@ fn main() -> Result<()> {
                 &staging_path,
                 segment,
                 &codec,
-                &preset,
-                crf,
-                max_bitrate_kbps,
+                &profile.preset,
+                profile.crf,
+                profile.max_video_bitrate_kbps,
             )?;
         }
         publish(&staging_path, &output_path)

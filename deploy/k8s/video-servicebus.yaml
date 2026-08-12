@@ -1,0 +1,114 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: video-analysis-servicebus
+  namespace: __KUBERNETES_NAMESPACE__
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: video-analysis-servicebus
+  template:
+    metadata:
+      labels:
+        app: video-analysis-servicebus
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: video-worker
+      nodeSelector:
+        kubernetes.io/os: linux
+        kubernetes.azure.com/mode: system
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: analysis
+          image: "__ACR_LOGIN_SERVER__/video-analysis-servicebus:__IMAGE_TAG__"
+          imagePullPolicy: Always
+          envFrom:
+            - configMapRef:
+                name: video-config
+          volumeMounts:
+            - name: input-storage
+              mountPath: /mnt/input
+              readOnly: true
+            - name: output-storage
+              mountPath: /mnt/output
+          resources:
+            requests: { cpu: "250m", memory: "512Mi" }
+            limits: { cpu: "1", memory: "2Gi" }
+      volumes:
+        - name: input-storage
+          csi:
+            driver: blob.csi.azure.com
+            readOnly: true
+            volumeAttributes:
+              protocol: fuse2
+              storageAccount: "__INPUT_STORAGE_ACCOUNT__"
+              containerName: "__INPUT_STORAGE_CONTAINER__"
+              ClientID: "__WORKLOAD_CLIENT_ID__"
+              mountWithWorkloadIdentityToken: "true"
+              mountOptions: "--allow-other --use-attr-cache=true --file-cache-timeout-in-seconds=300 --cancel-list-on-mount-seconds=10"
+        - name: output-storage
+          csi:
+            driver: blob.csi.azure.com
+            readOnly: false
+            volumeAttributes:
+              protocol: fuse2
+              storageAccount: "__OUTPUT_STORAGE_ACCOUNT__"
+              containerName: "__OUTPUT_STORAGE_CONTAINER__"
+              ClientID: "__WORKLOAD_CLIENT_ID__"
+              mountWithWorkloadIdentityToken: "true"
+              mountOptions: "--allow-other --use-attr-cache=true --file-cache-timeout-in-seconds=30 --disable-writeback-cache=true"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: video-completion-servicebus
+  namespace: __KUBERNETES_NAMESPACE__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: video-completion-servicebus
+  template:
+    metadata:
+      labels:
+        app: video-completion-servicebus
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: video-worker
+      nodeSelector:
+        kubernetes.io/os: linux
+        kubernetes.azure.com/mode: system
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: completion
+          image: "__ACR_LOGIN_SERVER__/video-completion-servicebus:__IMAGE_TAG__"
+          imagePullPolicy: Always
+          envFrom:
+            - configMapRef:
+                name: video-config
+          resources:
+            requests: { cpu: "50m", memory: "128Mi" }
+            limits: { cpu: "250m", memory: "512Mi" }
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: video-analysis-servicebus
+  namespace: __KUBERNETES_NAMESPACE__
+spec:
+  scaleTargetRef:
+    name: video-analysis-servicebus
+  pollingInterval: 10
+  cooldownPeriod: 60
+  minReplicaCount: 0
+  maxReplicaCount: 10
+  triggers:
+    - type: azure-servicebus
+      metadata:
+        namespace: "__SERVICE_BUS_NAMESPACE_SHORT__"
+        queueName: video-submitted
+        messageCount: "1"
+        activationMessageCount: "0"
+      authenticationRef:
+        name: video-workload-identity

@@ -1,4 +1,4 @@
-namespace SpotVideo.Analysis;
+namespace Video.Analysis;
 
 public interface IParallelizationStrategyFactory
 {

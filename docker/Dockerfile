@@ -1,13 +1,11 @@
 ARG FFMPEG_BUILD=btbn
 
-FROM ubuntu:26.04 AS ffmpeg-btbn
+FROM mcr.microsoft.com/azurelinux/base/core:3.0 AS ffmpeg-btbn
 ARG TARGETARCH
 ARG FFMPEG_ARCHIVE
 ARG VMAF_VERSION=3.0.0
-RUN apt-get update \
-    && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
-        ca-certificates curl xz-utils \
-    && rm -rf /var/lib/apt/lists/*
+RUN tdnf install --assumeyes ca-certificates curl tar xz \
+    && tdnf clean all
 WORKDIR /build
 RUN if [ -z "${FFMPEG_ARCHIVE}" ]; then \
         case "${TARGETARCH}" in \

@@ -2,7 +2,7 @@ using Azure.Core;
 using Azure.Identity;
 using Azure.Messaging.ServiceBus;
 using k8s;
-using SpotVideo.Completion;
+using Video.Completion;
 
 var builder = Host.CreateApplicationBuilder(args);
 TokenCredential credential = new DefaultAzureCredential();

@@ -1,13 +1,11 @@
 ARG FFMPEG_BUILD=custom
 
-FROM ubuntu:26.04 AS ffmpeg-btbn
+FROM mcr.microsoft.com/azurelinux/base/core:3.0 AS ffmpeg-btbn
 ARG TARGETARCH
 ARG FFMPEG_ARCHIVE
 ARG VMAF_VERSION=3.0.0
-RUN apt-get update \
-    && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
-        ca-certificates curl xz-utils \
-    && rm -rf /var/lib/apt/lists/*
+RUN tdnf install --assumeyes ca-certificates curl tar xz \
+    && tdnf clean all
 WORKDIR /build
 RUN if [ -z "${FFMPEG_ARCHIVE}" ]; then \
         case "${TARGETARCH}" in \
@@ -128,6 +126,7 @@ FROM ffmpeg-${FFMPEG_BUILD} AS ffmpeg
 
 FROM rust:1.97.0-bookworm AS build
 ARG BINARY
+ARG CARGO_FEATURES=
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends clang pkg-config \
     && rm -rf /var/lib/apt/lists/*
@@ -138,14 +137,16 @@ WORKDIR /source
 COPY rust/Cargo.toml rust/Cargo.lock ./
 RUN mkdir -p src/bin \
     && printf '' > src/lib.rs \
+    && printf 'fn main() {}\n' > src/bin/analyzer.rs \
+    && printf 'fn main() {}\n' > src/bin/completion.rs \
     && printf 'fn main() {}\n' > src/bin/encoder.rs \
     && printf 'fn main() {}\n' > src/bin/stitcher.rs \
-    && cargo check --locked --lib --bins \
+    && cargo check --locked --lib --bin "${BINARY}" ${CARGO_FEATURES} \
     && rm -rf src
 COPY rust/src ./src
 RUN test -n "${BINARY}" \
     && cargo test --locked --lib \
-    && cargo build --locked --release --bin "${BINARY}" \
+    && cargo build --locked --release --bin "${BINARY}" ${CARGO_FEATURES} \
     && strip "target/release/${BINARY}" \
     && cp "target/release/${BINARY}" /app
 
@@ -157,10 +158,10 @@ RUN tdnf install --assumeyes ca-certificates shadow-utils \
 COPY --from=ffmpeg /opt/ffmpeg/bin/ffmpeg /opt/ffmpeg/bin/ffprobe /opt/ffmpeg/bin/
 COPY --from=ffmpeg /opt/ffmpeg/lib /opt/ffmpeg/lib
 COPY --from=ffmpeg /opt/ffmpeg/share/vmaf/vmaf_v0.6.1.json /opt/ffmpeg/share/vmaf/vmaf_v0.6.1.json
-COPY --from=build /app /app/spotvideo
+COPY --from=build /app /app/video
 ENV PATH="/opt/ffmpeg/bin:${PATH}" \
     LD_LIBRARY_PATH="/opt/ffmpeg/lib" \
-    RUST_LOG=spotvideo=info
+    RUST_LOG=video=info
 WORKDIR /app
 USER app
-ENTRYPOINT ["/app/spotvideo"]
+ENTRYPOINT ["/app/video"]

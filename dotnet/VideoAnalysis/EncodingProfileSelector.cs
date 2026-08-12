@@ -1,6 +1,6 @@
 using FFMpegCore;
 
-namespace SpotVideo.Analysis;
+namespace Video.Analysis;
 
 public sealed record EncodingProfile(string Preset, int Crf, int MaxVideoBitrateKbps);
 
