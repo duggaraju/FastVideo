@@ -2,23 +2,30 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
 
-pub const ARCHITECTURE_ANNOTATION: &str = "video/architecture";
 pub const JOB_ID_ANNOTATION: &str = "video/job-id";
-pub const STAGE_ID_ANNOTATION: &str = "video/stage-id";
-pub const USE_SPOT_ANNOTATION: &str = "video/use-spot";
-pub const SEGMENT_COUNT_ANNOTATION: &str = "video/segment-count";
 pub const AUDIO_BLOB_NAME_ANNOTATION: &str = "video/audio-blob-name";
-pub const OUTPUT_VIDEO_URI_ANNOTATION: &str = "video/output-video-uri";
+pub const AUDIO_ENCODING_REQUIRED_ANNOTATION: &str = "video/audio-encoding-required";
+pub const OUTPUT_PATH_ANNOTATION: &str = "video/output-path";
+pub const OUTPUT_TYPE_ANNOTATION: &str = "video/output-type";
 pub const CALCULATE_VMAF_ANNOTATION: &str = "video/calculate-vmaf";
 pub const MEDIA_RUNTIME_ANNOTATION: &str = "video/media-runtime";
 pub const RESULT_REPORTED_ANNOTATION: &str = "video/result-reported";
+
+pub fn normalize_output_type(value: &str) -> Result<&'static str, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "" | "mp4" => Ok("mp4"),
+        "cmaf" => Ok("cmaf"),
+        "both" => Ok("both"),
+        _ => Err("outputType must be mp4, cmaf, or both".to_owned()),
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VideoSubmitted {
     pub job_id: String,
     pub input_video_uri: Url,
-    pub output_video_uri: Url,
+    pub output_path: Url,
     #[serde(default = "default_segment_duration")]
     pub segment_duration_seconds: u32,
     #[serde(default = "default_video_codec")]
@@ -35,6 +42,8 @@ pub struct VideoSubmitted {
     pub media_runtime: Option<String>,
     pub architecture: Option<String>,
     pub parallelization_strategy: Option<String>,
+    #[serde(default = "default_output_type")]
+    pub output_type: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,8 +53,8 @@ pub struct VideoManifest {
     pub job_id: String,
     #[serde(alias = "InputVideoUri")]
     pub input_video_uri: Url,
-    #[serde(alias = "OutputVideoUri")]
-    pub output_video_uri: Url,
+    #[serde(alias = "OutputPath")]
+    pub output_path: Url,
     #[serde(alias = "WorkingContainer")]
     pub working_container: String,
     #[serde(alias = "AudioBlobName")]
@@ -72,6 +81,8 @@ pub struct VideoManifest {
     pub use_spot: bool,
     #[serde(alias = "CalculateVmaf")]
     pub calculate_vmaf: bool,
+    #[serde(alias = "OutputType", default = "default_output_type")]
+    pub output_type: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,6 +160,9 @@ fn default_video_codec() -> String {
 fn default_audio_codec() -> String {
     "copy".into()
 }
+fn default_output_type() -> String {
+    "mp4".into()
+}
 fn default_true() -> bool {
     true
 }
@@ -163,7 +177,7 @@ mod tests {
             r#"{
                 "JobId":"job-1",
                 "InputVideoUri":"https://input.blob.core.windows.net/videos/input.mp4",
-                "OutputVideoUri":"https://output.blob.core.windows.net/videos/output.mp4",
+                "OutputPath":"https://output.blob.core.windows.net/videos/output",
                 "WorkingContainer":"videos",
                 "AudioBlobName":"job-1/audio.m4a",
                 "Duration":"00:01:00",

@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<meta name="color-scheme" content="dark">
+	<title>Spotvideo Player</title>
+	<script type="module" src="https://cdn.jsdelivr.net/npm/media-chrome@4/+esm"></script>
+	<script type="module" src="https://cdn.jsdelivr.net/npm/shaka-video-element@0.6/+esm"></script>
+	<style>
+		@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Manrope:wght@500;600;700&display=swap");
+
+		:root {
+			color: #f5f3ee;
+			background: #11130f;
+			font-family: "Manrope", sans-serif;
+			font-synthesis: none;
+			--surface: #1a1d17;
+			--surface-raised: #24281f;
+			--line: #3a4032;
+			--muted: #a9af9f;
+			--accent: #d9ff66;
+			--danger: #ff826e;
+		}
+
+		* {
+			box-sizing: border-box;
+		}
+
+		body {
+			min-height: 100vh;
+			margin: 0;
+			background:
+				linear-gradient(rgba(217, 255, 102, 0.04) 1px, transparent 1px),
+				linear-gradient(90deg, rgba(217, 255, 102, 0.04) 1px, transparent 1px),
+				#11130f;
+			background-size: 32px 32px;
+		}
+
+		main {
+			width: min(1180px, calc(100% - 32px));
+			margin: 0 auto;
+			padding: 30px 0 48px;
+		}
+
+		header {
+			display: flex;
+			align-items: baseline;
+			justify-content: space-between;
+			gap: 24px;
+			margin-bottom: 18px;
+		}
+
+		h1 {
+			margin: 0;
+			font-size: clamp(1.4rem, 4vw, 2.35rem);
+			line-height: 1;
+			letter-spacing: 0;
+		}
+
+		.eyebrow,
+		#status {
+			color: var(--muted);
+			font-family: "IBM Plex Mono", monospace;
+			font-size: 0.76rem;
+			letter-spacing: 0;
+			text-transform: uppercase;
+		}
+
+		.source-bar {
+			display: grid;
+			grid-template-columns: minmax(0, 1fr) auto;
+			gap: 10px;
+			margin-bottom: 14px;
+		}
+
+		input[type="url"],
+		input[type="text"] {
+			min-width: 0;
+			min-height: 42px;
+			border: 1px solid var(--line);
+			border-radius: 0;
+			outline: none;
+			padding: 0 14px;
+			color: #fff;
+			background: var(--surface);
+			font-family: "IBM Plex Mono", monospace;
+			font-size: 0.82rem;
+		}
+
+		input[type="url"]:focus,
+		input[type="text"]:focus {
+			border-color: var(--accent);
+			box-shadow: 0 0 0 1px var(--accent);
+		}
+
+		#sas-query {
+			grid-column: 1 / -1;
+			min-height: 42px;
+		}
+
+		button {
+			min-width: 104px;
+			min-height: 42px;
+			border: 1px solid var(--accent);
+			border-radius: 0;
+			padding: 0 20px;
+			color: #11130f;
+			background: var(--accent);
+			cursor: pointer;
+			font: 700 0.78rem "Manrope", sans-serif;
+			text-transform: uppercase;
+		}
+
+		button:hover {
+			background: #e6ff99;
+		}
+
+		.stage {
+			position: relative;
+			overflow: hidden;
+			border: 1px solid var(--line);
+			background: #050604;
+			box-shadow: 0 24px 70px rgba(0, 0, 0, 0.38);
+		}
+
+		media-controller {
+			width: 100%;
+			aspect-ratio: 16 / 9;
+			--media-control-background: rgba(14, 16, 12, 0.86);
+			--media-control-hover-background: rgba(50, 56, 42, 0.94);
+			--media-control-icon-color: #f5f3ee;
+			--media-range-track-background: #555c4c;
+			--media-range-bar-color: var(--accent);
+		}
+
+		shaka-video {
+			width: 100%;
+			height: 100%;
+			background: #050604;
+			object-fit: contain;
+		}
+
+		media-control-bar {
+			width: 100%;
+		}
+
+		media-time-range {
+			flex: 1;
+		}
+
+		.readout {
+			display: flex;
+			justify-content: space-between;
+			gap: 18px;
+			padding-top: 12px;
+		}
+
+		#status[data-state="error"] {
+			color: var(--danger);
+		}
+
+		#source-kind {
+			color: var(--accent);
+		}
+
+		@media (max-width: 680px) {
+			main {
+				width: min(100% - 20px, 1180px);
+				padding-top: 20px;
+			}
+
+			header {
+				align-items: flex-start;
+				flex-direction: column;
+				gap: 8px;
+			}
+
+			.source-bar {
+				grid-template-columns: 1fr auto;
+			}
+
+			input[type="url"],
+			input[type="text"] {
+				grid-column: 1 / -1;
+				min-height: 46px;
+			}
+
+			input[type="url"] {
+				grid-row: 1;
+			}
+
+			#sas-query {
+				grid-row: 2;
+			}
+
+			button {
+				grid-column: 1 / -1;
+				grid-row: 3;
+				min-height: 44px;
+			}
+
+			media-volume-range,
+			media-playback-rate-button {
+				display: none;
+			}
+		}
+	</style>
+</head>
+<body>
+	<main>
+		<header>
+			<h1>Spotvideo Player</h1>
+			<span class="eyebrow">Media playback monitor</span>
+		</header>
+
+		<form class="source-bar" id="source-form">
+			<input id="source-url" type="url" required spellcheck="false" autocomplete="url" aria-label="Media URL" placeholder="https://account.blob.core.windows.net/videos/video.mpd">
+			<button type="submit">Load</button>
+			<input id="sas-query" type="text" spellcheck="false" autocomplete="off" aria-label="Optional SAS query string" placeholder="Optional SAS query string: sv=...&amp;se=...&amp;sig=...">
+		</form>
+
+		<section class="stage">
+			<media-controller defaultsubtitles="">
+				<shaka-video id="video" slot="media" playsinline crossorigin="anonymous"></shaka-video>
+				<media-loading-indicator slot="centered-chrome" noautohide></media-loading-indicator>
+				<media-control-bar>
+					<media-play-button></media-play-button>
+					<media-mute-button></media-mute-button>
+					<media-volume-range></media-volume-range>
+					<media-current-time-display></media-current-time-display>
+					<media-time-range></media-time-range>
+					<media-duration-display></media-duration-display>
+					<media-playback-rate-button></media-playback-rate-button>
+					<media-fullscreen-button></media-fullscreen-button>
+				</media-control-bar>
+			</media-controller>
+		</section>
+
+		<div class="readout">
+			<span id="status" role="status" aria-live="polite">Waiting for media</span>
+			<span class="eyebrow" id="source-kind">AUTO</span>
+		</div>
+	</main>
+
+	<script type="module">
+		const form = document.querySelector("#source-form");
+		const sourceUrl = document.querySelector("#source-url");
+		const sasQuery = document.querySelector("#sas-query");
+		const video = document.querySelector("#video");
+		const status = document.querySelector("#status");
+		const sourceKind = document.querySelector("#source-kind");
+
+		const setStatus = (message, state = "idle") => {
+			status.textContent = message;
+			status.dataset.state = state;
+		};
+
+		const detectSourceType = (url) => {
+			const path = new URL(url).pathname.toLowerCase();
+			if (path.endsWith(".mp4")) return "mp4";
+			if (path.endsWith(".mpd")) return "dash";
+			if (path.endsWith(".m3u8")) return "hls";
+			return null;
+		};
+
+		const normalizedSasQuery = () => sasQuery.value.trim().replace(/^[?&]+/, "");
+
+		const addSasQuery = (uri, query) => {
+			const url = new URL(uri, sourceUrl.value.trim());
+			for (const [name, value] of new URLSearchParams(query)) {
+				url.searchParams.set(name, value);
+			}
+			return url.href;
+		};
+
+		await customElements.whenDefined("shaka-video");
+		video.api.getNetworkingEngine().registerRequestFilter((_type, request) => {
+			const query = normalizedSasQuery();
+			if (query) {
+				request.uris = request.uris.map((uri) => addSasQuery(uri, query));
+			}
+		});
+
+		form.addEventListener("submit", (event) => {
+			event.preventDefault();
+			const url = sourceUrl.value.trim();
+			const type = detectSourceType(url);
+			if (!type) {
+				setStatus("Use an MP4, MPD, or M3U8 URL", "error");
+				return;
+			}
+
+			const query = normalizedSasQuery();
+			sourceKind.textContent = type.toUpperCase();
+			setStatus(type === "mp4" ? "Loading MP4 file" : `Loading ${type.toUpperCase()} manifest`);
+			video.src = type === "mp4" && query ? addSasQuery(url, query) : url;
+			history.replaceState(null, "", `?src=${encodeURIComponent(url)}`);
+		});
+
+		video.addEventListener("loadedmetadata", () => setStatus("Manifest ready"));
+		video.addEventListener("playing", () => setStatus("Playing"));
+		video.addEventListener("waiting", () => setStatus("Buffering"));
+		video.addEventListener("pause", () => setStatus("Paused"));
+		video.addEventListener("error", (event) => {
+			const detail = event.detail?.message || video.error?.message || "Playback failed";
+			setStatus(detail, "error");
+		});
+
+		const params = new URLSearchParams(location.search);
+		const initialSource = params.get("src");
+		if (initialSource) {
+			sourceUrl.value = initialSource;
+			form.requestSubmit();
+		}
+	</script>
+</body>
+</html>

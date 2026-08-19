@@ -71,11 +71,27 @@ public sealed class EncodeJobWatcher(
             targetNamespace,
             labelSelector: "app.kubernetes.io/name=video-encoder",
             cancellationToken: cancellationToken);
+        var audioJobs = await kubernetes.BatchV1.ListNamespacedJobAsync(
+            targetNamespace,
+            labelSelector: "app.kubernetes.io/name=video-audio-encoder",
+            cancellationToken: cancellationToken);
 
         await RebalanceEncodingJobsAsync(encodeJobs.Items, targetNamespace, cancellationToken);
 
         foreach (var job in encodeJobs.Items.Where(job => HasCondition(job, "Complete")))
         {
+            var annotations = job.Metadata.Annotations;
+            var audioEncodingRequired = annotations is not null &&
+                bool.Parse(OptionalAnnotation(annotations, JobNames.AudioEncodingRequiredAnnotation, "false"));
+            if (audioEncodingRequired)
+            {
+                var jobId = RequiredAnnotation(annotations!, JobNames.JobIdAnnotation);
+                var audioJob = audioJobs.Items.SingleOrDefault(candidate =>
+                    candidate.Metadata.Annotations?.TryGetValue(JobNames.JobIdAnnotation, out var audioJobId) == true &&
+                    audioJobId == jobId);
+                if (audioJob is null || !HasCondition(audioJob, "Complete"))
+                    continue;
+            }
             try
             {
                 await SubmitStitchJobAsync(job, targetNamespace, cancellationToken);
@@ -93,6 +109,13 @@ public sealed class EncodeJobWatcher(
                 logger.LogWarning("Cannot report failed encode job {JobName}: job ID annotation is missing", job.Metadata.Name);
                 continue;
             }
+            if (audioJobs.Items.Any(audioJob =>
+                HasCondition(audioJob, "Failed") &&
+                audioJob.Metadata.Annotations?.TryGetValue(JobNames.JobIdAnnotation, out var audioJobId) == true &&
+                audioJobId == jobId))
+            {
+                continue;
+            }
             var failedCondition = job.Status?.Conditions?.LastOrDefault(condition => condition.Type == "Failed" && condition.Status == "True");
             await ReportResultAsync(
                 sender,
@@ -102,6 +125,27 @@ public sealed class EncodeJobWatcher(
                 succeeded: false,
                 terminalStage: "encode",
                 job.Status?.FailedIndexes,
+                failedCondition?.Message ?? failedCondition?.Reason,
+                cancellationToken);
+        }
+
+        foreach (var audioJob in audioJobs.Items.Where(job => HasCondition(job, "Failed")))
+        {
+            if (audioJob.Metadata.Annotations is null ||
+                !audioJob.Metadata.Annotations.TryGetValue(JobNames.JobIdAnnotation, out var jobId))
+            {
+                logger.LogWarning("Cannot report failed audio encode job {JobName}: job ID annotation is missing", audioJob.Metadata.Name);
+                continue;
+            }
+            var failedCondition = audioJob.Status?.Conditions?.LastOrDefault(condition => condition.Type == "Failed" && condition.Status == "True");
+            await ReportResultAsync(
+                sender,
+                audioJob,
+                targetNamespace,
+                jobId,
+                succeeded: false,
+                terminalStage: "audio-encode",
+                failedIndexes: null,
                 failedCondition?.Message ?? failedCondition?.Reason,
                 cancellationToken);
         }
@@ -133,7 +177,7 @@ public sealed class EncodeJobWatcher(
                 cancellationToken);
 
             if (succeeded)
-                await DeleteEncodeJobAsync(jobId, targetNamespace, cancellationToken);
+                await DeleteProducerJobsAsync(jobId, targetNamespace, cancellationToken);
         }
     }
 
@@ -185,16 +229,17 @@ public sealed class EncodeJobWatcher(
             ?? throw new InvalidOperationException($"Encode job {encodeJob.Metadata.Name} has no annotations");
         var jobId = RequiredAnnotation(annotations, JobNames.JobIdAnnotation);
         var stitchJobName = JobNames.For("stitch", jobId);
-        var useSpot = annotations.TryGetValue(JobNames.UseSpotAnnotation, out var useSpotValue)
-            ? bool.Parse(useSpotValue)
-            : encodeJob.Spec?.Template?.Spec?.NodeSelector?.TryGetValue(
-                "kubernetes.azure.com/scalesetpriority",
-                out var scaleSetPriority) == true && scaleSetPriority == "spot";
+        var encodeNodeSelector = encodeJob.Spec?.Template?.Spec?.NodeSelector;
+        var useSpot = encodeNodeSelector?.TryGetValue(
+            "kubernetes.azure.com/scalesetpriority",
+            out var scaleSetPriority) == true && scaleSetPriority == "spot";
         var mediaRuntime = OptionalAnnotation(
             annotations,
             JobNames.MediaRuntimeAnnotation,
             configuration["Encoding:MediaRuntimeDefault"] ?? "dotnet");
-        var architecture = OptionalAnnotation(annotations, JobNames.ArchitectureAnnotation, string.Empty);
+        var architecture = encodeNodeSelector?.TryGetValue("kubernetes.io/arch", out var architectureValue) == true
+            ? architectureValue
+            : string.Empty;
         try
         {
             await kubernetes.BatchV1.ReadNamespacedJobAsync(stitchJobName, targetNamespace, cancellationToken: cancellationToken);
@@ -235,9 +280,11 @@ public sealed class EncodeJobWatcher(
                         Env =
                         [
                             Env("JOB_ID", jobId),
-                            Env("SEGMENT_COUNT", RequiredAnnotation(annotations, JobNames.SegmentCountAnnotation)),
+                            Env("SEGMENT_COUNT", (encodeJob.Spec?.Completions
+                                ?? throw new InvalidOperationException($"Encode job {encodeJob.Metadata.Name} has no completion count")).ToString()),
                             Env("AUDIO_BLOB_NAME", RequiredAnnotation(annotations, JobNames.AudioBlobNameAnnotation)),
-                            Env("OUTPUT_VIDEO_URI", RequiredAnnotation(annotations, JobNames.OutputVideoUriAnnotation)),
+                            Env("OUTPUT_PATH", RequiredAnnotation(annotations, JobNames.OutputPathAnnotation)),
+                            Env("OUTPUT_TYPE", OptionalAnnotation(annotations, JobNames.OutputTypeAnnotation, VideoOutputTypes.Mp4)),
                             Env("CALCULATE_VMAF", OptionalAnnotation(annotations, JobNames.CalculateVmafAnnotation, "false")),
                             Env("OUTPUT_STORAGE_ACCOUNT_NAME", RequiredConfig("Storage:OutputAccountName")),
                             Env("OUTPUT_STORAGE_CONTAINER", RequiredConfig("Storage:OutputContainer")),
@@ -276,16 +323,11 @@ public sealed class EncodeJobWatcher(
                 Labels = labels,
                 Annotations = new Dictionary<string, string>
                 {
-                    [JobNames.JobIdAnnotation] = jobId,
-                    [JobNames.StageIdAnnotation] = stitchJobName,
-                    [JobNames.UseSpotAnnotation] = useSpot.ToString(),
-                    [JobNames.MediaRuntimeAnnotation] = mediaRuntime
+                    [JobNames.JobIdAnnotation] = jobId
                 }
             },
             Spec = new V1JobSpec { Template = pod, BackoffLimit = 6, TtlSecondsAfterFinished = 3600 }
         };
-        if (!string.IsNullOrEmpty(architecture))
-            stitchJob.Metadata.Annotations[JobNames.ArchitectureAnnotation] = architecture;
         await kubernetes.BatchV1.CreateNamespacedJobAsync(stitchJob, targetNamespace, cancellationToken: cancellationToken);
         logger.LogInformation("Submitted stitch job for {JobId}", jobId);
     }
@@ -340,20 +382,22 @@ public sealed class EncodeJobWatcher(
             terminalStage);
     }
 
-    private async Task DeleteEncodeJobAsync(string jobId, string targetNamespace, CancellationToken cancellationToken)
+    private async Task DeleteProducerJobsAsync(string jobId, string targetNamespace, CancellationToken cancellationToken)
     {
-        var encodeJobName = JobNames.For("encode", jobId);
-        try
+        foreach (var jobName in new[] { JobNames.For("encode", jobId), JobNames.For("audio", jobId) })
         {
-            await kubernetes.BatchV1.DeleteNamespacedJobAsync(
-                encodeJobName,
-                targetNamespace,
-                propagationPolicy: "Background",
-                cancellationToken: cancellationToken);
-            logger.LogInformation("Deleted encode job {EncodeJobName} after stitch completed", encodeJobName);
-        }
-        catch (Exception exception) when (IsNotFound(exception))
-        {
+            try
+            {
+                await kubernetes.BatchV1.DeleteNamespacedJobAsync(
+                    jobName,
+                    targetNamespace,
+                    propagationPolicy: "Background",
+                    cancellationToken: cancellationToken);
+                logger.LogInformation("Deleted producer job {JobName} after stitch completed", jobName);
+            }
+            catch (Exception exception) when (IsNotFound(exception))
+            {
+            }
         }
     }
 

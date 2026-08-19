@@ -12,10 +12,10 @@ use std::sync::Arc;
 use video::{
     config,
     contracts::{
-        job_name, VideoProcessingResult, ARCHITECTURE_ANNOTATION, AUDIO_BLOB_NAME_ANNOTATION,
-        CALCULATE_VMAF_ANNOTATION, JOB_ID_ANNOTATION, MEDIA_RUNTIME_ANNOTATION,
-        OUTPUT_VIDEO_URI_ANNOTATION, RESULT_REPORTED_ANNOTATION, SEGMENT_COUNT_ANNOTATION,
-        STAGE_ID_ANNOTATION, USE_SPOT_ANNOTATION,
+        job_name, VideoProcessingResult, AUDIO_BLOB_NAME_ANNOTATION,
+        AUDIO_ENCODING_REQUIRED_ANNOTATION, CALCULATE_VMAF_ANNOTATION, JOB_ID_ANNOTATION,
+        MEDIA_RUNTIME_ANNOTATION, OUTPUT_PATH_ANNOTATION, OUTPUT_TYPE_ANNOTATION,
+        RESULT_REPORTED_ANNOTATION,
     },
     parallelism,
 };
@@ -87,6 +87,12 @@ async fn reconcile_once(
         .list(&kube::api::ListParams::default().labels("app.kubernetes.io/name=video-encoder"))
         .await
         .context("Failed to list encode jobs")?;
+    let audio_jobs = jobs
+        .list(
+            &kube::api::ListParams::default().labels("app.kubernetes.io/name=video-audio-encoder"),
+        )
+        .await
+        .context("Failed to list audio encode jobs")?;
 
     rebalance_encoding_jobs(cfg.max_parallelism, jobs, &encode_jobs.items).await?;
 
@@ -95,6 +101,20 @@ async fn reconcile_once(
         .iter()
         .filter(|job| has_condition(job, "Complete"))
     {
+        let audio_encoding_required = annotation(job, AUDIO_ENCODING_REQUIRED_ANNOTATION)
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+        if audio_encoding_required {
+            let Some(job_id) = annotation(job, JOB_ID_ANNOTATION) else {
+                continue;
+            };
+            let audio_complete = audio_jobs.items.iter().any(|audio_job| {
+                annotation(audio_job, JOB_ID_ANNOTATION).as_deref() == Some(job_id.as_str())
+                    && has_condition(audio_job, "Complete")
+            });
+            if !audio_complete {
+                continue;
+            }
+        }
         submit_stitch_job(cfg, jobs, job).await?;
     }
 
@@ -107,6 +127,12 @@ async fn reconcile_once(
             tracing::warn!(job = ?job.metadata.name, "Failed encode job missing job-id annotation");
             continue;
         };
+        if audio_jobs.items.iter().any(|audio_job| {
+            annotation(audio_job, JOB_ID_ANNOTATION).as_deref() == Some(job_id.as_str())
+                && has_condition(audio_job, "Failed")
+        }) {
+            continue;
+        }
         let failure_reason = condition_message(job, "Failed");
         report_result(
             jobs,
@@ -121,6 +147,31 @@ async fn reconcile_once(
                     .as_ref()
                     .and_then(|status| status.failed_indexes.clone()),
                 failure_reason,
+                completed_at: chrono_timestamp(),
+            },
+        )
+        .await?;
+    }
+
+    for audio_job in audio_jobs
+        .items
+        .iter()
+        .filter(|job| has_condition(job, "Failed"))
+    {
+        let Some(job_id) = annotation(audio_job, JOB_ID_ANNOTATION) else {
+            tracing::warn!(job = ?audio_job.metadata.name, "Failed audio encode job missing job-id annotation");
+            continue;
+        };
+        report_result(
+            jobs,
+            result_queue,
+            audio_job,
+            VideoProcessingResult {
+                job_id,
+                succeeded: false,
+                terminal_stage: "audio-encode".to_owned(),
+                failed_indexes: None,
+                failure_reason: condition_message(audio_job, "Failed"),
                 completed_at: chrono_timestamp(),
             },
         )
@@ -160,13 +211,14 @@ async fn reconcile_once(
         .await?;
 
         if succeeded {
-            let encode_job_name = job_name("encode", &job_id);
-            if let Err(error) = jobs
-                .delete(&encode_job_name, &DeleteParams::background())
-                .await
-            {
-                if !is_not_found(&error) {
-                    return Err(error).context("Failed to delete completed encode job");
+            for producer_job_name in [job_name("encode", &job_id), job_name("audio", &job_id)] {
+                if let Err(error) = jobs
+                    .delete(&producer_job_name, &DeleteParams::background())
+                    .await
+                {
+                    if !is_not_found(&error) {
+                        return Err(error).context("Failed to delete completed producer job");
+                    }
                 }
             }
         }
@@ -251,26 +303,36 @@ async fn submit_stitch_job(
         Err(error) => return Err(error).context("Failed to check for existing stitch job"),
     }
 
-    let segment_count = annotations
-        .get(SEGMENT_COUNT_ANNOTATION)
-        .cloned()
-        .ok_or_else(|| anyhow!("Missing {SEGMENT_COUNT_ANNOTATION} annotation"))?;
+    let segment_count = encode_job
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.completions)
+        .ok_or_else(|| anyhow!("Encode job has no completion count"))?
+        .to_string();
     let audio_blob_name = annotations
         .get(AUDIO_BLOB_NAME_ANNOTATION)
         .cloned()
         .ok_or_else(|| anyhow!("Missing {AUDIO_BLOB_NAME_ANNOTATION} annotation"))?;
-    let output_video_uri = annotations
-        .get(OUTPUT_VIDEO_URI_ANNOTATION)
+    let output_path = annotations
+        .get(OUTPUT_PATH_ANNOTATION)
         .cloned()
-        .ok_or_else(|| anyhow!("Missing {OUTPUT_VIDEO_URI_ANNOTATION} annotation"))?;
+        .ok_or_else(|| anyhow!("Missing {OUTPUT_PATH_ANNOTATION} annotation"))?;
     let calculate_vmaf = annotations
         .get(CALCULATE_VMAF_ANNOTATION)
         .cloned()
         .unwrap_or_else(|| "false".to_owned());
-    let use_spot = annotations
-        .get(USE_SPOT_ANNOTATION)
-        .map(|value| value == "True" || value == "true")
-        .unwrap_or(true);
+    let output_type = annotations
+        .get(OUTPUT_TYPE_ANNOTATION)
+        .cloned()
+        .unwrap_or_else(|| "mp4".to_owned());
+    let encode_node_selector = encode_job
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.template.spec.as_ref())
+        .and_then(|spec| spec.node_selector.as_ref());
+    let use_spot = encode_node_selector
+        .and_then(|selector| selector.get("kubernetes.azure.com/scalesetpriority"))
+        .is_some_and(|priority| priority == "spot");
     let media_runtime = normalize_media_runtime(
         annotations
             .get(MEDIA_RUNTIME_ANNOTATION)
@@ -283,7 +345,8 @@ async fn submit_stitch_job(
         "kubernetes.azure.com/scalesetpriority": if use_spot { "spot" } else { "regular" },
         "kubernetes.io/os": "linux"
     });
-    if let Some(arch) = annotations.get(ARCHITECTURE_ANNOTATION) {
+    if let Some(arch) = encode_node_selector.and_then(|selector| selector.get("kubernetes.io/arch"))
+    {
         node_selector["kubernetes.io/arch"] = json!(arch);
     }
 
@@ -300,9 +363,6 @@ async fn submit_stitch_job(
             },
             "annotations": {
                 JOB_ID_ANNOTATION: job_id,
-                STAGE_ID_ANNOTATION: stitch_name,
-                USE_SPOT_ANNOTATION: use_spot.to_string(),
-                MEDIA_RUNTIME_ANNOTATION: media_runtime,
             }
         },
         "spec": {
@@ -352,7 +412,8 @@ async fn submit_stitch_job(
                                 { "name": "JOB_ID", "value": job_id },
                                 { "name": "SEGMENT_COUNT", "value": segment_count },
                                 { "name": "AUDIO_BLOB_NAME", "value": audio_blob_name },
-                                { "name": "OUTPUT_VIDEO_URI", "value": output_video_uri },
+                                { "name": "OUTPUT_PATH", "value": output_path },
+                                { "name": "OUTPUT_TYPE", "value": output_type },
                                 { "name": "CALCULATE_VMAF", "value": calculate_vmaf },
                                 { "name": "OUTPUT_STORAGE_ACCOUNT_NAME", "value": cfg.output_storage_account },
                                 { "name": "OUTPUT_STORAGE_CONTAINER", "value": cfg.output_storage_container },

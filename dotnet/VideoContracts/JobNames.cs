@@ -5,13 +5,11 @@ namespace Video.Contracts;
 
 public static class JobNames
 {
-    public const string ArchitectureAnnotation = "video/architecture";
     public const string JobIdAnnotation = "video/job-id";
-    public const string StageIdAnnotation = "video/stage-id";
-    public const string UseSpotAnnotation = "video/use-spot";
-    public const string SegmentCountAnnotation = "video/segment-count";
     public const string AudioBlobNameAnnotation = "video/audio-blob-name";
-    public const string OutputVideoUriAnnotation = "video/output-video-uri";
+    public const string AudioEncodingRequiredAnnotation = "video/audio-encoding-required";
+    public const string OutputPathAnnotation = "video/output-path";
+    public const string OutputTypeAnnotation = "video/output-type";
     public const string CalculateVmafAnnotation = "video/calculate-vmaf";
     public const string MediaRuntimeAnnotation = "video/media-runtime";
     public const string ResultReportedAnnotation = "video/result-reported";

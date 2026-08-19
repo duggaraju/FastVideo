@@ -124,7 +124,7 @@ RUN curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
 
 FROM ffmpeg-${FFMPEG_BUILD} AS ffmpeg
 
-FROM --platform=$BUILDPLATFORM mcr.microsoft.com/dotnet/sdk:10.0-resolute AS build
+FROM mcr.microsoft.com/dotnet/sdk:10.0-azurelinux3.0 AS build
 ARG PROJECT
 ARG TARGETARCH
 WORKDIR /source

@@ -22,7 +22,7 @@ var inputPath = BlobMountPaths.FromUri(
 var outputMountPath = Required("OUTPUT_MOUNT_PATH");
 var manifestPath = BlobMountPaths.FromBlobName($"{jobId}/manifest.json", outputMountPath);
 await using var manifestStream = File.OpenRead(manifestPath);
-var manifest = await JsonSerializer.DeserializeAsync<VideoManifest>(manifestStream)
+var manifest = await JsonSerializer.DeserializeAsync<VideoManifest>(manifestStream, JsonSerializerOptions.Web)
     ?? throw new InvalidOperationException("Manifest payload is empty");
 var segmentCount = manifest.SegmentCount;
 if (index < 0 || index >= segmentCount)

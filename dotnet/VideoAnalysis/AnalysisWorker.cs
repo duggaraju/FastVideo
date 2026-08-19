@@ -62,6 +62,18 @@ public sealed class AnalysisWorker(
             {
                 throw new InvalidOperationException("FFprobe returned an invalid duration");
             }
+            var sourceAudio = media.PrimaryAudioStream
+                ?? throw new InvalidOperationException("Input does not contain an audio stream");
+            var maxAudioDurationSeconds = configuration.GetValue("Encoding:MaxAudioDurationSeconds", 21600);
+            if (maxAudioDurationSeconds < 1)
+            {
+                throw new InvalidOperationException("Encoding:MaxAudioDurationSeconds must be greater than zero");
+            }
+            if (sourceAudio.Duration > TimeSpan.FromSeconds(maxAudioDurationSeconds))
+            {
+                throw new ArgumentException(
+                    $"Audio duration {sourceAudio.Duration.TotalSeconds:F3}s exceeds the configured maximum of {maxAudioDurationSeconds}s");
+            }
             var maxParallelism = configuration.GetValue("Encoding:MaxParallelism", 16);
             if (maxParallelism < 1)
             {
@@ -86,7 +98,10 @@ public sealed class AnalysisWorker(
                 request.Crf,
                 request.MaxVideoBitrateKbps);
 
-            await ExtractAudioAsync(inputPath, audioPath, request.AudioCodec);
+            var audioEncodingRequired = !string.Equals(request.AudioCodec, "copy", StringComparison.OrdinalIgnoreCase);
+            var outputType = VideoOutputTypes.Normalize(request.OutputType);
+            if (!audioEncodingRequired)
+                await ExtractAudioAsync(inputPath, audioPath, request.AudioCodec);
 
             var segments = await parallelizationStrategy.CreateSegmentsAsync(
                 inputPath,
@@ -99,7 +114,7 @@ public sealed class AnalysisWorker(
             var manifest = new VideoManifest(
                 request.JobId,
                 request.InputVideoUri,
-                request.OutputVideoUri,
+                request.OutputPath,
                 workingContainer,
                 audioBlobName,
                 media.Duration,
@@ -113,9 +128,12 @@ public sealed class AnalysisWorker(
                 encodingProfile.MaxVideoBitrateKbps,
                 request.UseSpot,
                 request.CalculateVmaf,
-                mediaRuntime);
+                mediaRuntime,
+                outputType);
             await WriteManifestAsync(manifest, outputMountPath, args.CancellationToken);
             await SubmitEncodingJobAsync(manifest, minParallelismPerJob, outputAccount, outputContainer, inputAccount, inputContainer, outputMountPath, inputMountPath, architecture, args.CancellationToken);
+            if (audioEncodingRequired)
+                await SubmitAudioEncodingJobAsync(manifest, outputAccount, outputContainer, inputAccount, inputContainer, outputMountPath, inputMountPath, architecture, args.CancellationToken);
             await args.CompleteMessageAsync(args.Message, args.CancellationToken);
             logger.LogInformation(
                 "Submitted {SegmentCount} encoding indexes for {JobId} using {ParallelizationStrategy}; segment duration={SegmentDurationSeconds}s, initial parallelism={InitialParallelism}, max parallelism={MaxParallelism}, source={Width}x{Height} {SourceBitrateKbps}kbps, preset={Preset}, crf={Crf}, maxrate={MaxVideoBitrateKbps}kbps",
@@ -266,11 +284,10 @@ public sealed class AnalysisWorker(
                 Annotations = new Dictionary<string, string>
                 {
                     [JobNames.JobIdAnnotation] = manifest.JobId,
-                    [JobNames.StageIdAnnotation] = jobName,
-                    [JobNames.UseSpotAnnotation] = manifest.UseSpot.ToString(),
-                    [JobNames.SegmentCountAnnotation] = manifest.SegmentCount.ToString(),
                     [JobNames.AudioBlobNameAnnotation] = manifest.AudioBlobName,
-                    [JobNames.OutputVideoUriAnnotation] = manifest.OutputVideoUri.ToString(),
+                    [JobNames.AudioEncodingRequiredAnnotation] = (!string.Equals(manifest.AudioCodec, "copy", StringComparison.OrdinalIgnoreCase)).ToString(),
+                    [JobNames.OutputPathAnnotation] = manifest.OutputPath.ToString(),
+                    [JobNames.OutputTypeAnnotation] = manifest.OutputType,
                     [JobNames.CalculateVmafAnnotation] = manifest.CalculateVmaf ? "true" : "false",
                     [JobNames.MediaRuntimeAnnotation] = manifest.MediaRuntime
                 }
@@ -285,8 +302,109 @@ public sealed class AnalysisWorker(
                 TtlSecondsAfterFinished = 86400
             }
         };
+        await kubernetes.BatchV1.CreateNamespacedJobAsync(job, targetNamespace, cancellationToken: cancellationToken);
+    }
+
+    private async Task SubmitAudioEncodingJobAsync(
+        VideoManifest manifest,
+        string outputAccount,
+        string outputContainer,
+        string inputAccount,
+        string inputContainer,
+        string outputMountPath,
+        string inputMountPath,
+        string? architecture,
+        CancellationToken cancellationToken)
+    {
+        var jobName = JobNames.For("audio", manifest.JobId);
+        var targetNamespace = configuration["Kubernetes:Namespace"] ?? "video-servicebus";
+        try
+        {
+            await kubernetes.BatchV1.ReadNamespacedJobAsync(jobName, targetNamespace, cancellationToken: cancellationToken);
+            return;
+        }
+        catch (Exception exception) when (IsNotFound(exception))
+        {
+        }
+
+        var labels = new Dictionary<string, string>
+        {
+            ["app.kubernetes.io/name"] = "video-audio-encoder",
+            ["video/job-id"] = JobNames.LabelValue(manifest.JobId),
+            ["azure.workload.identity/use"] = "true"
+        };
+        var nodeSelector = new Dictionary<string, string>
+        {
+            ["workload"] = "video-encoding",
+            ["kubernetes.azure.com/scalesetpriority"] = manifest.UseSpot ? "spot" : "regular",
+            ["kubernetes.io/os"] = "linux"
+        };
         if (architecture is not null)
-            job.Metadata.Annotations[JobNames.ArchitectureAnnotation] = architecture;
+            nodeSelector["kubernetes.io/arch"] = architecture;
+
+        var inputVolumeName = "input-storage";
+        var outputVolumeName = "output-storage";
+        var pod = new V1PodTemplateSpec
+        {
+            Metadata = new V1ObjectMeta { Labels = labels },
+            Spec = new V1PodSpec
+            {
+                Containers =
+                [
+                    new V1Container
+                    {
+                        Name = "audio-encoder",
+                        Image = RequiredImage(manifest.MediaRuntime, "AudioEncoder"),
+                        Env =
+                        [
+                            Env("JOB_ID", manifest.JobId),
+                            Env("SOURCE_VIDEO_URI", manifest.InputVideoUri.ToString()),
+                            Env("AUDIO_BLOB_NAME", manifest.AudioBlobName),
+                            Env("AUDIO_CODEC", manifest.AudioCodec),
+                            Env("INPUT_STORAGE_ACCOUNT_NAME", inputAccount),
+                            Env("INPUT_STORAGE_CONTAINER", inputContainer),
+                            Env("INPUT_MOUNT_PATH", inputMountPath),
+                            Env("OUTPUT_MOUNT_PATH", outputMountPath)
+                        ],
+                        VolumeMounts =
+                        [
+                            new V1VolumeMount { Name = inputVolumeName, MountPath = inputMountPath, ReadOnlyProperty = true },
+                            new V1VolumeMount { Name = outputVolumeName, MountPath = outputMountPath }
+                        ],
+                        Resources = new V1ResourceRequirements
+                        {
+                            Requests = new Dictionary<string, ResourceQuantity> { ["cpu"] = new("1"), ["memory"] = new("1Gi") },
+                            Limits = new Dictionary<string, ResourceQuantity> { ["cpu"] = new("2"), ["memory"] = new("2Gi") }
+                        }
+                    }
+                ],
+                Volumes =
+                [
+                    BlobFuseVolume(inputVolumeName, inputAccount, inputContainer, RequiredConfig("WorkloadIdentity:ClientId"), readOnly: true),
+                    BlobFuseVolume(outputVolumeName, outputAccount, outputContainer, RequiredConfig("WorkloadIdentity:ClientId"), readOnly: false)
+                ],
+                RestartPolicy = "Never",
+                ServiceAccountName = "video-worker",
+                Tolerations = manifest.UseSpot
+                    ? [new V1Toleration { Effect = "NoSchedule", OperatorProperty = "Equal", Key = "kubernetes.azure.com/scalesetpriority", Value = "spot" }]
+                    : null,
+                NodeSelector = nodeSelector,
+                TerminationGracePeriodSeconds = 120
+            }
+        };
+        var job = new V1Job
+        {
+            Metadata = new V1ObjectMeta
+            {
+                Name = jobName,
+                Labels = labels,
+                Annotations = new Dictionary<string, string>
+                {
+                    [JobNames.JobIdAnnotation] = manifest.JobId
+                }
+            },
+            Spec = new V1JobSpec { Template = pod, BackoffLimit = 6, TtlSecondsAfterFinished = 86400 }
+        };
         await kubernetes.BatchV1.CreateNamespacedJobAsync(job, targetNamespace, cancellationToken: cancellationToken);
     }
 
@@ -367,8 +485,12 @@ public sealed class AnalysisWorker(
             throw new ArgumentException("JobId must contain 1-128 characters");
         if (request.InputVideoUri.Scheme != Uri.UriSchemeHttps)
             throw new ArgumentException("InputVideoUri must use HTTPS");
-        if (request.OutputVideoUri.Scheme != Uri.UriSchemeHttps)
-            throw new ArgumentException("OutputVideoUri must use HTTPS");
+        if (request.OutputPath.Scheme != Uri.UriSchemeHttps)
+            throw new ArgumentException("OutputPath must use HTTPS");
+        if (request.OutputPath.AbsolutePath.EndsWith('/'))
+            throw new ArgumentException("OutputPath must include a base filename");
+        if (Path.HasExtension(request.OutputPath.AbsolutePath))
+            throw new ArgumentException("OutputPath base filename must not include an extension");
         if (request.SegmentDurationSeconds is < 5 or > 3600)
             throw new ArgumentException("SegmentDurationSeconds must be between 5 and 3600");
         if (request.Crf is < 0 or > 63)

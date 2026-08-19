@@ -1,6 +1,7 @@
 <Solution>
   <Folder Name="/dotnet/">
     <Project Path="dotnet/VideoAnalysis/VideoAnalysis.csproj" />
+    <Project Path="dotnet/VideoAudioEncoder/VideoAudioEncoder.csproj" />
     <Project Path="dotnet/VideoCompletion/VideoCompletion.csproj" />
     <Project Path="dotnet/VideoEncoder/VideoEncoder.csproj" />
     <Project Path="dotnet/VideoContracts/VideoContracts.csproj" />

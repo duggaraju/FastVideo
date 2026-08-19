@@ -7,6 +7,8 @@ param(
     [ValidateSet("fixed-duration", "keyframe-boundary")]
     [string] $ParallelizationStrategy = "fixed-duration",
     [string] $AudioCodec = "copy",
+    [ValidateSet("mp4", "cmaf", "both")]
+    [string] $OutputType = "mp4",
     [Nullable[int]] $Crf,
     [Nullable[int]] $MaxVideoBitrateKbps,
     [bool] $UseSpot = $true,
@@ -116,7 +118,7 @@ $jobId = $JobId
 $outputStorageAccount = $deployment.outputStorageName.value
 $outputContainer = $deployment.outputContainerName.value
 $outputBlobName = "$jobId.mp4"
-$outputVideoUri = "https://$outputStorageAccount.blob.core.windows.net/$outputContainer/$outputBlobName"
+$outputBaseUri = "https://$outputStorageAccount.blob.core.windows.net/$outputContainer/$jobId"
 az storage container show `
     --account-name $outputStorageAccount `
     --name $outputContainer `
@@ -128,10 +130,11 @@ Assert-NativeCommandSucceeded "Verifying access to the output container"
 $payload = [ordered]@{
     jobId = $jobId
     inputVideoUri = $InputVideoUri.AbsoluteUri
-    outputVideoUri = $outputVideoUri
+    outputPath = $outputBaseUri
     segmentDurationSeconds = $SegmentDurationSeconds
     parallelizationStrategy = $ParallelizationStrategy
     audioCodec = $AudioCodec
+    outputType = $OutputType
     useSpot = $UseSpot
     calculateVmaf = $CalculateVmaf.IsPresent
     mediaRuntime = $MediaRuntime
@@ -180,28 +183,74 @@ Assert-NativeCommandSucceeded "Submitting the video"
 
 $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
 do {
-    $finalBlobExists = az storage blob exists `
-        --account-name $outputStorageAccount `
-        --container-name $outputContainer `
-        --name $outputBlobName `
-        --auth-mode login `
-        --query exists `
-        --output tsv `
-        --only-show-errors
-    Assert-NativeCommandSucceeded "Checking for the final output blob"
-
-    if ($finalBlobExists -eq "true") {
-        $finalBlob = az storage blob show `
+    $finalBlobExists = if ($OutputType -in @("mp4", "both")) {
+        $mp4Exists = az storage blob exists `
             --account-name $outputStorageAccount `
             --container-name $outputContainer `
             --name $outputBlobName `
             --auth-mode login `
-            --query "{name:name,size:properties.contentLength,lastModified:properties.lastModified}" `
+            --query exists `
+            --output tsv `
+            --only-show-errors
+        Assert-NativeCommandSucceeded "Checking for the final MP4 blob"
+        $mp4Exists -eq "true"
+    } else {
+        $true
+    }
+
+    $cmafBlobs = @()
+    if ($OutputType -in @("cmaf", "both")) {
+        $cmafPrefix = "$jobId-"
+        $cmafBlobs = @(az storage blob list `
+            --account-name $outputStorageAccount `
+            --container-name $outputContainer `
+            --prefix $cmafPrefix `
+            --auth-mode login `
+            --query "[].{name:name,size:properties.contentLength}" `
             --output json `
-            --only-show-errors | ConvertFrom-Json
-        Assert-NativeCommandSucceeded "Reading the final output blob"
-        if ($finalBlob.size -le 0) {
-            throw "The final output blob exists but is empty."
+            --only-show-errors | ConvertFrom-Json)
+        Assert-NativeCommandSucceeded "Checking for the CMAF package blobs"
+        $requiredCmafNames = @(
+            "$jobId-stream0.m3u8",
+            "$jobId-stream1.m3u8",
+            "$jobId-stream0.cmaf",
+            "$jobId-stream1.cmaf"
+        )
+        $manifestBlobs = @(az storage blob list `
+            --account-name $outputStorageAccount `
+            --container-name $outputContainer `
+            --prefix $jobId `
+            --auth-mode login `
+            --query "[?name=='$jobId.mpd' || name=='$jobId.m3u8'].{name:name,size:properties.contentLength}" `
+            --output json `
+            --only-show-errors | ConvertFrom-Json)
+        $cmafBlobs += $manifestBlobs
+        $requiredCmafNames += @("$jobId.mpd", "$jobId.m3u8")
+        $cmafBlobsByName = @{}
+        foreach ($blob in $cmafBlobs) {
+            $cmafBlobsByName[[string]$blob.name] = [long]$blob.size
+        }
+        $cmafComplete = @($requiredCmafNames | Where-Object {
+            -not $cmafBlobsByName.ContainsKey($_) -or $cmafBlobsByName[$_] -le 0
+        }).Count -eq 0
+    } else {
+        $cmafComplete = $true
+    }
+
+    if ($finalBlobExists -and $cmafComplete) {
+        if ($OutputType -in @("mp4", "both")) {
+            $finalBlob = az storage blob show `
+                --account-name $outputStorageAccount `
+                --container-name $outputContainer `
+                --name $outputBlobName `
+                --auth-mode login `
+                --query "{name:name,size:properties.contentLength,lastModified:properties.lastModified}" `
+                --output json `
+                --only-show-errors | ConvertFrom-Json
+            Assert-NativeCommandSucceeded "Reading the final MP4 blob"
+            if ($finalBlob.size -le 0) {
+                throw "The final MP4 blob exists but is empty."
+            }
         }
 
         if ($CalculateVmaf) {
@@ -239,8 +288,16 @@ do {
         }
         Assert-NativeCommandSucceeded "Reading the video-results queue status"
 
-        Write-Host "Workflow completed for $jobId (transport=$MessageTransport, calculateVmaf=$($CalculateVmaf.IsPresent))."
-        Write-Host "Output: $outputVideoUri ($($finalBlob.size) bytes)"
+        Write-Host "Workflow completed for $jobId (transport=$MessageTransport, outputType=$OutputType, calculateVmaf=$($CalculateVmaf.IsPresent))."
+        if ($OutputType -in @("mp4", "both")) {
+            Write-Host "MP4 output: $outputBaseUri.mp4 ($($finalBlob.size) bytes)"
+        }
+        if ($OutputType -in @("cmaf", "both")) {
+            Write-Host "CMAF package:"
+            $cmafBlobs | Sort-Object name | ForEach-Object {
+                Write-Host "  https://$outputStorageAccount.blob.core.windows.net/$outputContainer/$($_.name) ($($_.size) bytes)"
+            }
+        }
         Write-Host "video-results active messages: $resultCount"
         if ($MessageTransport -eq "storagequeue") {
             Write-Host "Peek video-results in Storage Explorer or az storage message peek and confirm jobId='$jobId', succeeded=true, terminalStage='stitch'."
@@ -250,10 +307,10 @@ do {
         return
     }
 
-    Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Waiting for $outputBlobName"
+    Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Waiting for outputType=$OutputType artifacts for $jobId"
     Start-Sleep -Seconds $PollSeconds
 } while ((Get-Date) -lt $deadline)
 
 Write-Host "The workflow did not complete within $TimeoutMinutes minutes. Current workloads:"
 kubectl get scaledobjects,pods,jobs --namespace $KubernetesNamespace
-throw "Timed out waiting for '$outputVideoUri'."
+throw "Timed out waiting for artifacts at '$outputBaseUri'."

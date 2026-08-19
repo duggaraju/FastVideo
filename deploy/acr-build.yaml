@@ -1,0 +1,23 @@
+version: v1.1.0
+stepTimeout: 3600
+steps:
+  - id: build
+    build: >-
+      --platform {{.Values.platform}}
+      --build-arg TARGETARCH={{.Values.targetArch}}
+      --build-arg PROJECT={{.Values.project}}
+      --build-arg APP_DLL={{.Values.appDll}}
+      --build-arg BINARY={{.Values.binary}}
+      --build-arg CARGO_FEATURES={{.Values.cargoFeatures}}
+      --build-arg FFMPEG_BUILD={{.Values.ffmpegBuild}}
+      --build-arg FFMPEG_VERSION={{.Values.ffmpegVersion}}
+      --tag $Registry/{{.Values.image}}
+      --file {{.Values.dockerfile}}
+      .
+    env:
+      - DOCKER_BUILDKIT=1
+  - id: push
+    push:
+      - $Registry/{{.Values.image}}
+    when:
+      - build

@@ -42,5 +42,9 @@ name = "encoder"
 path = "src/bin/encoder.rs"
 
 [[bin]]
+name = "audio-encoder"
+path = "src/bin/audio-encoder.rs"
+
+[[bin]]
 name = "stitcher"
 path = "src/bin/stitcher.rs"

@@ -64,14 +64,18 @@ data:
   WorkloadIdentity__ClientId: "__WORKLOAD_CLIENT_ID__"
   Kubernetes__Namespace: "__KUBERNETES_NAMESPACE__"
   Images__Encoder: "__ACR_LOGIN_SERVER__/video-encoder-__MEDIA_RUNTIME__:__IMAGE_TAG__"
+  Images__AudioEncoder: "__ACR_LOGIN_SERVER__/video-audio-encoder-__MEDIA_RUNTIME__:__IMAGE_TAG__"
   Images__Stitcher: "__ACR_LOGIN_SERVER__/video-stitcher-__MEDIA_RUNTIME__:__IMAGE_TAG__"
   Images__Dotnet__Encoder: "__ACR_LOGIN_SERVER__/video-encoder-dotnet:__DOTNET_MEDIA_IMAGE_TAG__"
+  Images__Dotnet__AudioEncoder: "__ACR_LOGIN_SERVER__/video-audio-encoder-dotnet:__DOTNET_MEDIA_IMAGE_TAG__"
   Images__Dotnet__Stitcher: "__ACR_LOGIN_SERVER__/video-stitcher-dotnet:__DOTNET_MEDIA_IMAGE_TAG__"
   Images__Rust__Encoder: "__ACR_LOGIN_SERVER__/video-encoder-rust:__RUST_MEDIA_IMAGE_TAG__"
+  Images__Rust__AudioEncoder: "__ACR_LOGIN_SERVER__/video-audio-encoder-rust:__RUST_MEDIA_IMAGE_TAG__"
   Images__Rust__Stitcher: "__ACR_LOGIN_SERVER__/video-stitcher-rust:__RUST_MEDIA_IMAGE_TAG__"
   Encoding__MediaRuntimeDefault: "__MEDIA_RUNTIME__"
   Encoding__MaxParallelism: "32"
   Encoding__MinParallelismPerJob: "2"
+  Encoding__MaxAudioDurationSeconds: "__MAX_AUDIO_DURATION_SECONDS__"
   Encoding__ParallelizationStrategy: "fixed-duration"
 ---
 apiVersion: keda.sh/v1alpha1

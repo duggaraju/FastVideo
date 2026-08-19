@@ -5,13 +5,14 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::{
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
 };
 
 #[derive(Debug, Clone)]
 pub struct MediaInfo {
     pub duration_seconds: f64,
+    pub audio_duration_seconds: f64,
     pub width: i32,
     pub height: i32,
     pub frame_rate: f64,
@@ -36,6 +37,7 @@ struct ProbeDocument {
 struct ProbeStream {
     codec_type: String,
     codec_name: Option<String>,
+    duration: Option<String>,
     width: Option<i32>,
     height: Option<i32>,
     avg_frame_rate: Option<String>,
@@ -62,13 +64,22 @@ struct ProbePacket {
 pub fn probe(path: &Path) -> Result<MediaInfo> {
     let document: ProbeDocument = run_ffprobe_json(&[
         "-show_entries",
-        "format=duration:stream=codec_type,codec_name,width,height,avg_frame_rate,r_frame_rate,bit_rate",
+        "format=duration:stream=codec_type,codec_name,duration,width,height,avg_frame_rate,r_frame_rate,bit_rate",
         path.to_string_lossy().as_ref(),
     ])?;
     let duration_seconds = document.format.duration.parse()?;
     if duration_seconds <= 0.0 {
         bail!("FFmpeg returned an invalid duration");
     }
+    let audio_duration_seconds = document
+        .streams
+        .iter()
+        .find(|stream| stream.codec_type == "audio")
+        .context("Input does not contain an audio stream")?
+        .duration
+        .as_deref()
+        .and_then(|duration| duration.parse().ok())
+        .unwrap_or(duration_seconds);
     let stream = document
         .streams
         .into_iter()
@@ -83,6 +94,7 @@ pub fn probe(path: &Path) -> Result<MediaInfo> {
         .unwrap_or(30.0);
     Ok(MediaInfo {
         duration_seconds,
+        audio_duration_seconds,
         width: stream.width.unwrap_or_default(),
         height: stream.height.unwrap_or_default(),
         frame_rate,
@@ -303,14 +315,22 @@ pub fn encode_segment_with_vmaf(
         .context("VMAF output does not contain pooled_metrics.vmaf.mean")
 }
 
-pub fn stitch(concat_list: &Path, audio: &Path, output: &Path) -> Result<()> {
-    ensure_parent(output)?;
-    run_ffmpeg(
-        ffmpeg_command()
-            .args(["-f", "concat", "-safe", "0", "-i"])
-            .arg(concat_list)
-            .arg("-i")
-            .arg(audio)
+pub fn stitch(
+    concat_list: &Path,
+    audio: &Path,
+    output_base: &Path,
+    package_directory: &Path,
+    output_type: &str,
+) -> Result<()> {
+    ensure_parent(output_base)?;
+    let mut command = ffmpeg_command();
+    command
+        .args(["-f", "concat", "-safe", "0", "-i"])
+        .arg(concat_list)
+        .arg("-i")
+        .arg(audio);
+    if matches!(output_type, "mp4" | "both") {
+        command
             .args([
                 "-map",
                 "0:v:0",
@@ -321,8 +341,96 @@ pub fn stitch(concat_list: &Path, audio: &Path, output: &Path) -> Result<()> {
                 "-movflags",
                 "+faststart",
             ])
-            .arg(output),
-    )
+            .arg(append_suffix(output_base, ".mp4"));
+    }
+    if matches!(output_type, "cmaf" | "both") {
+        fs::create_dir_all(package_directory)?;
+        let base_name = output_base
+            .file_name()
+            .and_then(|value| value.to_str())
+            .context("Output path must end in a UTF-8 base filename")?;
+        command
+            .args([
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-c",
+                "copy",
+                "-f",
+                "dash",
+                "-seg_duration",
+                "6",
+                "-use_template",
+                "1",
+                "-use_timeline",
+                "1",
+                "-dash_segment_type",
+                "mp4",
+                "-single_file",
+                "1",
+                "-single_file_name",
+                &format!("{base_name}-stream$RepresentationID$.cmaf"),
+                "-adaptation_sets",
+                "id=0,streams=v id=1,streams=a",
+                "-hls_playlist",
+                "1",
+                "-hls_master_name",
+                &format!("{base_name}.m3u8"),
+            ])
+            .arg(package_directory.join(format!("{base_name}.mpd")));
+    }
+    run_ffmpeg(&mut command)?;
+
+    if matches!(output_type, "cmaf" | "both") {
+        let base_name = output_base
+            .file_name()
+            .and_then(|value| value.to_str())
+            .context("Output path must end in a UTF-8 base filename")?;
+        rename_hls_media_playlists(package_directory, base_name)?;
+        let output_directory = output_base.parent().context("Output path has no parent")?;
+        for entry in fs::read_dir(package_directory)? {
+            let source = entry?.path();
+            let destination = output_directory.join(
+                source
+                    .file_name()
+                    .context("Package artifact has no filename")?,
+            );
+            if destination.exists() {
+                fs::remove_file(&destination)?;
+            }
+            fs::copy(source, destination)?;
+        }
+    }
+    Ok(())
+}
+
+fn rename_hls_media_playlists(package_directory: &Path, base_name: &str) -> Result<()> {
+    let master_path = package_directory.join(format!("{base_name}.m3u8"));
+    let mut master_content = fs::read_to_string(&master_path)?;
+    for entry in fs::read_dir(package_directory)? {
+        let source = entry?.path();
+        let Some(original_name) = source.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let Some(representation_id) = original_name
+            .strip_prefix("media_")
+            .and_then(|value| value.strip_suffix(".m3u8"))
+        else {
+            continue;
+        };
+        let renamed_name = format!("{base_name}-stream{representation_id}.m3u8");
+        fs::rename(&source, package_directory.join(&renamed_name))?;
+        master_content = master_content.replace(original_name, &renamed_name);
+    }
+    fs::write(master_path, master_content)?;
+    Ok(())
+}
+
+fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_owned();
+    value.push(suffix);
+    PathBuf::from(value)
 }
 
 pub fn read_segment_vmaf(path: &Path) -> Result<SegmentVmaf> {
@@ -393,6 +501,7 @@ mod tests {
     fn automatic_av1_profile_matches_dotnet_thresholds() {
         let source = MediaInfo {
             duration_seconds: 1.0,
+            audio_duration_seconds: 1.0,
             width: 1920,
             height: 1080,
             frame_rate: 30.0,

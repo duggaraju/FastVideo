@@ -18,6 +18,8 @@ param(
     [string] $FfmpegVersion = "9.0",
     [string] $Platforms = "linux/amd64,linux/arm64",
     [string] $ControlPlanePlatforms = "linux/amd64",
+    [ValidateRange(1, 2147483647)]
+    [int] $MaxAudioDurationSeconds = 21600,
     [switch] $UseLocalDocker = $true,
     [switch] $SkipInfrastructureDeployment
 )
@@ -101,12 +103,14 @@ if ([string]::IsNullOrWhiteSpace($DotNetMediaImageTag)) {
 if ([string]::IsNullOrWhiteSpace($RustMediaImageTag)) {
     $RustMediaImageTag = $ImageTag
 }
-$projects = @("Analysis", "Completion", "Encoder", "Stitcher")
+$projects = @("Analysis", "Completion", "Encoder", "AudioEncoder", "Stitcher")
 foreach ($project in $projects) {
     $projectName = "Video$project"
     $isControlPlaneWorker = $project -in @("Analysis", "Completion")
     $imageName = if ($isControlPlaneWorker) {
         "video-$($project.ToLowerInvariant())-$MessageTransport"
+    } elseif ($project -eq "AudioEncoder") {
+        "video-audio-encoder-$MediaRuntime"
     } else {
         "video-$($project.ToLowerInvariant())-$MediaRuntime"
     }
@@ -114,11 +118,14 @@ foreach ($project in $projects) {
     $projectPlatforms = if ($isControlPlaneWorker) { $ControlPlanePlatforms } else { $Platforms }
     $isRustWorker = ($isControlPlaneWorker -and $MessageTransport -eq "storagequeue") -or `
         (-not $isControlPlaneWorker -and $MediaRuntime -eq "rust")
-    $dockerfile = Join-Path $root $(if ($isRustWorker) { "rust/Dockerfile" } else { "docker/Dockerfile" })
+    $dockerfile = Join-Path $root $(if ($isRustWorker) { "rust/Dockerfile" } else { "dotnet/Dockerfile" })
+    $binary = ""
+    $cargoFeatures = ""
     $buildArguments = if ($isRustWorker) {
         $binary = switch ($project) {
             "Analysis" { "analyzer" }
             "Completion" { "completion" }
+            "AudioEncoder" { "audio-encoder" }
             default { $project.ToLowerInvariant() }
         }
         @(
@@ -135,7 +142,8 @@ foreach ($project in $projects) {
         )
     }
     if ($isRustWorker -and $project -in @("Analysis", "Completion")) {
-        $buildArguments += @("--build-arg", "CARGO_FEATURES=--features=control-plane")
+        $cargoFeatures = "--features=control-plane"
+        $buildArguments += @("--build-arg", "CARGO_FEATURES=$cargoFeatures")
     }
     if ($UseLocalDocker) {
         az acr login --name $acrName
@@ -170,15 +178,29 @@ foreach ($project in $projects) {
         foreach ($platform in $platformList) {
             $platformSuffix = $platform.Replace('linux/', '')
             $platformImage = "${imageName}:${ImageTag}-${platformSuffix}"
-            az acr build `
-                --registry $acrName `
-                --image $platformImage `
-                --platform $platform `
-                --file $dockerfile `
-                --build-arg "TARGETARCH=$platformSuffix" `
-                @buildArguments `
-                $root
-            Assert-NativeCommandSucceeded "Building $projectName image for $platform in Azure Container Registry"
+            $taskValues = @(
+                "image=$platformImage",
+                "platform=$platform",
+                "targetArch=$platformSuffix",
+                "dockerfile=$($dockerfile.Substring($root.Length + 1).Replace('\', '/'))",
+                "project=$(if ($isRustWorker) { '' } else { $projectName })",
+                "appDll=$(if ($isRustWorker) { '' } else { "$projectName.dll" })",
+                "binary=$binary",
+                "cargoFeatures=$cargoFeatures",
+                "ffmpegBuild=$FfmpegBuild",
+                "ffmpegVersion=$FfmpegVersion"
+            )
+            $acrRunArguments = @(
+                "acr", "run",
+                "--registry", $acrName,
+                "--file", "deploy/acr-build.yaml"
+            )
+            foreach ($taskValue in $taskValues) {
+                $acrRunArguments += @("--set", $taskValue)
+            }
+            $acrRunArguments += $root
+            az @acrRunArguments
+            Assert-NativeCommandSucceeded "Building and pushing $projectName image for $platform with the Azure Container Registry task"
             $platformImages += "${acrLoginServer}/${platformImage}"
         }
         if ($platformImages.Count -gt 1) {
@@ -222,6 +244,7 @@ $replacements = @{
     "__RUST_MEDIA_IMAGE_TAG__" = $RustMediaImageTag
     "__MEDIA_RUNTIME__" = $MediaRuntime
     "__KUBERNETES_NAMESPACE__" = $KubernetesNamespace
+    "__MAX_AUDIO_DURATION_SECONDS__" = $MaxAudioDurationSeconds
 }
 foreach ($replacement in $replacements.GetEnumerator()) {
     $manifest = $manifest.Replace($replacement.Key, $replacement.Value)

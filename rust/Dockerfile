@@ -140,6 +140,7 @@ RUN mkdir -p src/bin \
     && printf 'fn main() {}\n' > src/bin/analyzer.rs \
     && printf 'fn main() {}\n' > src/bin/completion.rs \
     && printf 'fn main() {}\n' > src/bin/encoder.rs \
+    && printf 'fn main() {}\n' > src/bin/audio-encoder.rs \
     && printf 'fn main() {}\n' > src/bin/stitcher.rs \
     && cargo check --locked --lib --bin "${BINARY}" ${CARGO_FEATURES} \
     && rm -rf src

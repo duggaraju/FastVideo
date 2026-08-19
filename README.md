@@ -7,10 +7,10 @@ The Storage Queue and Service Bus control planes can run side by side. `storageq
 ## Workflow
 
 1. KEDA scales the selected analyzer from the `video-submitted` Storage Queue or Service Bus queue.
-2. The analyzer reads the source from the read-only input mount, probes it with FFprobe, extracts one audio track (copy or optional re-encode) to output storage, computes segment boundaries, writes the manifest to output storage, and creates a Kubernetes Indexed Job.
+2. The analyzer reads the source from the read-only input mount and probes it with FFprobe. It rejects audio longer than `Encoding__MaxAudioDurationSeconds`, stream-copies audio to output storage when `audioCodec` is `copy`, computes segment boundaries, writes the manifest, and creates the media Jobs. Audio transcoding runs concurrently in a singleton Job on the selected Spot or regular pool; video encoding runs in a Kubernetes Indexed Job.
 3. Every `VideoEncoder` index reads the source from input storage, encodes only its deterministic video time range (no audio), and writes to a unique staging path on the output BlobFuse mount. After FFmpeg succeeds, it renames the staging file to the deterministic segment path. When requested, the index also compares the segment with its source interval using VMAF and writes a deterministic score sidecar. A retry skips each artifact that already exists. Each index gets up to five retries on interruption or encoding failure.
-4. Kubernetes marks the Indexed encode Job complete only after every index succeeds. The singleton Job watcher observes that condition and creates a deterministic stitch Job using metadata stored on the encode Job. Stitching follows the request's `useSpot` setting and runs on the same Spot or regular pool selected for encoding.
-5. `VideoStitcher` constructs ordered segment paths directly from indexes `0..SegmentCount-1`, reads them and the extracted audio exclusively from output storage, and writes the requested final output path. When VMAF was requested, it also writes the arithmetic mean of all segment VMAF means beside the output video.
+4. Kubernetes marks the Indexed encode Job complete only after every index succeeds. For transcoding requests, the singleton Job watcher also waits for the audio encode Job to complete. It then creates a deterministic stitch Job using metadata stored on the encode Job. Stitching follows the request's `useSpot` setting and runs on the same Spot or regular pool selected for encoding.
+5. `VideoStitcher` constructs ordered segment paths directly from indexes `0..SegmentCount-1` and reads them and the extracted audio exclusively from output storage. One FFmpeg process concatenates the video and emits the selected MP4 output, CMAF package with DASH and HLS manifests, or both. When VMAF was requested, the stitcher also writes the arithmetic mean of all segment VMAF means beside the requested output path.
 6. A singleton completion reconciler logs failed encode pod attempts and sends one terminal `VideoProcessingResult` per video to `video-results`: encode failure after all retries means failure, stitch success means success, and stitch failure means failure. Individual retry failures and encode success are not sent as terminal results. After stitching succeeds, the reconciler deletes the corresponding encode Job.
 
 Indexed encode Jobs use Spot nodes by default and tolerate eviction. A request can instead select the dedicated autoscaling regular encoding pool. Stitch Jobs use the same pool selected for encoding, while lightweight analysis and the Job watcher remain on regular system nodes. Encoder retries remain safe because blob names are deterministic, while Kubernetes Job conditions provide durable fan-in state.
@@ -22,6 +22,7 @@ Indexed encode Jobs use Spot nodes by default and tolerate eviction. A request c
 | `VideoContracts` / Rust contracts | Queue and manifest contracts, deterministic Kubernetes names |
 | Analysis / `video-analyzer` | KEDA-scaled queue intake listener, FFprobe analysis, Indexed Job submission |
 | `VideoEncoder` | One FFmpeg time-range encode per Kubernetes completion index |
+| `VideoAudioEncoder` / Rust `audio-encoder` | One complete audio transcode for non-copy requests |
 | Completion / `video-completion` | Kubernetes Job watcher, stitch Job submission, terminal result publishing |
 | `VideoStitcher` | FFmpeg segment concatenation and output publishing |
 
@@ -62,6 +63,12 @@ docker build -f rust/Dockerfile `
 
 ```powershell
 ./scripts/deploy.ps1 -Location westus2
+```
+
+Audio is limited to six hours by default. Override the analysis-stage limit at deployment time; requests exceeding it are rejected before media Jobs are scheduled:
+
+```powershell
+./scripts/deploy.ps1 -Location westus2 -MaxAudioDurationSeconds 43200
 ```
 
 The default deploys the Rust Storage Queue control plane and Rust media workers. Deploy either or both control planes; select the media runtime independently for each namespace:
@@ -105,11 +112,21 @@ Azure RBAC can take several minutes to propagate after first deployment. If the 
 
 ## Submit Work
 
-Send the JSON shape in [samples/video-submitted.json](samples/video-submitted.json) to the selected broker's `video-submitted` queue. `inputVideoUri` and `outputVideoUri` must be HTTPS blob URLs. They can target different storage accounts, and should match the input/output BlobFuse mounts configured in deployment.
+Send the JSON shape in [samples/video-submitted.json](samples/video-submitted.json) to the selected broker's `video-submitted` queue. `inputVideoUri` and `outputPath` must be HTTPS blob URLs. `outputPath` includes a base filename without an extension. The URLs can target different storage accounts and should match the input/output BlobFuse mounts configured in deployment.
 
 When encoding parameters are omitted, analysis uses the source codec, bitrate, resolution, and frame rate to select CRF, preset, and a maximum video bitrate. The default target codec is `libsvtav1`. Optional `crf`, `preset`, and `maxVideoBitrateKbps` values override the corresponding automatic choices.
 
 `useSpot` is optional and defaults to `true`. Set it to `false` to schedule all indexes for that video on the regular encoding pool. `calculateVmaf` is optional and defaults to `false`. When enabled, every encoder compares its output with the matching source interval. The final `.vmaf.json` beside the output video contains the overall unweighted arithmetic mean and an ordered `Segments` array with the `Index` and `Score` for every segment.
+
+`outputType` is optional and defaults to `mp4`. Supported values are `mp4`, `cmaf`, and `both`:
+
+| Value | Output |
+| --- | --- |
+| `mp4` | A single fast-start MP4 at `<outputPath>.mp4` |
+| `cmaf` | Flat DASH/HLS manifests and single-file CMAF representations prefixed by the `outputPath` base filename |
+| `both` | The MP4 and CMAF outputs above, produced by the same FFmpeg invocation |
+
+For example, an `outputPath` ending in `videos/demo` produces `videos/demo.mp4`, `videos/demo.mpd`, `videos/demo.m3u8`, `videos/demo-stream0.m3u8`, and `videos/demo-stream0.cmaf` at the same level. Stream suffixes use FFmpeg's zero-based representation IDs. The DASH and HLS manifests reference the same CMAF representation media.
 
 Job IDs must be unique for distinct work. Reusing a job ID deliberately resumes or deduplicates that workflow because Kubernetes Job names and output paths derive from it.
 
@@ -189,9 +206,10 @@ Each result records requested and actual architecture, node pool, VM SKU, encode
 {
     "jobId": "test-20260804-1430",
     "inputVideoUri": "https://videoinsoudinndket2a.blob.core.windows.net/input/bingshort.mp4",
-    "outputVideoUri": "https://videooutsoudinndket2.blob.core.windows.net/videos/test-20260804-1430.mp4",
+    "outputPath": "https://videooutsoudinndket2.blob.core.windows.net/videos/test-20260804-1430",
     "segmentDurationSeconds": 60,
-    "audioCodec": "copy"
+    "audioCodec": "copy",
+    "outputType": "both"
 }
 ```
 
@@ -207,7 +225,11 @@ videos/{jobId}/segments/audio.m4a
 videos/{jobId}/segments/000000.mp4
 videos/{jobId}/segments/000000.vmaf.json (when requested)
 videos/{jobId}/segments/000001.mp4
-(final file is written to outputVideoUri)
+videos/{output-base}.mp4 (when outputType is mp4 or both)
+videos/{output-base}.mpd (when outputType is cmaf or both)
+videos/{output-base}.m3u8 (when outputType is cmaf or both)
+videos/{output-base}-stream*.m3u8 (when outputType is cmaf or both)
+videos/{output-base}-stream*.cmaf (when outputType is cmaf or both)
 ```
 
 After the final video and completion event are published, the stitcher removes the job prefix and all intermediate files.

@@ -13,10 +13,9 @@ use std::time::Duration;
 use video::{
     config,
     contracts::{
-        job_name, VideoManifest, VideoSubmitted, ARCHITECTURE_ANNOTATION,
-        AUDIO_BLOB_NAME_ANNOTATION, CALCULATE_VMAF_ANNOTATION, JOB_ID_ANNOTATION,
-        MEDIA_RUNTIME_ANNOTATION, OUTPUT_VIDEO_URI_ANNOTATION, SEGMENT_COUNT_ANNOTATION,
-        STAGE_ID_ANNOTATION, USE_SPOT_ANNOTATION,
+        job_name, VideoManifest, VideoSubmitted, AUDIO_BLOB_NAME_ANNOTATION,
+        AUDIO_ENCODING_REQUIRED_ANNOTATION, CALCULATE_VMAF_ANNOTATION, JOB_ID_ANNOTATION,
+        MEDIA_RUNTIME_ANNOTATION, OUTPUT_PATH_ANNOTATION, OUTPUT_TYPE_ANNOTATION,
     },
     media, parallelism, paths,
 };
@@ -35,6 +34,7 @@ struct AnalyzerConfig {
     submission_queue: String,
     max_parallelism: i32,
     min_parallelism_per_job: i32,
+    max_audio_duration_seconds: u32,
     default_parallelization_strategy: String,
     default_media_runtime: String,
     receive_visibility_timeout_seconds: i32,
@@ -42,6 +42,24 @@ struct AnalyzerConfig {
     renew_visibility: bool,
     renew_interval_seconds: i32,
 }
+
+#[derive(Debug)]
+struct AudioDurationExceeded {
+    actual_seconds: f64,
+    maximum_seconds: u32,
+}
+
+impl std::fmt::Display for AudioDurationExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Audio duration {:.3}s exceeds the configured maximum of {}s",
+            self.actual_seconds, self.maximum_seconds
+        )
+    }
+}
+
+impl std::error::Error for AudioDurationExceeded {}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -100,6 +118,14 @@ impl AnalyzerConfig {
             bail!("Encoding__MinParallelismPerJob must be between 1 and Encoding__MaxParallelism");
         }
 
+        let max_audio_duration_seconds: u32 =
+            config::setting("Encoding__MaxAudioDurationSeconds", "21600")
+                .parse()
+                .context("Encoding__MaxAudioDurationSeconds is invalid")?;
+        if max_audio_duration_seconds < 1 {
+            bail!("Encoding__MaxAudioDurationSeconds must be greater than zero");
+        }
+
         let receive_visibility_timeout_seconds: i32 =
             config::setting("Storage__QueueVisibilityTimeoutSeconds", "900")
                 .parse()
@@ -138,6 +164,7 @@ impl AnalyzerConfig {
             submission_queue: config::setting("Storage__SubmissionQueue", "video-submitted"),
             max_parallelism,
             min_parallelism_per_job,
+            max_audio_duration_seconds,
             default_parallelization_strategy: config::setting(
                 "Encoding__ParallelizationStrategy",
                 "fixed-duration",
@@ -212,6 +239,10 @@ async fn handle_message(
         Ok(()) => {
             delete_message(queue_client, &message_id, &pop_receipt).await?;
             tracing::info!(job_id = %request.job_id, "Analyzer completed submission");
+        }
+        Err(error) if error.downcast_ref::<AudioDurationExceeded>().is_some() => {
+            delete_message(queue_client, &message_id, &pop_receipt).await?;
+            tracing::warn!(job_id = %request.job_id, %error, "Submission exceeded the audio duration limit; deleting message");
         }
         Err(error) => {
             tracing::error!(job_id = %request.job_id, %error, "Analyzer failed; message will become visible again");
@@ -301,6 +332,13 @@ async fn process_submission(
     let audio_path = paths::from_blob_name(&audio_blob_name, &output_mount)?;
 
     let media_info = media::probe(&input_path)?;
+    if media_info.audio_duration_seconds > f64::from(cfg.max_audio_duration_seconds) {
+        return Err(AudioDurationExceeded {
+            actual_seconds: media_info.audio_duration_seconds,
+            maximum_seconds: cfg.max_audio_duration_seconds,
+        }
+        .into());
+    }
     let segment_duration_seconds = calculate_segment_duration_seconds(
         media_info.duration_seconds,
         cfg.max_parallelism,
@@ -315,7 +353,10 @@ async fn process_submission(
         request.max_video_bitrate_kbps,
     );
 
-    media::extract_audio(&input_path, &audio_path, &request.audio_codec)?;
+    let audio_encoding_required = !request.audio_codec.eq_ignore_ascii_case("copy");
+    if !audio_encoding_required {
+        media::extract_audio(&input_path, &audio_path, &request.audio_codec)?;
+    }
 
     let strategy = request
         .parallelization_strategy
@@ -350,10 +391,12 @@ async fn process_submission(
             .unwrap_or(&cfg.default_media_runtime),
     )?;
 
+    let output_type = video::contracts::normalize_output_type(&request.output_type)
+        .map_err(anyhow::Error::msg)?;
     let manifest = VideoManifest {
         job_id: request.job_id.clone(),
         input_video_uri: request.input_video_uri.clone(),
-        output_video_uri: request.output_video_uri.clone(),
+        output_path: request.output_path.clone(),
         working_container: cfg.working_container.clone(),
         audio_blob_name: audio_blob_name.clone(),
         duration: format_dotnet_timespan(media_info.duration_seconds),
@@ -367,6 +410,7 @@ async fn process_submission(
         max_video_bitrate_kbps: profile.max_video_bitrate_kbps,
         use_spot: request.use_spot,
         calculate_vmaf: request.calculate_vmaf,
+        output_type: output_type.to_owned(),
     };
 
     write_manifest(&manifest, &output_mount)?;
@@ -376,9 +420,18 @@ async fn process_submission(
         &manifest,
         media_runtime,
         request.architecture.as_deref(),
-        &analysis_stage_id,
     )
     .await?;
+    if audio_encoding_required {
+        submit_audio_encoding_job(
+            cfg,
+            jobs,
+            &manifest,
+            media_runtime,
+            request.architecture.as_deref(),
+        )
+        .await?;
+    }
 
     tracing::info!(
         job_id = %manifest.job_id,
@@ -409,7 +462,6 @@ async fn submit_encoding_job(
     manifest: &VideoManifest,
     media_runtime: &str,
     requested_architecture: Option<&str>,
-    analysis_stage_id: &str,
 ) -> Result<()> {
     let encode_job_name = job_name("encode", &manifest.job_id);
 
@@ -426,21 +478,15 @@ async fn submit_encoding_job(
         None => None,
     };
 
-    let mut annotations = json!({
+    let annotations = json!({
         JOB_ID_ANNOTATION: manifest.job_id,
-        STAGE_ID_ANNOTATION: encode_job_name,
-        USE_SPOT_ANNOTATION: manifest.use_spot.to_string(),
-        SEGMENT_COUNT_ANNOTATION: manifest.segment_count.to_string(),
         AUDIO_BLOB_NAME_ANNOTATION: manifest.audio_blob_name,
-        OUTPUT_VIDEO_URI_ANNOTATION: manifest.output_video_uri.to_string(),
+        AUDIO_ENCODING_REQUIRED_ANNOTATION: (!manifest.audio_codec.eq_ignore_ascii_case("copy")).to_string(),
+        OUTPUT_PATH_ANNOTATION: manifest.output_path.to_string(),
+        OUTPUT_TYPE_ANNOTATION: manifest.output_type,
         CALCULATE_VMAF_ANNOTATION: if manifest.calculate_vmaf { "true" } else { "false" },
         MEDIA_RUNTIME_ANNOTATION: media_runtime,
-        "video/analysis-stage-id": analysis_stage_id,
     });
-    if let Some(arch) = architecture {
-        annotations[ARCHITECTURE_ANNOTATION] = json!(arch);
-    }
-
     let mut node_selector = json!({
         "workload": "video-encoding",
         "kubernetes.azure.com/scalesetpriority": if manifest.use_spot { "spot" } else { "regular" },
@@ -571,6 +617,125 @@ async fn submit_encoding_job(
     }
 }
 
+async fn submit_audio_encoding_job(
+    cfg: &AnalyzerConfig,
+    jobs: &Api<Job>,
+    manifest: &VideoManifest,
+    media_runtime: &str,
+    requested_architecture: Option<&str>,
+) -> Result<()> {
+    let audio_job_name = job_name("audio", &manifest.job_id);
+    match jobs.get(&audio_job_name).await {
+        Ok(_) => return Ok(()),
+        Err(kube::Error::Api(error)) if error.code == 404 => {}
+        Err(error) => return Err(error).context("Failed to check for existing audio encode job"),
+    }
+
+    let architecture = match requested_architecture {
+        Some("amd64") => Some("amd64"),
+        Some("arm64") => Some("arm64"),
+        Some(other) => bail!("architecture must be amd64 or arm64; got '{other}'"),
+        None => None,
+    };
+    let annotations = json!({ JOB_ID_ANNOTATION: manifest.job_id });
+    let mut node_selector = json!({
+        "workload": "video-encoding",
+        "kubernetes.azure.com/scalesetpriority": if manifest.use_spot { "spot" } else { "regular" },
+        "kubernetes.io/os": "linux",
+    });
+    if let Some(arch) = architecture {
+        node_selector["kubernetes.io/arch"] = json!(arch);
+    }
+
+    let audio_encoder_image = required_image(media_runtime, "AudioEncoder")?;
+    let job_json = json!({
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "metadata": {
+            "name": audio_job_name,
+            "labels": {
+                "app.kubernetes.io/name": "video-audio-encoder",
+                "video/job-id": video::contracts::label_value(&manifest.job_id),
+                "azure.workload.identity/use": "true"
+            },
+            "annotations": annotations
+        },
+        "spec": {
+            "backoffLimit": 6,
+            "ttlSecondsAfterFinished": 86400,
+            "template": {
+                "metadata": { "labels": {
+                    "app.kubernetes.io/name": "video-audio-encoder",
+                    "video/job-id": video::contracts::label_value(&manifest.job_id),
+                    "azure.workload.identity/use": "true"
+                }},
+                "spec": {
+                    "serviceAccountName": "video-worker",
+                    "restartPolicy": "Never",
+                    "terminationGracePeriodSeconds": 120,
+                    "nodeSelector": node_selector,
+                    "tolerations": manifest.use_spot.then(|| vec![json!({
+                        "key": "kubernetes.azure.com/scalesetpriority",
+                        "operator": "Equal",
+                        "value": "spot",
+                        "effect": "NoSchedule"
+                    })]),
+                    "volumes": [
+                        { "name": "input-storage", "csi": {
+                            "driver": "blob.csi.azure.com", "readOnly": true,
+                            "volumeAttributes": {
+                                "protocol": "fuse2", "storageAccount": cfg.input_storage_account,
+                                "containerName": cfg.input_storage_container, "ClientID": cfg.workload_client_id,
+                                "mountWithWorkloadIdentityToken": "true",
+                                "mountOptions": "--allow-other --use-attr-cache=true --cancel-list-on-mount-seconds=10"
+                            }
+                        }},
+                        { "name": "output-storage", "csi": {
+                            "driver": "blob.csi.azure.com", "readOnly": false,
+                            "volumeAttributes": {
+                                "protocol": "fuse2", "storageAccount": cfg.output_storage_account,
+                                "containerName": cfg.output_storage_container, "ClientID": cfg.workload_client_id,
+                                "mountWithWorkloadIdentityToken": "true",
+                                "mountOptions": "--allow-other --use-attr-cache=true --disable-writeback-cache=true"
+                            }
+                        }}
+                    ],
+                    "containers": [{
+                        "name": "audio-encoder",
+                        "image": audio_encoder_image,
+                        "env": [
+                            { "name": "JOB_ID", "value": manifest.job_id },
+                            { "name": "SOURCE_VIDEO_URI", "value": manifest.input_video_uri.to_string() },
+                            { "name": "AUDIO_BLOB_NAME", "value": manifest.audio_blob_name },
+                            { "name": "AUDIO_CODEC", "value": manifest.audio_codec },
+                            { "name": "INPUT_STORAGE_ACCOUNT_NAME", "value": cfg.input_storage_account },
+                            { "name": "INPUT_STORAGE_CONTAINER", "value": cfg.input_storage_container },
+                            { "name": "INPUT_MOUNT_PATH", "value": cfg.input_mount_path },
+                            { "name": "OUTPUT_MOUNT_PATH", "value": cfg.output_mount_path }
+                        ],
+                        "volumeMounts": [
+                            { "name": "input-storage", "mountPath": cfg.input_mount_path, "readOnly": true },
+                            { "name": "output-storage", "mountPath": cfg.output_mount_path }
+                        ],
+                        "resources": {
+                            "requests": { "cpu": "1", "memory": "1Gi" },
+                            "limits": { "cpu": "2", "memory": "2Gi" }
+                        }
+                    }]
+                }
+            }
+        }
+    });
+
+    let job: Job =
+        serde_json::from_value(job_json).context("Failed to serialize audio encode job")?;
+    match jobs.create(&PostParams::default(), &job).await {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(error)) if error.code == 409 => Ok(()),
+        Err(error) => Err(error).context("Failed to create audio encode job"),
+    }
+}
+
 fn calculate_segment_duration_seconds(
     duration_seconds: f64,
     max_parallelism: i32,
@@ -591,8 +756,17 @@ fn validate_submission(request: &VideoSubmitted) -> Result<()> {
     if request.input_video_uri.scheme() != "https" {
         bail!("InputVideoUri must use HTTPS");
     }
-    if request.output_video_uri.scheme() != "https" {
-        bail!("OutputVideoUri must use HTTPS");
+    if request.output_path.scheme() != "https" {
+        bail!("OutputPath must use HTTPS");
+    }
+    if request.output_path.path().ends_with('/') {
+        bail!("OutputPath must include a base filename");
+    }
+    if std::path::Path::new(request.output_path.path())
+        .extension()
+        .is_some()
+    {
+        bail!("OutputPath base filename must not include an extension");
     }
     if !(5..=3600).contains(&request.segment_duration_seconds) {
         bail!("SegmentDurationSeconds must be between 5 and 3600");
@@ -685,7 +859,7 @@ mod tests {
         serde_json::from_value(json!({
             "jobId": "job-1",
             "inputVideoUri": "https://input.blob.core.windows.net/input/video.mp4",
-            "outputVideoUri": "https://output.blob.core.windows.net/videos/video.mp4",
+            "outputPath": "https://output.blob.core.windows.net/videos/video",
             "segmentDurationSeconds": 60,
             "audioCodec": "copy"
         }))
@@ -698,6 +872,11 @@ mod tests {
 
         let mut invalid = submission();
         invalid.segment_duration_seconds = 4;
+        assert!(validate_submission(&invalid).is_err());
+
+        let mut invalid = submission();
+        invalid.output_path =
+            Url::parse("https://output.blob.core.windows.net/videos/video.mp4").unwrap();
         assert!(validate_submission(&invalid).is_err());
     }
 

@@ -4,7 +4,11 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
-use video::{config, contracts::VideoVmaf, media, paths};
+use video::{
+    config,
+    contracts::{normalize_output_type, VideoVmaf},
+    media, paths,
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -12,10 +16,16 @@ async fn main() -> Result<()> {
     let job_id = config::required("JOB_ID")?;
     let segment_count: usize = config::parse("SEGMENT_COUNT")?;
     let output_mount = PathBuf::from(config::required("OUTPUT_MOUNT_PATH")?);
-    let output_uri = url::Url::parse(&config::required("OUTPUT_VIDEO_URI")?)?;
+    let output_uri = url::Url::parse(&config::required("OUTPUT_PATH")?)?;
+    let output_type =
+        normalize_output_type(&config::required("OUTPUT_TYPE")?).map_err(anyhow::Error::msg)?;
     let calculate_vmaf: bool = config::parse("CALCULATE_VMAF")?;
     let job_directory = paths::from_blob_name(&job_id, &output_mount)?;
     let working_directory = job_directory.join("_stitch");
+    let package_directory = std::env::temp_dir()
+        .join("video-stitcher")
+        .join(&job_id)
+        .join("package");
     fs::create_dir_all(&working_directory)?;
     let mut complete = false;
 
@@ -67,24 +77,29 @@ async fn main() -> Result<()> {
             .join("\n");
         fs::write(&concat_list, concat_content)?;
         let audio = paths::from_blob_name(&config::required("AUDIO_BLOB_NAME")?, &output_mount)?;
-        let output_path = paths::from_uri(
+        let output_base_path = paths::from_uri(
             &output_uri,
             &config::required("OUTPUT_STORAGE_ACCOUNT_NAME")?,
             &config::required("OUTPUT_STORAGE_CONTAINER")?,
             &output_mount,
         )?;
-        media::stitch(&concat_list, &audio, &output_path)?;
-        let length = fs::metadata(&output_path)?.len();
+        media::stitch(
+            &concat_list,
+            &audio,
+            &output_base_path,
+            &package_directory,
+            output_type,
+        )?;
         if let Some(score) = vmaf_score {
             fs::write(
-                output_path.with_extension("vmaf.json"),
+                append_suffix(&output_base_path, ".vmaf.json"),
                 serde_json::to_vec(&VideoVmaf {
                     score,
                     segments: vmaf_segments,
                 })?,
             )?;
         }
-        tracing::info!(%job_id, %length, ?vmaf_score, "Stitching completed");
+        tracing::info!(%job_id, %output_type, ?vmaf_score, "Stitching completed");
         complete = true;
 
         let mut cleanup = segments;
@@ -95,10 +110,17 @@ async fn main() -> Result<()> {
     }
     .await;
 
+    delete_directory(&package_directory).await;
     if !complete {
         delete_directory(&working_directory).await;
     }
     result
+}
+
+fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_owned();
+    value.push(suffix);
+    PathBuf::from(value)
 }
 
 async fn delete_intermediate(paths: Vec<PathBuf>, job_directory: &Path) {

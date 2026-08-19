@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Video.AudioEncoder</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="FFMpegCore" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\VideoContracts\VideoContracts.csproj" />
+  </ItemGroup>
+
+</Project>
