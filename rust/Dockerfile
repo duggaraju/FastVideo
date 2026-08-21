@@ -1,4 +1,5 @@
 ARG FFMPEG_BUILD=custom
+ARG FFMPEG_IMAGE=ffmpeg-build
 
 FROM mcr.microsoft.com/azurelinux/base/core:3.0 AS ffmpeg-btbn
 ARG TARGETARCH
@@ -122,11 +123,11 @@ RUN curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
     && install --directory /opt/ffmpeg/share/vmaf \
     && cp /build/vmaf/model/vmaf_v0.6.1.json /opt/ffmpeg/share/vmaf/vmaf_v0.6.1.json
 
-FROM ffmpeg-${FFMPEG_BUILD} AS ffmpeg
+FROM ffmpeg-${FFMPEG_BUILD} AS ffmpeg-build
+
+FROM ${FFMPEG_IMAGE} AS ffmpeg
 
 FROM rust:1.97.0-bookworm AS build
-ARG BINARY
-ARG CARGO_FEATURES=
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends clang pkg-config \
     && rm -rf /var/lib/apt/lists/*
@@ -142,16 +143,19 @@ RUN mkdir -p src/bin \
     && printf 'fn main() {}\n' > src/bin/encoder.rs \
     && printf 'fn main() {}\n' > src/bin/audio-encoder.rs \
     && printf 'fn main() {}\n' > src/bin/stitcher.rs \
-    && cargo check --locked --lib --bin "${BINARY}" ${CARGO_FEATURES} \
+    && cargo check --locked --all-targets --all-features \
     && rm -rf src
 COPY rust/src ./src
-RUN test -n "${BINARY}" \
-    && cargo test --locked --lib \
-    && cargo build --locked --release --bin "${BINARY}" ${CARGO_FEATURES} \
-    && strip "target/release/${BINARY}" \
-    && cp "target/release/${BINARY}" /app
+RUN cargo test --locked --all-features \
+    && cargo build --locked --release --bins --all-features \
+    && install --directory /app \
+    && for binary in analyzer completion encoder audio-encoder stitcher; do \
+        strip "target/release/${binary}"; \
+        cp "target/release/${binary}" "/app/${binary}"; \
+    done
 
 FROM mcr.microsoft.com/azurelinux/base/core:3.0 AS final
+ARG BINARY
 RUN tdnf install --assumeyes ca-certificates shadow-utils \
     && tdnf clean all \
     && groupadd --system --gid 1654 app \
@@ -159,7 +163,7 @@ RUN tdnf install --assumeyes ca-certificates shadow-utils \
 COPY --from=ffmpeg /opt/ffmpeg/bin/ffmpeg /opt/ffmpeg/bin/ffprobe /opt/ffmpeg/bin/
 COPY --from=ffmpeg /opt/ffmpeg/lib /opt/ffmpeg/lib
 COPY --from=ffmpeg /opt/ffmpeg/share/vmaf/vmaf_v0.6.1.json /opt/ffmpeg/share/vmaf/vmaf_v0.6.1.json
-COPY --from=build /app /app/video
+COPY --from=build /app/${BINARY} /app/video
 ENV PATH="/opt/ffmpeg/bin:${PATH}" \
     LD_LIBRARY_PATH="/opt/ffmpeg/lib" \
     RUST_LOG=video=info

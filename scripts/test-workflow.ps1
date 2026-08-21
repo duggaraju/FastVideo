@@ -1,3 +1,5 @@
+#!/usr/bin/env pwsh
+
 [CmdletBinding()]
 param(
     [string] $ResourceGroup = "$([Environment]::UserName)-video",
@@ -28,6 +30,10 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+if ($PSVersionTable.PSVersion.Major -lt 7) {
+    throw "PowerShell 7 or later is required."
+}
 
 function Assert-NativeCommandSucceeded([string] $Operation) {
     if ($LASTEXITCODE -ne 0) {
@@ -152,23 +158,21 @@ if ($Architecture -ne "auto") {
 }
 $payload = $payload | ConvertTo-Json -Compress
 if ($MessageTransport -eq "storagequeue") {
-    $payloadArgument = $payload.Replace('"', '\"')
     Write-Host "Submitting $jobId to $outputStorageAccount/video-submitted with mediaRuntime=$MediaRuntime"
     az storage message put `
         --account-name $outputStorageAccount `
         --queue-name video-submitted `
-        --content $payloadArgument `
+        --content $payload `
         --auth-mode login `
         --only-show-errors `
         --output none
 } else {
     $serviceBusNamespace = $deployment.serviceBusNamespace.value
-    $payloadArgument = $payload.Replace('"', '\"')
     $brokerProperties = [ordered]@{
         MessageId = $jobId
         CorrelationId = $jobId
     } | ConvertTo-Json -Compress
-    $brokerPropertiesHeader = "BrokerProperties=$($brokerProperties.Replace('"', '\"'))"
+    $brokerPropertiesHeader = "BrokerProperties=$brokerProperties"
 
     Write-Host "Submitting $jobId to $serviceBusNamespace/video-submitted with mediaRuntime=$MediaRuntime"
     az rest `
@@ -176,7 +180,7 @@ if ($MessageTransport -eq "storagequeue") {
         --url "https://$serviceBusNamespace/video-submitted/messages" `
         --resource "https://servicebus.azure.net" `
         --headers "Content-Type=application/json" $brokerPropertiesHeader `
-        --body $payloadArgument `
+        --body $payload `
         --output none
 }
 Assert-NativeCommandSucceeded "Submitting the video"

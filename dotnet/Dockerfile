@@ -1,4 +1,5 @@
 ARG FFMPEG_BUILD=btbn
+ARG FFMPEG_IMAGE=ffmpeg-build
 
 FROM mcr.microsoft.com/azurelinux/base/core:3.0 AS ffmpeg-btbn
 ARG TARGETARCH
@@ -122,15 +123,20 @@ RUN curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
     && install --directory /opt/ffmpeg/share/vmaf \
     && cp /build/vmaf/model/vmaf_v0.6.1.json /opt/ffmpeg/share/vmaf/vmaf_v0.6.1.json
 
-FROM ffmpeg-${FFMPEG_BUILD} AS ffmpeg
+FROM ffmpeg-${FFMPEG_BUILD} AS ffmpeg-build
+
+FROM ${FFMPEG_IMAGE} AS ffmpeg
 
 FROM mcr.microsoft.com/dotnet/sdk:10.0-azurelinux3.0 AS build
 ARG PROJECT
 ARG TARGETARCH
 WORKDIR /source
-COPY . .
-RUN dotnet restore "dotnet/${PROJECT}/${PROJECT}.csproj" -a "${TARGETARCH}" \
-    && dotnet publish "dotnet/${PROJECT}/${PROJECT}.csproj" --no-restore -c Release -a "${TARGETARCH}" -o /app
+COPY Directory.Build.props Directory.Packages.props global.json ./
+COPY dotnet/VideoContracts/VideoContracts.csproj dotnet/VideoContracts/
+COPY dotnet/${PROJECT}/${PROJECT}.csproj dotnet/${PROJECT}/
+RUN dotnet restore "dotnet/${PROJECT}/${PROJECT}.csproj" -a "${TARGETARCH}"
+COPY dotnet/ dotnet/
+RUN dotnet publish "dotnet/${PROJECT}/${PROJECT}.csproj" --no-restore -c Release -a "${TARGETARCH}" -o /app
 
 FROM mcr.microsoft.com/dotnet/runtime:10.0-azurelinux3.0 AS runtime
 COPY --from=ffmpeg /opt/ffmpeg/bin/ffmpeg /opt/ffmpeg/bin/ffprobe /opt/ffmpeg/bin/

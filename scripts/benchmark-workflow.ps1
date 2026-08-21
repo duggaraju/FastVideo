@@ -1,3 +1,5 @@
+#!/usr/bin/env pwsh
+
 [CmdletBinding()]
 param(
     [string] $ResourceGroup = "$([Environment]::UserName)-video",
@@ -22,6 +24,10 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+if ($PSVersionTable.PSVersion.Major -lt 7) {
+    throw "PowerShell 7 or later is required."
+}
 
 function Assert-NativeCommandSucceeded([string] $Operation) {
     if ($LASTEXITCODE -ne 0) {
@@ -174,7 +180,6 @@ for ($run = 1; $run -le $Runs; $run++) {
         $payload.architecture = $Architecture
     }
     $payload = $payload | ConvertTo-Json -Compress
-    $payloadArgument = $payload.Replace('"', '\"')
 
     $submittedAt = [DateTimeOffset]::UtcNow
     Write-Host "[$run/$Runs] Submitting $jobId ($mode) at $submittedAt"
@@ -182,7 +187,7 @@ for ($run = 1; $run -le $Runs; $run++) {
         az storage message put `
             --account-name $outputStorageAccount `
             --queue-name video-submitted `
-            --content $payloadArgument `
+            --content $payload `
             --auth-mode login `
             --only-show-errors `
             --output none
@@ -201,7 +206,7 @@ for ($run = 1; $run -le $Runs; $run++) {
             --url "https://$serviceBusNamespace/video-submitted/messages" `
             --resource "https://servicebus.azure.net" `
             --headers $messageHeaders `
-            --body $payloadArgument `
+            --body $payload `
             --output none
     }
     Assert-NativeCommandSucceeded "Submitting $jobId"

@@ -1,3 +1,5 @@
+#!/usr/bin/env pwsh
+
 [CmdletBinding()]
 param(
     [string] $ResourceGroup = "$([Environment]::UserName)-video",
@@ -26,6 +28,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
+
+if ($PSVersionTable.PSVersion.Major -lt 7) {
+    throw "PowerShell 7 or later is required."
+}
 
 if ([string]::IsNullOrWhiteSpace($KubernetesNamespace)) {
     $KubernetesNamespace = "video-$MessageTransport"
@@ -175,6 +181,7 @@ foreach ($project in $projects) {
     } else {
         $platformList = @($projectPlatforms.Split(',', [StringSplitOptions]::RemoveEmptyEntries) | ForEach-Object { $_.Trim() })
         $platformImages = @()
+        $dockerfileRelativePath = [IO.Path]::GetRelativePath($root, $dockerfile).Replace([IO.Path]::DirectorySeparatorChar, '/')
         foreach ($platform in $platformList) {
             $platformSuffix = $platform.Replace('linux/', '')
             $platformImage = "${imageName}:${ImageTag}-${platformSuffix}"
@@ -182,7 +189,7 @@ foreach ($project in $projects) {
                 "image=$platformImage",
                 "platform=$platform",
                 "targetArch=$platformSuffix",
-                "dockerfile=$($dockerfile.Substring($root.Length + 1).Replace('\', '/'))",
+                "dockerfile=$dockerfileRelativePath",
                 "project=$(if ($isRustWorker) { '' } else { $projectName })",
                 "appDll=$(if ($isRustWorker) { '' } else { "$projectName.dll" })",
                 "binary=$binary",
@@ -204,10 +211,17 @@ foreach ($project in $projects) {
             $platformImages += "${acrLoginServer}/${platformImage}"
         }
         if ($platformImages.Count -gt 1) {
-            az acr login --name $acrName
-            Assert-NativeCommandSucceeded "Logging in to Azure Container Registry '$acrName'"
-            docker buildx imagetools create --tag $fullImage @platformImages
-            Assert-NativeCommandSucceeded "Creating multi-platform manifest for $projectName"
+            $manifestArguments = @(
+                "acr", "run",
+                "--registry", $acrName,
+                "--file", "deploy/acr-manifest.yaml",
+                "--set", "image=${imageName}:${ImageTag}",
+                "--set", "amd64Image=${imageName}:${ImageTag}-amd64",
+                "--set", "arm64Image=${imageName}:${ImageTag}-arm64",
+                $root
+            )
+            az @manifestArguments
+            Assert-NativeCommandSucceeded "Creating multi-platform manifest for $projectName in Azure Container Registry"
         } else {
             az acr import `
                 --name $acrName `

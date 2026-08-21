@@ -1,3 +1,5 @@
+#!/usr/bin/env pwsh
+
 [CmdletBinding()]
 param(
     [string] $ResourceGroup = "$([Environment]::UserName)-video",
@@ -17,6 +19,11 @@ param(
 
 $ErrorActionPreference = "Stop"
 $workspaceRoot = Split-Path $PSScriptRoot -Parent
+$benchmarkScript = Join-Path $PSScriptRoot "benchmark-workflow.ps1"
+
+if ($PSVersionTable.PSVersion.Major -lt 7) {
+    throw "PowerShell 7 or later is required."
+}
 
 function Assert-NativeCommandSucceeded([string] $Operation) {
     if ($LASTEXITCODE -ne 0) {
@@ -59,10 +66,10 @@ function Set-MediaRuntimeImages([string] $LoginServer, [string] $DotNetTag, [str
 
 function Start-Benchmark([string] $Runtime, [string] $BatchId, [string] $ResultPath) {
     Start-Job -ScriptBlock {
-        param($Root, $Group, $MediaRuntime, $Transport, $Batch, $Path, $InheritedPath)
+        param($Root, $ScriptPath, $Group, $MediaRuntime, $Transport, $Batch, $Path, $InheritedPath)
         $env:PATH = $InheritedPath
         Set-Location $Root
-        & .\scripts\benchmark-workflow.ps1 `
+        & $ScriptPath `
             -ResourceGroup $Group `
             -Runs 1 `
             -UseSpot $true `
@@ -73,7 +80,7 @@ function Start-Benchmark([string] $Runtime, [string] $BatchId, [string] $ResultP
             -TimeoutMinutes 30 `
             -BatchId $Batch `
             -OutputPath $Path
-    } -ArgumentList $workspaceRoot, $ResourceGroup, $Runtime, $MessageTransport, $BatchId, $ResultPath, $env:PATH
+    } -ArgumentList $workspaceRoot, $benchmarkScript, $ResourceGroup, $Runtime, $MessageTransport, $BatchId, $ResultPath, $env:PATH
 }
 
 foreach ($command in @("az", "kubectl")) {
@@ -156,7 +163,7 @@ try {
             kubectl wait --namespace $KubernetesNamespace --for=create "job/$firstJobName" --timeout=10m | Out-Host
             Assert-NativeCommandSucceeded "Waiting for the first encode job"
 
-            & "$PSScriptRoot\benchmark-workflow.ps1" `
+            & $benchmarkScript `
                 -ResourceGroup $ResourceGroup `
                 -Runs 1 `
                 -UseSpot $true `

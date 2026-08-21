@@ -1,0 +1,13 @@
+version: v1.1.0
+stepTimeout: 600
+steps:
+  - id: create
+    cmd: >-
+      docker manifest create
+      $Registry/{{.Values.image}}
+      $Registry/{{.Values.amd64Image}}
+      $Registry/{{.Values.arm64Image}}
+  - id: push
+    cmd: docker manifest push --purge $Registry/{{.Values.image}}
+    when:
+      - create

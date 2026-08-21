@@ -28,6 +28,7 @@ Indexed encode Jobs use Spot nodes by default and tolerate eviction. A request c
 
 ## Prerequisites
 
+- PowerShell 7 or later on Windows or Linux
 - .NET 10 SDK for local builds
 - Azure CLI with the Bicep extension
 - `kubectl`
