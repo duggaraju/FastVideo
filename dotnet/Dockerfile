@@ -127,7 +127,7 @@ FROM ffmpeg-${FFMPEG_BUILD} AS ffmpeg-build
 
 FROM ${FFMPEG_IMAGE} AS ffmpeg
 
-FROM mcr.microsoft.com/dotnet/sdk:10.0-azurelinux3.0 AS build
+FROM --platform=${BUILDPLATFORM} mcr.microsoft.com/dotnet/sdk:10.0-azurelinux3.0 AS build
 ARG PROJECT
 ARG TARGETARCH
 WORKDIR /source

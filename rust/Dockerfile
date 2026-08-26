@@ -1,4 +1,4 @@
-ARG FFMPEG_BUILD=custom
+ARG FFMPEG_BUILD=btbn
 ARG FFMPEG_IMAGE=ffmpeg-build
 
 FROM mcr.microsoft.com/azurelinux/base/core:3.0 AS ffmpeg-btbn
@@ -127,13 +127,11 @@ FROM ffmpeg-${FFMPEG_BUILD} AS ffmpeg-build
 
 FROM ${FFMPEG_IMAGE} AS ffmpeg
 
-FROM rust:1.97.0-bookworm AS build
+FROM --platform=$BUILDPLATFORM rust:1.97.0-bookworm AS build
 RUN apt-get update \
-    && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends clang pkg-config \
+    && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
+        clang g++-aarch64-linux-gnu gcc-aarch64-linux-gnu libc6-dev-arm64-cross pkg-config \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=ffmpeg /opt/ffmpeg /opt/ffmpeg
-ENV PKG_CONFIG_PATH=/opt/ffmpeg/lib/pkgconfig \
-    LD_LIBRARY_PATH=/opt/ffmpeg/lib
 WORKDIR /source
 COPY rust/Cargo.toml rust/Cargo.lock ./
 RUN mkdir -p src/bin \
@@ -146,12 +144,22 @@ RUN mkdir -p src/bin \
     && cargo check --locked --all-targets --all-features \
     && rm -rf src
 COPY rust/src ./src
-RUN cargo test --locked --all-features \
-    && cargo build --locked --release --bins --all-features \
+RUN cargo test --locked --all-features
+ARG TARGETARCH
+RUN case "${TARGETARCH}" in \
+        amd64) rust_target=x86_64-unknown-linux-gnu; strip_command=strip ;; \
+        arm64) rust_target=aarch64-unknown-linux-gnu; strip_command=aarch64-linux-gnu-strip ;; \
+        *) echo "Unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+    && rustup target add "${rust_target}" \
+    && CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+        CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
+        CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++ \
+        cargo build --locked --release --bins --all-features --target "${rust_target}" \
     && install --directory /app \
     && for binary in analyzer completion encoder audio-encoder stitcher; do \
-        strip "target/release/${binary}"; \
-        cp "target/release/${binary}" "/app/${binary}"; \
+        "${strip_command}" "target/${rust_target}/release/${binary}"; \
+        cp "target/${rust_target}/release/${binary}" "/app/${binary}"; \
     done
 
 FROM mcr.microsoft.com/azurelinux/base/core:3.0 AS final
