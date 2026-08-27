@@ -1,50 +1,30 @@
-[package]
-name = "video"
+[workspace]
+members = [
+	"analyzer",
+	"audio-encoder",
+	"completion",
+	"encoder",
+	"stitcher",
+	"video-core",
+]
+resolver = "2"
+
+[workspace.package]
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 rust-version = "1.97"
 
-[features]
-default = []
-control-plane = ["dep:azure_core", "dep:azure_identity", "dep:azure_storage_queue", "dep:k8s-openapi", "dep:kube"]
-
-[dependencies]
+[workspace.dependencies]
 anyhow = "1.0"
-azure_core = { version = "1.0.0", optional = true }
-azure_identity = { version = "1.0.0", features = ["tokio"], optional = true }
-azure_storage_queue = { version = "1.0.0", optional = true }
-ffmpeg-sidecar = { version = "2.5.2", default-features = false }
-k8s-openapi = { version = "0.28.0", features = ["v1_34"], optional = true }
-kube = { version = "4.2.0", default-features = false, features = ["aws-lc-rs", "client", "rustls-tls"], optional = true }
-percent-encoding = "2.3"
-serde = { version = "1.0", features = ["derive"] }
+azure_core = "1.0.0"
+azure_identity = { version = "1.0.0", features = ["tokio"] }
+azure_storage_queue = "1.0.0"
+k8s-openapi = { version = "0.28.0", features = ["v1_34"] }
+kube = { version = "4.2.0", default-features = false, features = ["aws-lc-rs", "client", "rustls-tls"] }
 serde_json = "1.0"
-sha2 = "0.11"
 time = { version = "0.3", features = ["formatting"] }
 tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "signal", "time"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-url = { version = "2.5", features = ["serde"] }
+url = "2.5"
 uuid = { version = "1.18", features = ["v4"] }
-
-[[bin]]
-name = "analyzer"
-path = "src/bin/analyzer.rs"
-required-features = ["control-plane"]
-
-[[bin]]
-name = "completion"
-path = "src/bin/completion.rs"
-required-features = ["control-plane"]
-
-[[bin]]
-name = "encoder"
-path = "src/bin/encoder.rs"
-
-[[bin]]
-name = "audio-encoder"
-path = "src/bin/audio-encoder.rs"
-
-[[bin]]
-name = "stitcher"
-path = "src/bin/stitcher.rs"
+video = { package = "video-core", path = "video-core" }

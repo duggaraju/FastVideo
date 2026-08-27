@@ -8,8 +8,6 @@ param(
 
     [string] $Prefix = "video",
     [string] $ImageTag = "latest",
-    [string] $DotNetMediaImageTag,
-    [string] $RustMediaImageTag,
     [ValidateSet("dotnet", "rust")]
     [string] $MediaRuntime = "rust",
     [ValidateSet("storagequeue", "servicebus")]
@@ -19,7 +17,6 @@ param(
     [string] $FfmpegBuild = "btbn",
     [string] $FfmpegVersion = "9.0",
     [string] $Platforms = "linux/amd64,linux/arm64",
-    [string] $ControlPlanePlatforms = "linux/amd64",
     [ValidateRange(1, 2147483647)]
     [int] $MaxAudioDurationSeconds = 21600,
     [switch] $UseLocalDocker = $true,
@@ -103,135 +100,16 @@ if ($SkipInfrastructureDeployment -and
 
 $acrName = $deployment.acrName.value
 $acrLoginServer = $deployment.acrLoginServer.value
-if ([string]::IsNullOrWhiteSpace($DotNetMediaImageTag)) {
-    $DotNetMediaImageTag = $ImageTag
+$buildImageParameters = @{
+    AcrName = $acrName
+    ImageTag = $ImageTag
+    MessageTransport = $MessageTransport
+    FfmpegBuild = $FfmpegBuild
+    FfmpegVersion = $FfmpegVersion
+    Platforms = $Platforms
+    AcrBuild = -not $UseLocalDocker
 }
-if ([string]::IsNullOrWhiteSpace($RustMediaImageTag)) {
-    $RustMediaImageTag = $ImageTag
-}
-$projects = @("Analysis", "Completion", "Encoder", "AudioEncoder", "Stitcher")
-foreach ($project in $projects) {
-    $projectName = "Video$project"
-    $isControlPlaneWorker = $project -in @("Analysis", "Completion")
-    $imageName = if ($isControlPlaneWorker) {
-        "video-$($project.ToLowerInvariant())-$MessageTransport"
-    } elseif ($project -eq "AudioEncoder") {
-        "video-audio-encoder-$MediaRuntime"
-    } else {
-        "video-$($project.ToLowerInvariant())-$MediaRuntime"
-    }
-    $fullImage = "${acrLoginServer}/${imageName}:${ImageTag}"
-    $projectPlatforms = if ($isControlPlaneWorker) { $ControlPlanePlatforms } else { $Platforms }
-    $isRustWorker = ($isControlPlaneWorker -and $MessageTransport -eq "storagequeue") -or `
-        (-not $isControlPlaneWorker -and $MediaRuntime -eq "rust")
-    $dockerfile = Join-Path $root $(if ($isRustWorker) { "rust/Dockerfile" } else { "dotnet/Dockerfile" })
-    $binary = ""
-    $cargoFeatures = ""
-    $buildArguments = if ($isRustWorker) {
-        $binary = switch ($project) {
-            "Analysis" { "analyzer" }
-            "Completion" { "completion" }
-            "AudioEncoder" { "audio-encoder" }
-            default { $project.ToLowerInvariant() }
-        }
-        @(
-            "--build-arg", "BINARY=$binary",
-            "--build-arg", "FFMPEG_BUILD=$FfmpegBuild",
-            "--build-arg", "FFMPEG_VERSION=$FfmpegVersion"
-        )
-    } else {
-        @(
-            "--build-arg", "PROJECT=$projectName",
-            "--build-arg", "APP_DLL=$projectName.dll",
-            "--build-arg", "FFMPEG_BUILD=$FfmpegBuild",
-            "--build-arg", "FFMPEG_VERSION=$FfmpegVersion"
-        )
-    }
-    if ($isRustWorker -and $project -in @("Analysis", "Completion")) {
-        $cargoFeatures = "--features=control-plane"
-        $buildArguments += @("--build-arg", "CARGO_FEATURES=$cargoFeatures")
-    }
-    if ($UseLocalDocker) {
-        az acr login --name $acrName
-        Assert-NativeCommandSucceeded "Logging in to Azure Container Registry '$acrName'"
-        if ($projectPlatforms.Contains(',')) {
-            docker buildx build `
-            --platform $projectPlatforms `
-                --provenance=false `
-                --sbom=false `
-                --file $dockerfile `
-                @buildArguments `
-                --tag $fullImage `
-                --push `
-                $root
-            Assert-NativeCommandSucceeded "Building and pushing multi-platform $projectName image"
-        } else {
-            docker build `
-                --platform $projectPlatforms `
-                --provenance=false `
-                --sbom=false `
-                --file $dockerfile `
-                @buildArguments `
-                --tag $fullImage `
-                $root
-            Assert-NativeCommandSucceeded "Building $projectName image"
-            docker push $fullImage
-            Assert-NativeCommandSucceeded "Pushing $projectName image"
-        }
-    } else {
-        $platformList = @($projectPlatforms.Split(',', [StringSplitOptions]::RemoveEmptyEntries) | ForEach-Object { $_.Trim() })
-        $platformImages = @()
-        $dockerfileRelativePath = [IO.Path]::GetRelativePath($root, $dockerfile).Replace([IO.Path]::DirectorySeparatorChar, '/')
-        foreach ($platform in $platformList) {
-            $platformSuffix = $platform.Replace('linux/', '')
-            $platformImage = "${imageName}:${ImageTag}-${platformSuffix}"
-            $taskValues = @(
-                "image=$platformImage",
-                "platform=$platform",
-                "targetArch=$platformSuffix",
-                "dockerfile=$dockerfileRelativePath",
-                "project=$(if ($isRustWorker) { '' } else { $projectName })",
-                "appDll=$(if ($isRustWorker) { '' } else { "$projectName.dll" })",
-                "binary=$binary",
-                "cargoFeatures=$cargoFeatures",
-                "ffmpegBuild=$FfmpegBuild",
-                "ffmpegVersion=$FfmpegVersion"
-            )
-            $acrRunArguments = @(
-                "acr", "run",
-                "--registry", $acrName,
-                "--file", "deploy/acr-build.yaml"
-            )
-            foreach ($taskValue in $taskValues) {
-                $acrRunArguments += @("--set", $taskValue)
-            }
-            $acrRunArguments += $root
-            az @acrRunArguments
-            Assert-NativeCommandSucceeded "Building and pushing $projectName image for $platform with the Azure Container Registry task"
-            $platformImages += "${acrLoginServer}/${platformImage}"
-        }
-        if ($platformImages.Count -gt 1) {
-            $manifestArguments = @(
-                "acr", "run",
-                "--registry", $acrName,
-                "--file", "deploy/acr-manifest.yaml",
-                "--set", "image=${imageName}:${ImageTag}",
-                "--set", "amd64Image=${imageName}:${ImageTag}-amd64",
-                "--set", "arm64Image=${imageName}:${ImageTag}-arm64",
-                $root
-            )
-            az @manifestArguments
-            Assert-NativeCommandSucceeded "Creating multi-platform manifest for $projectName in Azure Container Registry"
-        } else {
-            az acr import `
-                --name $acrName `
-                --source $platformImages[0] `
-                --image "${imageName}:${ImageTag}" `
-                --force
-            Assert-NativeCommandSucceeded "Tagging $projectName image"
-        }
-    }
-}
+& (Join-Path $PSScriptRoot "build-images.ps1") @buildImageParameters
 
 az aks get-credentials `
     --resource-group $ResourceGroup `
@@ -254,8 +132,8 @@ $replacements = @{
     "__OUTPUT_STORAGE_CONTAINER__" = $deployment.outputContainerName.value
     "__ACR_LOGIN_SERVER__" = $acrLoginServer
     "__IMAGE_TAG__" = $ImageTag
-    "__DOTNET_MEDIA_IMAGE_TAG__" = $DotNetMediaImageTag
-    "__RUST_MEDIA_IMAGE_TAG__" = $RustMediaImageTag
+    "__DOTNET_MEDIA_IMAGE_TAG__" = $ImageTag
+    "__RUST_MEDIA_IMAGE_TAG__" = $ImageTag
     "__MEDIA_RUNTIME__" = $MediaRuntime
     "__KUBERNETES_NAMESPACE__" = $KubernetesNamespace
     "__MAX_AUDIO_DURATION_SECONDS__" = $MaxAudioDurationSeconds

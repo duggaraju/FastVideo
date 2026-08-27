@@ -1,0 +1,12 @@
+[package]
+name = "encoder"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+url.workspace = true
+uuid.workspace = true
+video.workspace = true

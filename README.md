@@ -56,8 +56,32 @@ Build a Rust worker image with the separate Dockerfile by selecting `encoder` or
 
 ```powershell
 docker build -f rust/Dockerfile `
-    --build-arg BINARY=encoder `
+    --build-arg PACKAGE=encoder `
     -t video-encoder-rust:latest .
+```
+
+Build the complete image set locally for the current machine architecture without Azure credentials or a registry push:
+
+```powershell
+./scripts/build-images.ps1 -ImageTag dev
+```
+
+To build both media architectures with local Docker and push them to ACR, provide the registry name:
+
+```powershell
+./scripts/build-images.ps1 `
+    -AcrName videoacr `
+    -ImageTag latest `
+    -Platforms linux/amd64,linux/arm64
+```
+
+Use ACR build agents instead of local Docker by adding `-AcrBuild`. The script submits each architecture through [deploy/acr-build.yaml](deploy/acr-build.yaml), then creates the multi-platform manifests with [deploy/acr-manifest.yaml](deploy/acr-manifest.yaml).
+
+```powershell
+./scripts/build-images.ps1 `
+    -AcrName videoacr `
+    -AcrBuild `
+    -Platforms linux/amd64,linux/arm64
 ```
 
 ## Deploy
@@ -95,7 +119,7 @@ To compile a specific FFmpeg release from the official GitHub mirror:
     -FfmpegVersion 9.0
 ```
 
-The script deploys [infra/main.bicep](infra/main.bicep), which creates or updates the selected broker and its RBAC assignments. Existing resources from the other mode are retained. It builds the corresponding Rust or .NET control-plane images, builds encoder and stitcher images for the selected media runtime, and combines the shared [deploy/k8s/video.yaml](deploy/k8s/video.yaml) resources with the selected transport manifest. Each transport deployment only applies and restarts resources in its own namespace, allowing both control planes to remain active. The AKS system pool hosts analysis and completion. Dedicated x64 Spot, ARM64 Spot, and regular media-processing pools autoscale from zero. Encoding and stitching use any available Spot media architecture unless `useSpot` is `false`; no architecture-specific application code or image tag is required.
+The script deploys [infra/main.bicep](infra/main.bicep), which creates or updates the selected broker and its RBAC assignments. Existing resources from the other mode are retained. It calls [scripts/build-images.ps1](scripts/build-images.ps1) to build the corresponding Rust or .NET control-plane images, build .NET and Rust encoder, audio encoder, and stitcher images for both `linux/amd64` and `linux/arm64`, and publish a multi-platform manifest for each media image. It then combines the shared [deploy/k8s/video.yaml](deploy/k8s/video.yaml) resources with the selected transport manifest. Each transport deployment only applies and restarts resources in its own namespace, allowing both control planes to remain active. The AKS system pool hosts analysis and completion. Dedicated x64 Spot, ARM64 Spot, and regular media-processing pools autoscale from zero. Encoding and stitching use any available Spot media architecture unless `useSpot` is `false`; no architecture-specific application code or image tag is required.
 
 The infrastructure also enables Container Insights with managed-identity authentication and retains container logs in Log Analytics for 30 days, including logs from pods deleted after KEDA scales a deployment to zero.
 

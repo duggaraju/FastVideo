@@ -128,23 +128,30 @@ FROM ffmpeg-${FFMPEG_BUILD} AS ffmpeg-build
 FROM ${FFMPEG_IMAGE} AS ffmpeg
 
 FROM --platform=$BUILDPLATFORM rust:1.97.0-bookworm AS build
+ARG PACKAGE
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
         clang g++-aarch64-linux-gnu gcc-aarch64-linux-gnu libc6-dev-arm64-cross pkg-config \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /source
 COPY rust/Cargo.toml rust/Cargo.lock ./
-RUN mkdir -p src/bin \
-    && printf '' > src/lib.rs \
-    && printf 'fn main() {}\n' > src/bin/analyzer.rs \
-    && printf 'fn main() {}\n' > src/bin/completion.rs \
-    && printf 'fn main() {}\n' > src/bin/encoder.rs \
-    && printf 'fn main() {}\n' > src/bin/audio-encoder.rs \
-    && printf 'fn main() {}\n' > src/bin/stitcher.rs \
-    && cargo check --locked --all-targets --all-features \
-    && rm -rf src
-COPY rust/src ./src
-RUN cargo test --locked --all-features
+COPY rust/analyzer/Cargo.toml analyzer/Cargo.toml
+COPY rust/audio-encoder/Cargo.toml audio-encoder/Cargo.toml
+COPY rust/completion/Cargo.toml completion/Cargo.toml
+COPY rust/encoder/Cargo.toml encoder/Cargo.toml
+COPY rust/stitcher/Cargo.toml stitcher/Cargo.toml
+COPY rust/video-core/Cargo.toml video-core/Cargo.toml
+RUN mkdir -p analyzer/src audio-encoder/src completion/src encoder/src stitcher/src video-core/src \
+    && printf '' > video-core/src/lib.rs \
+    && printf 'fn main() {}\n' > analyzer/src/main.rs \
+    && printf 'fn main() {}\n' > audio-encoder/src/main.rs \
+    && printf 'fn main() {}\n' > completion/src/main.rs \
+    && printf 'fn main() {}\n' > encoder/src/main.rs \
+    && printf 'fn main() {}\n' > stitcher/src/main.rs \
+    && cargo check --locked --package "${PACKAGE}" \
+    && rm -rf analyzer/src audio-encoder/src completion/src encoder/src stitcher/src video-core/src
+COPY rust/ .
+RUN cargo test --locked --package "${PACKAGE}"
 ARG TARGETARCH
 RUN case "${TARGETARCH}" in \
         amd64) rust_target=x86_64-unknown-linux-gnu; strip_command=strip ;; \
@@ -155,15 +162,13 @@ RUN case "${TARGETARCH}" in \
     && CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
         CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
         CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++ \
-        cargo build --locked --release --bins --all-features --target "${rust_target}" \
+        cargo build --locked --release --package "${PACKAGE}" --target "${rust_target}" \
     && install --directory /app \
-    && for binary in analyzer completion encoder audio-encoder stitcher; do \
-        "${strip_command}" "target/${rust_target}/release/${binary}"; \
-        cp "target/${rust_target}/release/${binary}" "/app/${binary}"; \
-    done
+    && "${strip_command}" "target/${rust_target}/release/${PACKAGE}" \
+    && cp "target/${rust_target}/release/${PACKAGE}" "/app/${PACKAGE}"
 
 FROM mcr.microsoft.com/azurelinux/base/core:3.0 AS final
-ARG BINARY
+ARG PACKAGE
 RUN tdnf install --assumeyes ca-certificates shadow-utils \
     && tdnf clean all \
     && groupadd --system --gid 1654 app \
@@ -171,7 +176,7 @@ RUN tdnf install --assumeyes ca-certificates shadow-utils \
 COPY --from=ffmpeg /opt/ffmpeg/bin/ffmpeg /opt/ffmpeg/bin/ffprobe /opt/ffmpeg/bin/
 COPY --from=ffmpeg /opt/ffmpeg/lib /opt/ffmpeg/lib
 COPY --from=ffmpeg /opt/ffmpeg/share/vmaf/vmaf_v0.6.1.json /opt/ffmpeg/share/vmaf/vmaf_v0.6.1.json
-COPY --from=build /app/${BINARY} /app/video
+COPY --from=build /app/${PACKAGE} /app/video
 ENV PATH="/opt/ffmpeg/bin:${PATH}" \
     LD_LIBRARY_PATH="/opt/ffmpeg/lib" \
     RUST_LOG=video=info

@@ -130,11 +130,12 @@ FROM ${FFMPEG_IMAGE} AS ffmpeg
 FROM --platform=${BUILDPLATFORM} mcr.microsoft.com/dotnet/sdk:10.0-azurelinux3.0 AS build
 ARG PROJECT
 ARG TARGETARCH
+ARG NUGET_SOURCE=https://api.nuget.org/v3/index.json
 WORKDIR /source
 COPY Directory.Build.props Directory.Packages.props global.json ./
 COPY dotnet/VideoContracts/VideoContracts.csproj dotnet/VideoContracts/
 COPY dotnet/${PROJECT}/${PROJECT}.csproj dotnet/${PROJECT}/
-RUN dotnet restore "dotnet/${PROJECT}/${PROJECT}.csproj" -a "${TARGETARCH}"
+RUN dotnet restore "dotnet/${PROJECT}/${PROJECT}.csproj" -a "${TARGETARCH}" --source "${NUGET_SOURCE}"
 COPY dotnet/ dotnet/
 RUN dotnet publish "dotnet/${PROJECT}/${PROJECT}.csproj" --no-restore -c Release -a "${TARGETARCH}" -o /app
 

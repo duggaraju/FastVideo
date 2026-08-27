@@ -8,8 +8,7 @@ steps:
       --build-arg TARGETARCH={{.Values.targetArch}}
       --build-arg PROJECT={{.Values.project}}
       --build-arg APP_DLL={{.Values.appDll}}
-      --build-arg BINARY={{.Values.binary}}
-      --build-arg CARGO_FEATURES={{.Values.cargoFeatures}}
+      --build-arg PACKAGE={{.Values.package}}
       --build-arg FFMPEG_BUILD={{.Values.ffmpegBuild}}
       --build-arg FFMPEG_VERSION={{.Values.ffmpegVersion}}
       --tag $Registry/{{.Values.image}}
