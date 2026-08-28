@@ -77,6 +77,16 @@ data:
   Encoding__MinParallelismPerJob: "2"
   Encoding__MaxAudioDurationSeconds: "__MAX_AUDIO_DURATION_SECONDS__"
   Encoding__ParallelizationStrategy: "fixed-duration"
+  Encoding__LadderProfilesPath: "/etc/video/ladder/ladder-profiles.json"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: video-ladder-profiles
+  namespace: __KUBERNETES_NAMESPACE__
+data:
+  ladder-profiles.json: |-
+__LADDER_PROFILES_JSON__
 ---
 apiVersion: keda.sh/v1alpha1
 kind: TriggerAuthentication

@@ -127,13 +127,14 @@ FROM ffmpeg-${FFMPEG_BUILD} AS ffmpeg-build
 
 FROM ${FFMPEG_IMAGE} AS ffmpeg
 
-FROM --platform=$BUILDPLATFORM rust:1.97.0-bookworm AS build
+FROM --platform=$BUILDPLATFORM rust:1.98.0-bookworm AS build
 ARG PACKAGE
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
         clang g++-aarch64-linux-gnu gcc-aarch64-linux-gnu libc6-dev-arm64-cross pkg-config \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /source
+COPY deploy/ladder-profiles.json /deploy/ladder-profiles.json
 COPY rust/Cargo.toml rust/Cargo.lock ./
 COPY rust/analyzer/Cargo.toml analyzer/Cargo.toml
 COPY rust/audio-encoder/Cargo.toml audio-encoder/Cargo.toml

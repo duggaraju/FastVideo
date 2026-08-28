@@ -122,6 +122,18 @@ $serviceBusShortName = if ([string]::IsNullOrWhiteSpace($serviceBusNamespace)) {
 $manifest = (Get-Content (Join-Path $root "deploy/k8s/video.yaml") -Raw) + `
     "`n---`n" + `
     (Get-Content (Join-Path $root "deploy/k8s/video-$MessageTransport.yaml") -Raw)
+$ladderProfilesPath = Join-Path $root "deploy/ladder-profiles.json"
+try {
+    $ladderProfiles = Get-Content $ladderProfilesPath -Raw | ConvertFrom-Json
+} catch {
+    throw "Ladder profile configuration '$ladderProfilesPath' is not valid JSON: $($_.Exception.Message)"
+}
+if ($null -eq $ladderProfiles.rungs -or $null -eq $ladderProfiles.presets -or
+    @($ladderProfiles.rungs.PSObject.Properties).Count -eq 0 -or
+    @($ladderProfiles.presets.PSObject.Properties).Count -eq 0) {
+    throw "Ladder profile configuration '$ladderProfilesPath' must contain non-empty 'rungs' and 'presets' objects."
+}
+$ladderProfilesJson = (Get-Content $ladderProfilesPath) | ForEach-Object { "    $_" } | Join-String -Separator "`n"
 $replacements = @{
     "__WORKLOAD_CLIENT_ID__" = $deployment.workloadClientId.value
     "__SERVICE_BUS_NAMESPACE__" = $serviceBusNamespace
@@ -137,6 +149,7 @@ $replacements = @{
     "__MEDIA_RUNTIME__" = $MediaRuntime
     "__KUBERNETES_NAMESPACE__" = $KubernetesNamespace
     "__MAX_AUDIO_DURATION_SECONDS__" = $MaxAudioDurationSeconds
+    "__LADDER_PROFILES_JSON__" = $ladderProfilesJson
 }
 foreach ($replacement in $replacements.GetEnumerator()) {
     $manifest = $manifest.Replace($replacement.Key, $replacement.Value)

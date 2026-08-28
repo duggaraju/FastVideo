@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use azure_core::credentials::TokenCredential;
 use azure_core::http::Url;
 use azure_identity::{DeveloperToolsCredential, WorkloadIdentityCredential};
@@ -13,9 +13,9 @@ use std::time::Duration;
 use video::{
     config,
     contracts::{
-        job_name, VideoManifest, VideoSubmitted, AUDIO_BLOB_NAME_ANNOTATION,
-        AUDIO_ENCODING_REQUIRED_ANNOTATION, CALCULATE_VMAF_ANNOTATION, JOB_ID_ANNOTATION,
-        MEDIA_RUNTIME_ANNOTATION, OUTPUT_PATH_ANNOTATION, OUTPUT_TYPE_ANNOTATION,
+        AUDIO_BLOB_NAME_ANNOTATION, AUDIO_ENCODING_REQUIRED_ANNOTATION, CALCULATE_VMAF_ANNOTATION,
+        JOB_ID_ANNOTATION, MEDIA_RUNTIME_ANNOTATION, OUTPUT_PATH_ANNOTATION,
+        OUTPUT_TYPE_ANNOTATION, VideoEncodingProfile, VideoManifest, VideoSubmitted, job_name,
     },
     media, parallelism, paths,
 };
@@ -35,6 +35,8 @@ struct AnalyzerConfig {
     max_parallelism: i32,
     min_parallelism_per_job: i32,
     max_audio_duration_seconds: u32,
+    ladder_profiles_path: Option<std::path::PathBuf>,
+    ladder_profiles_json: Option<String>,
     default_parallelization_strategy: String,
     default_media_runtime: String,
     receive_visibility_timeout_seconds: i32,
@@ -141,7 +143,9 @@ impl AnalyzerConfig {
         if renew_interval_seconds < 1
             || renew_interval_seconds >= receive_visibility_timeout_seconds
         {
-            bail!("Storage__QueueVisibilityRenewalSeconds must be positive and less than Storage__QueueVisibilityTimeoutSeconds");
+            bail!(
+                "Storage__QueueVisibilityRenewalSeconds must be positive and less than Storage__QueueVisibilityTimeoutSeconds"
+            );
         }
 
         let receive_poll_interval_seconds = config::setting("Storage__QueuePollSeconds", "3")
@@ -165,6 +169,11 @@ impl AnalyzerConfig {
             max_parallelism,
             min_parallelism_per_job,
             max_audio_duration_seconds,
+            ladder_profiles_path: std::env::var("Encoding__LadderProfilesPath")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(Into::into),
+            ladder_profiles_json: std::env::var("Encoding__LadderProfiles").ok(),
             default_parallelization_strategy: config::setting(
                 "Encoding__ParallelizationStrategy",
                 "fixed-duration",
@@ -177,6 +186,20 @@ impl AnalyzerConfig {
                 .context("Storage__QueueVisibilityRenew is invalid")?,
             renew_interval_seconds,
         })
+    }
+
+    fn load_ladder_profiles(&self) -> Result<Option<String>> {
+        if let Some(path) = &self.ladder_profiles_path {
+            return std::fs::read_to_string(path)
+                .with_context(|| {
+                    format!(
+                        "Could not read Encoding__LadderProfilesPath '{}'",
+                        path.display()
+                    )
+                })
+                .map(Some);
+        }
+        Ok(self.ladder_profiles_json.clone())
     }
 }
 
@@ -345,13 +368,16 @@ async fn process_submission(
         request.segment_duration_seconds,
     );
 
-    let profile = media::select_profile(
+    let ladder_profiles_json = cfg.load_ladder_profiles()?;
+    let profiles = media::select_profiles(
         &media_info,
         &request.video_codec,
         request.preset.clone(),
+        request.encoder_preset.clone(),
         request.crf,
         request.max_video_bitrate_kbps,
-    );
+        ladder_profiles_json.as_deref(),
+    )?;
 
     let audio_encoding_required = !request.audio_codec.eq_ignore_ascii_case("copy");
     if !audio_encoding_required {
@@ -405,9 +431,22 @@ async fn process_submission(
         segments,
         video_codec: request.video_codec.clone(),
         audio_codec: request.audio_codec.clone(),
-        preset: profile.preset,
-        crf: profile.crf,
-        max_video_bitrate_kbps: profile.max_video_bitrate_kbps,
+        preset: media::is_configured_ladder_preset(
+            request.preset.as_deref(),
+            ladder_profiles_json.as_deref(),
+        )
+        .then(|| request.preset.as_ref().unwrap().to_ascii_lowercase()),
+        encoding_profiles: profiles
+            .iter()
+            .map(|profile| VideoEncodingProfile {
+                name: profile.name.clone(),
+                width: profile.width,
+                height: profile.height,
+                encoder_preset: profile.preset.clone(),
+                crf: profile.crf,
+                max_video_bitrate_kbps: profile.max_video_bitrate_kbps,
+            })
+            .collect(),
         use_spot: request.use_spot,
         calculate_vmaf: request.calculate_vmaf,
         output_type: output_type.to_owned(),
@@ -583,9 +622,6 @@ async fn submit_encoding_job(
                                 { "name": "JOB_ID", "value": manifest.job_id },
                                 { "name": "SOURCE_VIDEO_URI", "value": manifest.input_video_uri.to_string() },
                                 { "name": "VIDEO_CODEC", "value": manifest.video_codec },
-                                { "name": "PRESET", "value": manifest.preset },
-                                { "name": "CRF", "value": manifest.crf.to_string() },
-                                { "name": "MAX_VIDEO_BITRATE_KBPS", "value": manifest.max_video_bitrate_kbps.to_string() },
                                 { "name": "CALCULATE_VMAF", "value": if manifest.calculate_vmaf { "true" } else { "false" } },
                                 { "name": "INPUT_STORAGE_ACCOUNT_NAME", "value": cfg.input_storage_account },
                                 { "name": "INPUT_STORAGE_CONTAINER", "value": cfg.input_storage_container },
@@ -779,6 +815,11 @@ fn validate_submission(request: &VideoSubmitted) -> Result<()> {
         .is_some_and(|value| !(64..=100_000).contains(&value))
     {
         bail!("MaxVideoBitrateKbps must be between 64 and 100000");
+    }
+    if request.preset.as_deref().is_some_and(|value| {
+        value.to_ascii_lowercase().starts_with("max") && !media::is_ladder_preset(Some(value))
+    }) {
+        bail!("Preset must be max4k or max<height>p, for example max1080p");
     }
     if request.audio_codec.trim().is_empty() {
         bail!("AudioCodec is required");

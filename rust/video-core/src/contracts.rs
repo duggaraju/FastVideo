@@ -33,6 +33,7 @@ pub struct VideoSubmitted {
     #[serde(default = "default_audio_codec")]
     pub audio_codec: String,
     pub preset: Option<String>,
+    pub encoder_preset: Option<String>,
     pub crf: Option<u32>,
     pub max_video_bitrate_kbps: Option<u32>,
     #[serde(default = "default_true")]
@@ -71,18 +72,33 @@ pub struct VideoManifest {
     pub video_codec: String,
     #[serde(alias = "AudioCodec")]
     pub audio_codec: String,
-    #[serde(alias = "Preset")]
-    pub preset: String,
-    #[serde(alias = "Crf")]
-    pub crf: u32,
-    #[serde(alias = "MaxVideoBitrateKbps")]
-    pub max_video_bitrate_kbps: u32,
+    #[serde(alias = "Preset", default)]
+    pub preset: Option<String>,
+    #[serde(alias = "EncodingProfiles")]
+    pub encoding_profiles: Vec<VideoEncodingProfile>,
     #[serde(alias = "UseSpot")]
     pub use_spot: bool,
     #[serde(alias = "CalculateVmaf")]
     pub calculate_vmaf: bool,
     #[serde(alias = "OutputType", default = "default_output_type")]
     pub output_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoEncodingProfile {
+    #[serde(alias = "Name")]
+    pub name: String,
+    #[serde(alias = "Width")]
+    pub width: i32,
+    #[serde(alias = "Height")]
+    pub height: i32,
+    #[serde(alias = "EncoderPreset")]
+    pub encoder_preset: String,
+    #[serde(alias = "Crf")]
+    pub crf: u32,
+    #[serde(alias = "MaxVideoBitrateKbps")]
+    pub max_video_bitrate_kbps: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -186,9 +202,15 @@ mod tests {
                 "Segments":[{"Index":0,"StartSeconds":0.0,"DurationSeconds":60.0}],
                 "VideoCodec":"libsvtav1",
                 "AudioCodec":"copy",
-                "Preset":"8",
-                "Crf":32,
-                "MaxVideoBitrateKbps":4000,
+                "Preset":"max1080p",
+                "EncodingProfiles":[{
+                    "Name":"1080p",
+                    "Width":1920,
+                    "Height":1080,
+                    "EncoderPreset":"8",
+                    "Crf":32,
+                    "MaxVideoBitrateKbps":4000
+                }],
                 "UseSpot":true,
                 "CalculateVmaf":false
             }"#,
@@ -197,6 +219,7 @@ mod tests {
 
         assert_eq!(manifest.job_id, "job-1");
         assert_eq!(manifest.segments[0].duration_seconds, 60.0);
+        assert_eq!(manifest.encoding_profiles[0].name, "1080p");
     }
 
     #[test]

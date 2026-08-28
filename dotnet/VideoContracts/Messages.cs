@@ -15,6 +15,35 @@ public static class VideoOutputTypes
     };
 }
 
+public static class VideoLadderPresets
+{
+    public const string Max4K = "max4k";
+    public const string Max1440P = "max1440p";
+    public const string Max1080P = "max1080p";
+    public const string Max720P = "max720p";
+    public const string Max480P = "max480p";
+    public const string Max360P = "max360p";
+
+    public static bool IsLadder(string? value) => TryGetMaximumHeight(value, out _);
+
+    public static bool TryGetMaximumHeight(string? value, out int height)
+    {
+        var normalized = value?.Trim().ToLowerInvariant();
+        if (normalized == Max4K)
+        {
+            height = 2160;
+            return true;
+        }
+        if (normalized is not null && normalized.StartsWith("max", StringComparison.Ordinal) && normalized.EndsWith('p') &&
+            int.TryParse(normalized.AsSpan(3, normalized.Length - 4), out height) && height > 0)
+        {
+            return true;
+        }
+        height = 0;
+        return false;
+    }
+}
+
 public sealed record VideoSubmitted(
     string JobId,
     Uri InputVideoUri,
@@ -23,6 +52,7 @@ public sealed record VideoSubmitted(
     string VideoCodec = "libsvtav1",
     string AudioCodec = "copy",
     string? Preset = null,
+    string? EncoderPreset = null,
     int? Crf = null,
     int? MaxVideoBitrateKbps = null,
     bool UseSpot = true,
@@ -44,13 +74,20 @@ public sealed record VideoManifest(
     IReadOnlyList<VideoSegment> Segments,
     string VideoCodec,
     string AudioCodec,
-    string Preset,
-    int Crf,
-    int MaxVideoBitrateKbps,
+    string? Preset,
+    IReadOnlyList<VideoEncodingProfile> EncodingProfiles,
     bool UseSpot,
     bool CalculateVmaf,
     string MediaRuntime,
     string OutputType);
+
+public sealed record VideoEncodingProfile(
+    string Name,
+    int Width,
+    int Height,
+    string EncoderPreset,
+    int Crf,
+    int MaxVideoBitrateKbps);
 
 public sealed record VideoSegment(
     int Index,

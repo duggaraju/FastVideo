@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use azure_core::credentials::TokenCredential;
 use azure_core::http::Url;
 use azure_identity::{DeveloperToolsCredential, WorkloadIdentityCredential};
@@ -12,10 +12,9 @@ use std::sync::Arc;
 use video::{
     config,
     contracts::{
-        job_name, VideoProcessingResult, AUDIO_BLOB_NAME_ANNOTATION,
-        AUDIO_ENCODING_REQUIRED_ANNOTATION, CALCULATE_VMAF_ANNOTATION, JOB_ID_ANNOTATION,
-        MEDIA_RUNTIME_ANNOTATION, OUTPUT_PATH_ANNOTATION, OUTPUT_TYPE_ANNOTATION,
-        RESULT_REPORTED_ANNOTATION,
+        AUDIO_BLOB_NAME_ANNOTATION, AUDIO_ENCODING_REQUIRED_ANNOTATION, CALCULATE_VMAF_ANNOTATION,
+        JOB_ID_ANNOTATION, MEDIA_RUNTIME_ANNOTATION, OUTPUT_PATH_ANNOTATION,
+        OUTPUT_TYPE_ANNOTATION, RESULT_REPORTED_ANNOTATION, VideoProcessingResult, job_name,
     },
     parallelism,
 };
@@ -215,10 +214,9 @@ async fn reconcile_once(
                 if let Err(error) = jobs
                     .delete(&producer_job_name, &DeleteParams::background())
                     .await
+                    && !is_not_found(&error)
                 {
-                    if !is_not_found(&error) {
-                        return Err(error).context("Failed to delete completed producer job");
-                    }
+                    return Err(error).context("Failed to delete completed producer job");
                 }
             }
         }

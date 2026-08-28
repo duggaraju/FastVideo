@@ -139,7 +139,13 @@ Azure RBAC can take several minutes to propagate after first deployment. If the 
 
 Send the JSON shape in [samples/video-submitted.json](samples/video-submitted.json) to the selected broker's `video-submitted` queue. `inputVideoUri` and `outputPath` must be HTTPS blob URLs. `outputPath` includes a base filename without an extension. The URLs can target different storage accounts and should match the input/output BlobFuse mounts configured in deployment.
 
-When encoding parameters are omitted, analysis uses the source codec, bitrate, resolution, and frame rate to select CRF, preset, and a maximum video bitrate. The default target codec is `libsvtav1`. Optional `crf`, `preset`, and `maxVideoBitrateKbps` values override the corresponding automatic choices.
+When encoding parameters are omitted, analysis creates one output at the source resolution and uses the source codec, bitrate, resolution, and frame rate to select CRF, encoder speed preset, and maximum video bitrate. The default target codec is `libsvtav1`.
+
+Set the optional `preset` message property to a ladder ceiling such as `max4k`, `max1440p`, `max1080p`, `max720p`, `max480p`, or `max360p`. Generic `max<height>p` values are also supported. The analyzer selects every configured rung at or below both that ceiling and the input dimensions, so it never upscales. Each segment worker encodes all selected resolutions; the stitcher independently publishes `<outputPath>-1080p.mp4`, `<outputPath>-720p.mp4`, and so on. Without a ladder preset, the existing `<outputPath>.mp4` naming is retained.
+
+Optional `crf`, `encoderPreset`, and `maxVideoBitrateKbps` fields customize encoding. `maxVideoBitrateKbps` is a ceiling, not a replacement for every rung's configured target. The highest profile is capped at the detected input bitrate (including the existing target-codec efficiency adjustment), and every lower-resolution profile is guaranteed to use a lower maximum bitrate. For backward compatibility, a non-ladder value in `preset` is treated as the encoder speed preset; new clients should use `encoderPreset` for that purpose.
+
+Ladder rungs and named presets are deployment configuration in [deploy/ladder-profiles.json](deploy/ladder-profiles.json). A `bounded` preset selects shared rungs at or below its resolution and bitrate ceilings; its optional `rungs` array can restrict which shared rungs are eligible. A `custom` preset declares an exact `renditions` array. Each custom rendition can reference a shared rung with `{ "rung": "720p" }`, optionally override its name, dimensions, or bitrate, or define all fields inline. Source-dimension and source-bitrate safeguards apply to both preset types. The deployment script validates the JSON, embeds it in the `video-ladder-profiles` ConfigMap, and mounts it read-only at `/etc/video/ladder/ladder-profiles.json` in both analyzers. Add, remove, or retune rungs and presets without changing or rebuilding application code. The analyzers read the projected file for each submission, while `Encoding__LadderProfiles` remains available as an inline JSON fallback for local deployments.
 
 `useSpot` is optional and defaults to `true`. Set it to `false` to schedule all indexes for that video on the regular encoding pool. `calculateVmaf` is optional and defaults to `false`. When enabled, every encoder compares its output with the matching source interval. The final `.vmaf.json` beside the output video contains the overall unweighted arithmetic mean and an ordered `Segments` array with the `Index` and `Score` for every segment.
 
@@ -175,6 +181,16 @@ The script discovers the latest successful deployment, creates a transport/VMAF-
     -CalculateVmaf `
     -TimeoutMinutes 90
 ```
+
+Use `-OutputVideoUri` to select the deployed output container and an optional virtual-directory prefix. By default, the job ID is appended as another prefix so each workflow's files remain grouped. Set `-UseJobIdAsPrefix $false` to omit it:
+
+```powershell
+./scripts/test-workflow.ps1 `
+    -OutputVideoUri "https://videoout.blob.core.windows.net/videos/validation" `
+    -UseJobIdAsPrefix $false
+```
+
+For an input named `sample.mp4`, this writes final artifacts with the base path `validation/sample`; manifests and intermediate segments remain under the workflow's job-ID prefix.
 
 Use `-MediaRuntime dotnet` or `-MediaRuntime rust` to select the encoder and stitcher implementation. Message transport is independent: `-MessageTransport auto` follows the deployment's selected transport. Pass `storagequeue` or `servicebus` explicitly to require a matching deployment.
 
@@ -247,10 +263,13 @@ Intermediate output is written under the job prefix until stitching succeeds:
 ```text
 videos/{jobId}/manifest.json
 videos/{jobId}/segments/audio.m4a
-videos/{jobId}/segments/000000.mp4
-videos/{jobId}/segments/000000.vmaf.json (when requested)
-videos/{jobId}/segments/000001.mp4
+videos/{jobId}/segments/000000-1080p.mp4
+videos/{jobId}/segments/000000-1080p.vmaf.json (when requested)
+videos/{jobId}/segments/000000-720p.mp4
+videos/{jobId}/segments/000001-1080p.mp4
 videos/{output-base}.mp4 (when outputType is mp4 or both)
+videos/{output-base}-1080p.mp4 (for a ladder request)
+videos/{output-base}-720p.mp4 (for a ladder request)
 videos/{output-base}.mpd (when outputType is cmaf or both)
 videos/{output-base}.m3u8 (when outputType is cmaf or both)
 videos/{output-base}-stream*.m3u8 (when outputType is cmaf or both)

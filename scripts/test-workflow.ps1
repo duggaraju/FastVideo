@@ -11,6 +11,8 @@ param(
     [string] $AudioCodec = "copy",
     [ValidateSet("mp4", "cmaf", "both")]
     [string] $OutputType = "mp4",
+    [ValidateSet("max4k", "max2160p", "max1440p", "max1080p", "max720p", "max480p", "max360p")]
+    [string] $Preset,
     [Nullable[int]] $Crf,
     [Nullable[int]] $MaxVideoBitrateKbps,
     [bool] $UseSpot = $true,
@@ -22,6 +24,8 @@ param(
     [ValidateSet("auto", "storagequeue", "servicebus")]
     [string] $MessageTransport = "auto",
     [string] $KubernetesNamespace,
+    [uri] $OutputVideoUri ="https://videooutsoudinndket2a.blob.core.windows.net/videos",
+    [bool] $UseJobIdAsPrefix = $true,
     [string] $JobId,
     [ValidateRange(1, 1440)]
     [int] $TimeoutMinutes = 60,
@@ -109,12 +113,20 @@ az storage blob show `
     --output none
 Assert-NativeCommandSucceeded "Verifying the input blob"
 
-az aks get-credentials `
-    --resource-group $ResourceGroup `
-    --name $deployment.aksName.value `
-    --overwrite-existing `
-    --output none
-Assert-NativeCommandSucceeded "Getting AKS credentials"
+$aksName = [string]$deployment.aksName.value
+$currentCluster = kubectl config view --minify --output "jsonpath={.contexts[0].context.cluster}" 2>$null
+$kubectlReady = $LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($currentCluster) -and
+    (kubectl get namespace $KubernetesNamespace --request-timeout=10s --output name 2>$null)
+if (-not $kubectlReady) {
+    az aks get-credentials `
+        --resource-group $ResourceGroup `
+        --name $aksName `
+        --overwrite-existing `
+        --output none
+    Assert-NativeCommandSucceeded "Getting AKS credentials"
+} else {
+    Write-Host "Using the current working kubectl context for AKS cluster '$aksName'."
+}
 
 if ([string]::IsNullOrWhiteSpace($JobId)) {
     $vmafSuffix = if ($CalculateVmaf) { "vmaf" } else { "no-vmaf" }
@@ -123,8 +135,34 @@ if ([string]::IsNullOrWhiteSpace($JobId)) {
 $jobId = $JobId
 $outputStorageAccount = $deployment.outputStorageName.value
 $outputContainer = $deployment.outputContainerName.value
-$outputBlobName = "$jobId.mp4"
-$outputBaseUri = "https://$outputStorageAccount.blob.core.windows.net/$outputContainer/$jobId"
+$configuredOutputUri = if ($null -eq $OutputVideoUri) {
+    [uri]"https://$outputStorageAccount.blob.core.windows.net/$outputContainer"
+} else {
+    $OutputVideoUri
+}
+$outputUriPath = $configuredOutputUri.AbsolutePath.Trim('/').Split('/', 2)
+if ($configuredOutputUri.Scheme -ne "https" -or
+    -not $configuredOutputUri.Host.Equals("$outputStorageAccount.blob.core.windows.net", [StringComparison]::OrdinalIgnoreCase) -or
+    $outputUriPath.Count -lt 1 -or
+    -not $outputUriPath[0].Equals($outputContainer, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "OutputVideoUri must identify the deployed HTTPS output container 'https://$outputStorageAccount.blob.core.windows.net/$outputContainer', optionally followed by a blob prefix."
+}
+$configuredOutputPrefix = if ($outputUriPath.Count -eq 2) {
+    [uri]::UnescapeDataString($outputUriPath[1]).Trim('/')
+} else {
+    ""
+}
+$outputFileBaseName = [IO.Path]::GetFileNameWithoutExtension($inputBlobName)
+if ([string]::IsNullOrWhiteSpace($outputFileBaseName)) {
+    throw "InputVideoUri must identify a file with a non-empty basename."
+}
+$outputPathParts = @(
+    $configuredOutputPrefix
+    $(if ($UseJobIdAsPrefix) { $jobId })
+    $outputFileBaseName
+) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+$artifactBaseNameWithoutProfile = $outputPathParts -join '/'
+$outputBaseUri = "https://$outputStorageAccount.blob.core.windows.net/$outputContainer/$artifactBaseNameWithoutProfile"
 az storage container show `
     --account-name $outputStorageAccount `
     --name $outputContainer `
@@ -149,6 +187,9 @@ if ($null -ne $Crf) {
     if ($Crf -lt 0 -or $Crf -gt 63) { throw "Crf must be between 0 and 63." }
     $payload.crf = [int]$Crf
 }
+if (-not [string]::IsNullOrWhiteSpace($Preset)) {
+    $payload.preset = $Preset
+}
 if ($null -ne $MaxVideoBitrateKbps) {
     if ($MaxVideoBitrateKbps -lt 64 -or $MaxVideoBitrateKbps -gt 100000) { throw "MaxVideoBitrateKbps must be between 64 and 100000." }
     $payload.maxVideoBitrateKbps = [int]$MaxVideoBitrateKbps
@@ -159,10 +200,13 @@ if ($Architecture -ne "auto") {
 $payload = $payload | ConvertTo-Json -Compress
 if ($MessageTransport -eq "storagequeue") {
     Write-Host "Submitting $jobId to $outputStorageAccount/video-submitted with mediaRuntime=$MediaRuntime"
+    # az.cmd uses legacy native argument parsing on Windows, which otherwise strips
+    # JSON quotes and produces an invalid payload such as {jobId:value}.
+    $queuePayload = if ($IsWindows) { $payload.Replace('"', '\"') } else { $payload }
     az storage message put `
         --account-name $outputStorageAccount `
         --queue-name video-submitted `
-        --content $payload `
+        --content $queuePayload `
         --auth-mode login `
         --only-show-errors `
         --output none
@@ -186,6 +230,57 @@ if ($MessageTransport -eq "storagequeue") {
 Assert-NativeCommandSucceeded "Submitting the video"
 
 $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
+$manifestBlobName = "$jobId/manifest.json"
+$manifestTempPath = Join-Path ([IO.Path]::GetTempPath()) "$jobId-manifest.json"
+try {
+    do {
+        $manifestExists = az storage blob exists `
+            --account-name $outputStorageAccount `
+            --container-name $outputContainer `
+            --name $manifestBlobName `
+            --auth-mode login `
+            --query exists `
+            --output tsv `
+            --only-show-errors
+        Assert-NativeCommandSucceeded "Checking for the analysis manifest"
+        if ($manifestExists -eq "true") { break }
+        if ((Get-Date) -ge $deadline) {
+            throw "Timed out waiting for analysis manifest '$manifestBlobName'."
+        }
+        Start-Sleep -Seconds $PollSeconds
+    } while ($true)
+
+    az storage blob download `
+        --account-name $outputStorageAccount `
+        --container-name $outputContainer `
+        --name $manifestBlobName `
+        --file $manifestTempPath `
+        --auth-mode login `
+        --overwrite `
+        --only-show-errors `
+        --output none
+    Assert-NativeCommandSucceeded "Downloading the analysis manifest"
+    $manifest = Get-Content -Raw $manifestTempPath | ConvertFrom-Json
+} finally {
+    Remove-Item $manifestTempPath -Force -ErrorAction SilentlyContinue
+}
+
+$profileName = if ([string]::IsNullOrWhiteSpace($Preset)) {
+    $null
+} else {
+    [string]$manifest.encodingProfiles[0].name
+    if ([string]::IsNullOrWhiteSpace($manifest.encodingProfiles[0].name)) {
+        throw "Analysis manifest '$manifestBlobName' contains no encoding profile."
+    }
+}
+$artifactBaseName = if ($null -eq $profileName) {
+    $artifactBaseNameWithoutProfile
+} else {
+    "$artifactBaseNameWithoutProfile-$profileName"
+}
+$outputBlobName = "$artifactBaseName.mp4"
+Write-Host "Analysis selected highest rendition: $(if ($null -eq $profileName) { 'source resolution' } else { $profileName })"
+
 do {
     $finalBlobExists = if ($OutputType -in @("mp4", "both")) {
         $mp4Exists = az storage blob exists `
@@ -204,7 +299,7 @@ do {
 
     $cmafBlobs = @()
     if ($OutputType -in @("cmaf", "both")) {
-        $cmafPrefix = "$jobId-"
+        $cmafPrefix = "$artifactBaseName-"
         $cmafBlobs = @(az storage blob list `
             --account-name $outputStorageAccount `
             --container-name $outputContainer `
@@ -215,21 +310,21 @@ do {
             --only-show-errors | ConvertFrom-Json)
         Assert-NativeCommandSucceeded "Checking for the CMAF package blobs"
         $requiredCmafNames = @(
-            "$jobId-stream0.m3u8",
-            "$jobId-stream1.m3u8",
-            "$jobId-stream0.cmaf",
-            "$jobId-stream1.cmaf"
+            "$artifactBaseName-stream0.m3u8",
+            "$artifactBaseName-stream1.m3u8",
+            "$artifactBaseName-stream0.cmaf",
+            "$artifactBaseName-stream1.cmaf"
         )
         $manifestBlobs = @(az storage blob list `
             --account-name $outputStorageAccount `
             --container-name $outputContainer `
-            --prefix $jobId `
+            --prefix $artifactBaseName `
             --auth-mode login `
-            --query "[?name=='$jobId.mpd' || name=='$jobId.m3u8'].{name:name,size:properties.contentLength}" `
+            --query "[?name=='$artifactBaseName.mpd' || name=='$artifactBaseName.m3u8'].{name:name,size:properties.contentLength}" `
             --output json `
             --only-show-errors | ConvertFrom-Json)
         $cmafBlobs += $manifestBlobs
-        $requiredCmafNames += @("$jobId.mpd", "$jobId.m3u8")
+        $requiredCmafNames += @("$artifactBaseName.mpd", "$artifactBaseName.m3u8")
         $cmafBlobsByName = @{}
         foreach ($blob in $cmafBlobs) {
             $cmafBlobsByName[[string]$blob.name] = [long]$blob.size
@@ -292,9 +387,9 @@ do {
         }
         Assert-NativeCommandSucceeded "Reading the video-results queue status"
 
-        Write-Host "Workflow completed for $jobId (transport=$MessageTransport, outputType=$OutputType, calculateVmaf=$($CalculateVmaf.IsPresent))."
+        Write-Host "Workflow completed for $jobId (transport=$MessageTransport, preset=$Preset, outputType=$OutputType, calculateVmaf=$($CalculateVmaf.IsPresent))."
         if ($OutputType -in @("mp4", "both")) {
-            Write-Host "MP4 output: $outputBaseUri.mp4 ($($finalBlob.size) bytes)"
+            Write-Host "MP4 output: https://$outputStorageAccount.blob.core.windows.net/$outputContainer/$outputBlobName ($($finalBlob.size) bytes)"
         }
         if ($OutputType -in @("cmaf", "both")) {
             Write-Host "CMAF package:"
@@ -317,4 +412,4 @@ do {
 
 Write-Host "The workflow did not complete within $TimeoutMinutes minutes. Current workloads:"
 kubectl get scaledobjects,pods,jobs --namespace $KubernetesNamespace
-throw "Timed out waiting for artifacts at '$outputBaseUri'."
+throw "Timed out waiting for artifacts with base name '$artifactBaseName' at '$outputBaseUri'."

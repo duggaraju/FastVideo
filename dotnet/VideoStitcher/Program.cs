@@ -19,62 +19,85 @@ var outputStorageAccountName = Required("OUTPUT_STORAGE_ACCOUNT_NAME");
 var outputStorageContainer = Required("OUTPUT_STORAGE_CONTAINER");
 var calculateVmaf = bool.Parse(Required("CALCULATE_VMAF"));
 var jobDirectory = BlobMountPaths.FromBlobName(jobId, outputMountPath);
+await using var manifestStream = File.OpenRead(Path.Combine(jobDirectory, "manifest.json"));
+var manifest = await JsonSerializer.DeserializeAsync<VideoManifest>(manifestStream, JsonSerializerOptions.Web)
+    ?? throw new InvalidOperationException("Manifest payload is empty");
+if (manifest.SegmentCount != segmentCount)
+    throw new InvalidOperationException($"Manifest segment count {manifest.SegmentCount} does not match Job count {segmentCount}");
 var workingDirectory = Path.Combine(jobDirectory, "_stitch");
-var packageDirectory = Path.Combine(Path.GetTempPath(), "video-stitcher", jobId, "package");
+var packageRoot = Path.Combine(Path.GetTempPath(), "video-stitcher", jobId);
 Directory.CreateDirectory(workingDirectory);
 var stitchCompleted = false;
 try
 {
-    var paths = Enumerable.Range(0, segmentCount)
-        .Select(index => BlobMountPaths.FromBlobName($"{jobId}/segments/{index:D6}.mp4", outputMountPath))
-        .ToList();
-    var missingPaths = paths.Where(path => !File.Exists(path)).ToList();
-    if (missingPaths.Count > 0)
-        throw new InvalidOperationException($"Expected {segmentCount} segments but {missingPaths.Count} files are missing");
-    var vmafPaths = calculateVmaf
-        ? Enumerable.Range(0, segmentCount)
-            .Select(index => BlobMountPaths.FromBlobName($"{jobId}/segments/{index:D6}.vmaf.json", outputMountPath))
-            .ToList()
-        : [];
-    var missingVmafPaths = vmafPaths.Where(path => !File.Exists(path)).ToList();
-    if (missingVmafPaths.Count > 0)
-        throw new InvalidOperationException($"Expected {segmentCount} VMAF results but {missingVmafPaths.Count} files are missing");
-    var segmentVmafScores = calculateVmaf
-        ? (await Task.WhenAll(vmafPaths.Select(ReadVmafAsync))).OrderBy(result => result.Index).ToList()
-        : [];
-    double? vmafScore = calculateVmaf ? segmentVmafScores.Average(result => result.Score) : null;
-
-    var concatListPath = Path.Combine(workingDirectory, "segments.txt");
-    await File.WriteAllLinesAsync(
-        concatListPath,
-        paths.Select(path => $"file '{Path.GetFullPath(path).Replace("'", "'\\''")}'"));
     var audioPath = BlobMountPaths.FromBlobName(audioBlobName, outputMountPath);
-
     var outputBasePath = BlobMountPaths.FromUri(
         outputUri,
         outputStorageAccountName,
         outputStorageContainer,
         outputMountPath);
+    var outputIsInJobDirectory = Path.GetFullPath(outputBasePath)
+        .StartsWith(Path.GetFullPath(jobDirectory) + Path.DirectorySeparatorChar, StringComparison.Ordinal);
     Directory.CreateDirectory(Path.GetDirectoryName(outputBasePath)!);
-    await StitchAsync(concatListPath, audioPath, outputBasePath, packageDirectory, outputType);
-    if (vmafScore is not null)
+    var intermediatePaths = new List<string>();
+
+    foreach (var profile in manifest.EncodingProfiles)
     {
-        var outputVmafPath = $"{outputBasePath}.vmaf.json";
-        await File.WriteAllBytesAsync(
-            outputVmafPath,
-            JsonSerializer.SerializeToUtf8Bytes(new VideoVmaf(vmafScore.Value, segmentVmafScores)));
+        var paths = Enumerable.Range(0, segmentCount)
+            .Select(index => BlobMountPaths.FromBlobName($"{jobId}/segments/{index:D6}-{profile.Name}.mp4", outputMountPath))
+            .ToList();
+        var missingPaths = paths.Where(path => !File.Exists(path)).ToList();
+        if (missingPaths.Count > 0)
+            throw new InvalidOperationException($"Expected {segmentCount} {profile.Name} segments but {missingPaths.Count} files are missing");
+        var vmafPaths = calculateVmaf
+            ? Enumerable.Range(0, segmentCount)
+                .Select(index => BlobMountPaths.FromBlobName($"{jobId}/segments/{index:D6}-{profile.Name}.vmaf.json", outputMountPath))
+                .ToList()
+            : [];
+        var missingVmafPaths = vmafPaths.Where(path => !File.Exists(path)).ToList();
+        if (missingVmafPaths.Count > 0)
+            throw new InvalidOperationException($"Expected {segmentCount} {profile.Name} VMAF results but {missingVmafPaths.Count} files are missing");
+        var segmentVmafScores = calculateVmaf
+            ? (await Task.WhenAll(vmafPaths.Select(ReadVmafAsync))).OrderBy(result => result.Index).ToList()
+            : [];
+
+        var concatListPath = Path.Combine(workingDirectory, $"segments-{profile.Name}.txt");
+        await File.WriteAllLinesAsync(
+            concatListPath,
+            paths.Select(path => $"file '{Path.GetFullPath(path).Replace("'", "'\\''")}'"));
+        var profileOutputBasePath = manifest.Preset is null
+            ? outputBasePath
+            : $"{outputBasePath}-{profile.Name}";
+        var packageDirectory = Path.Combine(packageRoot, profile.Name);
+        await StitchAsync(concatListPath, audioPath, profileOutputBasePath, packageDirectory, outputType);
+        if (calculateVmaf)
+        {
+            var vmafScore = segmentVmafScores.Average(result => result.Score);
+            await File.WriteAllBytesAsync(
+                $"{profileOutputBasePath}.vmaf.json",
+                JsonSerializer.SerializeToUtf8Bytes(new VideoVmaf(vmafScore, segmentVmafScores)));
+        }
+        intermediatePaths.AddRange(paths);
+        intermediatePaths.AddRange(vmafPaths);
+        intermediatePaths.Add(concatListPath);
     }
 
     stitchCompleted = true;
     await DeleteIntermediateFilesAsync(
-        paths.Concat(vmafPaths).Append(audioPath)
-            .Append(Path.Combine(jobDirectory, "manifest.json"))
-            .Append(concatListPath),
-        jobDirectory);
+        intermediatePaths.Append(audioPath).Append(Path.Combine(jobDirectory, "manifest.json")));
+    if (outputIsInJobDirectory)
+    {
+        await DeleteDirectoryAsync(Path.Combine(jobDirectory, "segments"));
+        await DeleteDirectoryAsync(workingDirectory);
+    }
+    else
+    {
+        await DeleteDirectoryAsync(jobDirectory);
+    }
 }
 finally
 {
-    await DeleteDirectoryAsync(packageDirectory);
+    await DeleteDirectoryAsync(packageRoot);
     if (!stitchCompleted)
         await DeleteDirectoryAsync(workingDirectory);
 }
@@ -173,7 +196,7 @@ static async Task<SegmentVmaf> ReadVmafAsync(string path)
         ?? throw new InvalidOperationException($"VMAF result {path} is empty");
 }
 
-static async Task DeleteIntermediateFilesAsync(IEnumerable<string> paths, string jobDirectory)
+static Task DeleteIntermediateFilesAsync(IEnumerable<string> paths)
 {
     foreach (var path in paths.Distinct(StringComparer.Ordinal))
     {
@@ -187,7 +210,7 @@ static async Task DeleteIntermediateFilesAsync(IEnumerable<string> paths, string
         }
     }
 
-    await DeleteDirectoryAsync(jobDirectory);
+    return Task.CompletedTask;
 }
 
 static async Task DeleteDirectoryAsync(string path)

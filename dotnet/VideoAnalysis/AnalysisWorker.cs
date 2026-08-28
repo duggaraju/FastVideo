@@ -91,12 +91,15 @@ public sealed class AnalysisWorker(
                 request.SegmentDurationSeconds);
             var sourceVideo = media.PrimaryVideoStream
                 ?? throw new InvalidOperationException("Input does not contain a video stream");
-            var encodingProfile = EncodingProfileSelector.Select(
+            var ladderProfilesJson = LoadLadderProfiles(configuration);
+            var encodingProfiles = EncodingProfileSelector.Select(
                 sourceVideo,
                 videoCodec,
                 request.Preset,
+                request.EncoderPreset,
                 request.Crf,
-                request.MaxVideoBitrateKbps);
+                request.MaxVideoBitrateKbps,
+                ladderProfilesJson);
 
             var audioEncodingRequired = !string.Equals(request.AudioCodec, "copy", StringComparison.OrdinalIgnoreCase);
             var outputType = VideoOutputTypes.Normalize(request.OutputType);
@@ -123,9 +126,14 @@ public sealed class AnalysisWorker(
                 segments,
                 videoCodec,
                 request.AudioCodec,
-                encodingProfile.Preset,
-                encodingProfile.Crf,
-                encodingProfile.MaxVideoBitrateKbps,
+                EncodingProfileSelector.IsLadderPreset(request.Preset, ladderProfilesJson) ? request.Preset!.ToLowerInvariant() : null,
+                encodingProfiles.Select(profile => new VideoEncodingProfile(
+                    profile.Name,
+                    profile.Width,
+                    profile.Height,
+                    profile.EncoderPreset,
+                    profile.Crf,
+                    profile.MaxVideoBitrateKbps)).ToList(),
                 request.UseSpot,
                 request.CalculateVmaf,
                 mediaRuntime,
@@ -136,7 +144,7 @@ public sealed class AnalysisWorker(
                 await SubmitAudioEncodingJobAsync(manifest, outputAccount, outputContainer, inputAccount, inputContainer, outputMountPath, inputMountPath, architecture, args.CancellationToken);
             await args.CompleteMessageAsync(args.Message, args.CancellationToken);
             logger.LogInformation(
-                "Submitted {SegmentCount} encoding indexes for {JobId} using {ParallelizationStrategy}; segment duration={SegmentDurationSeconds}s, initial parallelism={InitialParallelism}, max parallelism={MaxParallelism}, source={Width}x{Height} {SourceBitrateKbps}kbps, preset={Preset}, crf={Crf}, maxrate={MaxVideoBitrateKbps}kbps",
+                "Submitted {SegmentCount} encoding indexes for {JobId} using {ParallelizationStrategy}; segment duration={SegmentDurationSeconds}s, initial parallelism={InitialParallelism}, max parallelism={MaxParallelism}, source={Width}x{Height} {SourceBitrateKbps}kbps, ladder={Ladder}",
                 segments.Count,
                 request.JobId,
                 parallelizationStrategy.Name,
@@ -146,9 +154,7 @@ public sealed class AnalysisWorker(
                 sourceVideo.Width,
                 sourceVideo.Height,
                 sourceVideo.BitRate / 1000,
-                encodingProfile.Preset,
-                encodingProfile.Crf,
-                encodingProfile.MaxVideoBitrateKbps);
+                string.Join(",", encodingProfiles.Select(profile => $"{profile.Name}:{profile.Width}x{profile.Height}@{profile.MaxVideoBitrateKbps}k")));
         }
         catch (JsonException exception)
         {
@@ -210,9 +216,6 @@ public sealed class AnalysisWorker(
             Env("JOB_ID", manifest.JobId),
             Env("SOURCE_VIDEO_URI", manifest.InputVideoUri.ToString()),
             Env("VIDEO_CODEC", manifest.VideoCodec),
-            Env("PRESET", manifest.Preset),
-            Env("CRF", manifest.Crf.ToString()),
-            Env("MAX_VIDEO_BITRATE_KBPS", manifest.MaxVideoBitrateKbps.ToString()),
             Env("CALCULATE_VMAF", manifest.CalculateVmaf ? "true" : "false"),
             Env("INPUT_STORAGE_ACCOUNT_NAME", inputAccount),
             Env("INPUT_STORAGE_CONTAINER", inputContainer),
@@ -475,6 +478,23 @@ public sealed class AnalysisWorker(
     private string RequiredConfig(string key) =>
         configuration[key] ?? throw new InvalidOperationException($"{key} is required");
 
+    private static string? LoadLadderProfiles(IConfiguration configuration)
+    {
+        var path = configuration["Encoding:LadderProfilesPath"];
+        if (!string.IsNullOrWhiteSpace(path))
+        {
+            try
+            {
+                return File.ReadAllText(path);
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+            {
+                throw new InvalidOperationException($"Could not read Encoding:LadderProfilesPath '{path}'", exception);
+            }
+        }
+        return configuration["Encoding:LadderProfiles"];
+    }
+
     private static bool IsNotFound(Exception exception) =>
         exception.ToString().Contains("404", StringComparison.Ordinal) ||
         exception.ToString().Contains("NotFound", StringComparison.OrdinalIgnoreCase);
@@ -497,6 +517,10 @@ public sealed class AnalysisWorker(
             throw new ArgumentException("Crf must be between 0 and 63");
         if (request.MaxVideoBitrateKbps is < 64 or > 100_000)
             throw new ArgumentException("MaxVideoBitrateKbps must be between 64 and 100000");
+        if (!string.IsNullOrWhiteSpace(request.Preset) &&
+            request.Preset.StartsWith("max", StringComparison.OrdinalIgnoreCase) &&
+            !VideoLadderPresets.IsLadder(request.Preset))
+            throw new ArgumentException("Preset must be max4k or max<height>p, for example max1080p");
         if (string.IsNullOrWhiteSpace(request.AudioCodec))
             throw new ArgumentException("AudioCodec is required");
     }

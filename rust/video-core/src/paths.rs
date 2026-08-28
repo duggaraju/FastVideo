@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use percent_encoding::percent_decode_str;
 use std::path::{Component, Path, PathBuf};
 use url::Url;
@@ -14,7 +14,9 @@ pub fn from_uri(uri: &Url, account: &str, container: &str, mount_root: &Path) ->
     let mut segments = uri.path().trim_matches('/').split('/');
     let actual_container = segments.next().unwrap_or_default();
     if !actual_container.eq_ignore_ascii_case(container) {
-        bail!("Blob URI container '{actual_container}' does not match configured container '{container}'");
+        bail!(
+            "Blob URI container '{actual_container}' does not match configured container '{container}'"
+        );
     }
     let decoded = segments
         .map(|segment| percent_decode_str(segment).decode_utf8())
