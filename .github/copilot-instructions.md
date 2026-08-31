@@ -53,7 +53,7 @@ Shared logical components have parallel implementations:
 
 Media flows through BlobFuse rather than local downloads. The input mount is read-only; intermediate and final artifacts use the output mount. Stitchers intentionally mount only output storage. `deploy/ladder-profiles.json` is runtime configuration mounted into both analyzers, not application code.
 
-Infrastructure starts at `infra/main.bicep`, with transport-specific modules under `infra/modules`. `scripts/deploy.ps1` combines the shared `deploy/k8s/video.yaml` template with exactly one `video-<transport>.yaml` template, replaces `__PLACEHOLDER__` values, and writes `deploy/rendered.yaml` before applying it.
+Infrastructure starts at `infra/main.bicep`, with transport-specific modules under `infra/modules`. Kubernetes manifests now live under `deploy/k8s/base` and `deploy/k8s/overlays/*`; `scripts/deploy.ps1` generates a small runtime overlay, renders it with `kubectl kustomize`, writes `deploy/rendered.yaml`, and applies that rendered manifest.
 
 ## Repository-specific conventions
 
@@ -63,7 +63,7 @@ Infrastructure starts at `infra/main.bicep`, with transport-specific modules und
 - Terminal results are emitted only for exhausted encode/audio failures or terminal stitch success/failure. Individual pod retries and successful encode completion are not terminal events. Result-report annotations provide deduplication.
 - Preserve the global encoding budget semantics. The analyzer sets initial Indexed Job parallelism from `Encoding__MinParallelismPerJob`; the completion worker continuously reallocates `Encoding__MaxParallelism` across unfinished Jobs.
 - Configuration uses .NET-style hierarchical names. Kubernetes ConfigMap keys use double underscores such as `Encoding__MaxParallelism`; .NET reads the equivalent `Encoding:MaxParallelism`, while Rust reads the double-underscore environment variable directly.
-- Treat `deploy/k8s/video.yaml`, `deploy/k8s/video-storagequeue.yaml`, `deploy/k8s/video-servicebus.yaml`, `deploy/ladder-profiles.json`, and Bicep sources as editable inputs. Do not hand-edit generated `deploy/rendered.yaml` or `infra/main.json`.
+- Treat `deploy/k8s/base`, `deploy/k8s/overlays`, `deploy/ladder-profiles.json`, and Bicep sources as editable inputs. Do not hand-edit generated `deploy/rendered.yaml`, `deploy/.generated/`, or `infra/main.json`.
 - Keep image naming aligned with `scripts/build-images.ps1`: transport suffixes identify control-plane images, while `-dotnet` and `-rust` suffixes identify media images. Rust package names are `analyzer`, `completion`, `encoder`, `audio-encoder`, and `stitcher`.
 - Runtime containers are Linux, non-root, and expect FFmpeg/FFprobe under `/opt/ffmpeg/bin` in images, with `/usr/bin` as the local fallback. Preserve architecture-neutral application behavior; scheduling selects `amd64` or `arm64`.
 - PowerShell automation requires PowerShell 7, sets `$ErrorActionPreference = "Stop"`, and checks `$LASTEXITCODE` after native commands. Keep Azure authentication identity-based; do not introduce storage keys, Service Bus connection strings, or ACR admin credentials.

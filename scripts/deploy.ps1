@@ -25,6 +25,25 @@ param(
     [string] $RenderedManifestPath = (Join-Path (Split-Path -Parent $PSScriptRoot) "deploy/rendered.yaml")
 )
 
+# This script renders Kubernetes manifests with Kustomize (bases + overlays under
+# deploy/k8s/) instead of the old __PLACEHOLDER__ string-replace templating engine.
+#
+# deploy/k8s/base                    - provider/transport-agnostic resources
+# deploy/k8s/overlays/storagequeue   - Storage Queue transport resource variants
+# deploy/k8s/overlays/servicebus     - Service Bus transport resource variants
+# deploy/k8s/overlays/azure          - Azure/AKS provider component (workload
+#                                      identity, node selectors/tolerations, CSI)
+# deploy/k8s/overlays/external       - external-cluster provider component (inert
+#                                      defaults; every value comes from the user's
+#                                      -ExternalConfigPath JSON)
+#
+# Values only known at deploy time (storage account names, workload identity
+# client id, Service Bus namespace, image tags, KEDA trigger metadata, ...) are
+# injected by generating a small overlay on disk under deploy/.generated/<name>/
+# that layers a transport overlay + provider component and patches in the real
+# values. `kubectl kustomize` renders that generated overlay into the final
+# manifest; `kubectl apply -k` (or `apply -f -` on the rendered output) applies it.
+
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 
@@ -64,145 +83,38 @@ function ConvertTo-YamlScalar($Value) {
     return [string]$Value
 }
 
-function ConvertTo-YamlLines($Value, [int] $Indent = 0) {
+# Expands "{{TOKEN}}" placeholders inside a single scalar string. This is only used
+# for the small, genuinely free-form JSON blob (KEDA scaler type/metadata) that
+# still lives in deploy/overlays/azure-config.json; every other per-deploy-run value
+# is injected directly as a Kustomize patch/replacement below.
+function Expand-Tokens([string] $Value, [System.Collections.IDictionary] $Tokens) {
+    if ([string]::IsNullOrEmpty($Value)) { return $Value }
+    $result = $Value
+    foreach ($key in $Tokens.Keys) {
+        $result = $result.Replace("{{$key}}", [string]$Tokens[$key])
+    }
+    return $result
+}
+
+# Renders a flat string-valued map (KEDA trigger metadata, annotations, pod labels)
+# as YAML "key: value" lines at the given indent. Only supports one level of
+# nesting because that is all the KEDA/annotation/label schemas ever need.
+function Format-FlatYamlMap([System.Collections.IDictionary] $Map, [int] $Indent, [System.Collections.IDictionary] $Tokens = $null) {
     $padding = " " * $Indent
     $lines = [System.Collections.Generic.List[string]]::new()
-    if ($Value -is [System.Collections.IDictionary]) {
-        foreach ($key in $Value.Keys) {
-            $child = $Value[$key]
-            if ($child -is [System.Collections.IDictionary] -or
-                ($child -is [System.Collections.IEnumerable] -and $child -isnot [string])) {
-                $lines.Add("$padding$key`:")
-                foreach ($line in (ConvertTo-YamlLines $child ($Indent + 2))) { $lines.Add($line) }
-            } else {
-                $lines.Add("$padding$key`: $(ConvertTo-YamlScalar $child)")
-            }
-        }
-    } elseif ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
-        foreach ($child in $Value) {
-            if ($child -is [System.Collections.IDictionary] -or
-                ($child -is [System.Collections.IEnumerable] -and $child -isnot [string])) {
-                $lines.Add("$padding-")
-                foreach ($line in (ConvertTo-YamlLines $child ($Indent + 2))) { $lines.Add($line) }
-            } else {
-                $lines.Add("$padding- $(ConvertTo-YamlScalar $child)")
-            }
+    if ($null -ne $Map) {
+        foreach ($key in $Map.Keys) {
+            $value = [string]$Map[$key]
+            if ($null -ne $Tokens) { $value = Expand-Tokens $value $Tokens }
+            $lines.Add("$padding$key`: $(ConvertTo-YamlScalar $value)")
         }
     }
-    return $lines
-}
-
-function ConvertTo-YamlProperty(
-    [string] $Name,
-    $Value,
-    [int] $Indent,
-    [switch] $OmitWhenEmpty
-) {
-    $items = @(ConvertTo-YamlLines $Value ($Indent + 2))
-    if ($items.Count -eq 0) {
-        if ($OmitWhenEmpty) { return "" }
-        return "$((' ' * $Indent))$Name`: {}"
-    }
-    return (@("$((' ' * $Indent))$Name`:") + $items) -join "`n"
-}
-
-function ConvertTo-JsonConfig($Value) {
-    if ($null -eq $Value) { return "{}" }
-    if ($Value -is [System.Collections.IDictionary]) {
-        if ($Value.Count -eq 0) { return "{}" }
-    } elseif ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
-        $items = @($Value)
-        if ($items.Count -eq 0) { return "[]" }
-        return $items | ConvertTo-Json -Compress -Depth 20 -AsArray
-    }
-    return $Value | ConvertTo-Json -Compress -Depth 20
-}
-
-function Resolve-OverlayTokens($Value, [System.Collections.IDictionary] $Tokens) {
-    if ($Value -is [string]) {
-        $result = $Value
-        foreach ($key in $Tokens.Keys) {
-            $result = $result.Replace("{{$key}}", [string]$Tokens[$key])
-        }
-        return $result
-    }
-    if ($Value -is [System.Collections.IDictionary]) {
-        $copy = [ordered]@{}
-        foreach ($key in $Value.Keys) { $copy[$key] = Resolve-OverlayTokens $Value[$key] $Tokens }
-        return $copy
-    }
-    if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
-        $resolvedItems = [System.Collections.Generic.List[object]]::new()
-        foreach ($item in $Value) { $resolvedItems.Add((Resolve-OverlayTokens $item $Tokens)) }
-        return , $resolvedItems.ToArray()
-    }
-    return $Value
-}
-
-function New-TriggerAuthenticationResource(
-    [string] $Namespace,
-    [string] $Name,
-    [System.Collections.IDictionary] $Spec
-) {
-    if ($null -eq $Spec -or $Spec.Count -eq 0) { return "" }
-    $specLines = ConvertTo-YamlLines $Spec 2
-    return @"
----
-apiVersion: keda.sh/v1alpha1
-kind: TriggerAuthentication
-metadata:
-  name: $Name
-  namespace: $Namespace
-spec:
-$($specLines -join "`n")
-"@
-}
-
-function New-ScalerResource(
-    [string] $Namespace,
-    [string] $DeploymentName,
-    [System.Collections.IDictionary] $Scaler
-) {
-    $mode = [string](Get-ConfigValue $Scaler "mode" "none")
-    if ($mode -eq "none") { return "" }
-    if ($mode -ne "keda") {
-        throw "Scaler mode must be 'keda' or 'none'; got '$mode'."
-    }
-    $type = [string](Get-RequiredConfigValue $Scaler "type" "scaler")
-    $metadata = Get-RequiredConfigValue $Scaler "metadata" "scaler"
-    if ($metadata -isnot [System.Collections.IDictionary]) {
-        throw "Scaler 'metadata' must be a JSON object."
-    }
-    $metadataLines = ConvertTo-YamlLines $metadata 8
-    $authenticationRef = [string](Get-ConfigValue $Scaler "authenticationRef" "")
-    $authenticationBlock = if ([string]::IsNullOrWhiteSpace($authenticationRef)) {
-        ""
-    } else {
-        "`n      authenticationRef:`n        name: $(ConvertTo-YamlScalar $authenticationRef)"
-    }
-    return @"
----
-apiVersion: keda.sh/v1alpha1
-kind: ScaledObject
-metadata:
-  name: $DeploymentName
-  namespace: $Namespace
-spec:
-  scaleTargetRef:
-    name: $DeploymentName
-  pollingInterval: 10
-  cooldownPeriod: 60
-  minReplicaCount: 0
-  maxReplicaCount: 10
-  triggers:
-    - type: $(ConvertTo-YamlScalar $type)
-      metadata:
-$($metadataLines -join "`n")$authenticationBlock
-"@
+    return , $lines.ToArray()
 }
 
 $deployment = $null
 $deploymentName = $null
+$kubeContext = $null
 $kubectlContextArgs = @()
 $serviceBusNamespace = ""
 $inputStorageAccount = ""
@@ -212,6 +124,11 @@ $outputStorageContainer = ""
 $workloadClientId = ""
 $serviceAccountName = "video-worker"
 $serviceAccountAnnotations = @{}
+$scaler = @{ mode = "none" }
+$imageRepository = ""
+$storageCsiDriver = ""
+$inputCsiVolumeAttributes = @{}
+$outputCsiVolumeAttributes = @{}
 $podLabels = @{}
 $controlPlaneNodeSelector = @{}
 $controlPlaneTolerations = @()
@@ -219,12 +136,6 @@ $mediaNodeSelectorSpot = @{}
 $mediaNodeSelectorRegular = @{}
 $mediaTolerationsSpot = @()
 $mediaTolerationsRegular = @()
-$storageCsiDriver = ""
-$inputCsiVolumeAttributes = @{}
-$outputCsiVolumeAttributes = @{}
-$scaler = @{}
-$triggerAuthentication = $null
-$imageRepository = ""
 
 if ($DeploymentMode -eq "external") {
     if ($SkipInfrastructureDeployment) {
@@ -258,13 +169,6 @@ if ($DeploymentMode -eq "external") {
     $workloadClientId = [string](Get-RequiredConfigValue $external "workloadClientId" $resolvedConfigPath)
     $serviceAccountName = [string](Get-RequiredConfigValue $external "serviceAccountName" $resolvedConfigPath)
     $serviceAccountAnnotations = Get-ConfigValue $external "serviceAccountAnnotations" @{}
-    $podLabels = Get-ConfigValue $external "podLabels" @{}
-    $controlPlaneNodeSelector = Get-ConfigValue $external "controlPlaneNodeSelector" @{}
-    $controlPlaneTolerations = Get-ConfigValue $external "controlPlaneTolerations" @()
-    $mediaNodeSelectorSpot = Get-ConfigValue $external "mediaNodeSelectorSpot" @{}
-    $mediaNodeSelectorRegular = Get-ConfigValue $external "mediaNodeSelectorRegular" @{}
-    $mediaTolerationsSpot = Get-ConfigValue $external "mediaTolerationsSpot" @()
-    $mediaTolerationsRegular = Get-ConfigValue $external "mediaTolerationsRegular" @()
 
     $storage = Get-RequiredConfigValue $external "storage" $resolvedConfigPath
     if ($storage -isnot [System.Collections.IDictionary]) {
@@ -275,8 +179,13 @@ if ($DeploymentMode -eq "external") {
     $outputStorageAccount = [string](Get-RequiredConfigValue $storage "outputAccountName" "storage")
     $outputStorageContainer = [string](Get-RequiredConfigValue $storage "outputContainer" "storage")
     $storageCsiDriver = [string](Get-RequiredConfigValue $storage "csiDriver" "storage")
-    $inputCsiVolumeAttributes = Get-RequiredConfigValue $storage "inputVolumeAttributes" "storage"
-    $outputCsiVolumeAttributes = Get-RequiredConfigValue $storage "outputVolumeAttributes" "storage"
+    $podLabels = Get-ConfigValue $external "podLabels" @{}
+    $controlPlaneNodeSelector = Get-ConfigValue $external "controlPlaneNodeSelector" @{}
+    $controlPlaneTolerations = @(Get-ConfigValue $external "controlPlaneTolerations" @())
+    $mediaNodeSelectorSpot = Get-ConfigValue $external "mediaNodeSelectorSpot" @{}
+    $mediaNodeSelectorRegular = Get-ConfigValue $external "mediaNodeSelectorRegular" @{}
+    $mediaTolerationsSpot = @(Get-ConfigValue $external "mediaTolerationsSpot" @())
+    $mediaTolerationsRegular = @(Get-ConfigValue $external "mediaTolerationsRegular" @())
 
     $serviceBusNamespace = [string](Get-ConfigValue $external "serviceBusNamespace" "")
     if ($MessageTransport -eq "servicebus" -and [string]::IsNullOrWhiteSpace($serviceBusNamespace)) {
@@ -286,10 +195,9 @@ if ($DeploymentMode -eq "external") {
     if ($scaler -isnot [System.Collections.IDictionary]) {
         throw "External deployment config '$resolvedConfigPath' property 'scaler' must be a JSON object."
     }
-    $triggerAuthentication = Get-ConfigValue $scaler "triggerAuthentication"
 } else {
     if (-not [string]::IsNullOrWhiteSpace($ExternalConfigPath)) {
-        throw "-ExternalConfigPath is only valid with -DeploymentMode external."
+        throw "-ExternalConfigPath is only valid with -DeploymentMode azure."
     }
     if ([string]::IsNullOrWhiteSpace($KubernetesNamespace)) {
         $KubernetesNamespace = "video-$MessageTransport"
@@ -374,103 +282,287 @@ if ($DeploymentMode -eq "external") {
     $outputStorageAccount = [string]$deployment.outputStorageName.value
     $outputStorageContainer = [string]$deployment.outputContainerName.value
     $workloadClientId = [string]$deployment.workloadClientId.value
+    $serviceAccountAnnotations = @{ "azure.workload.identity/client-id" = $workloadClientId }
+    $storageCsiDriver = "blob.csi.azure.com"
 
+    # deploy/overlays/azure-config.json is now a small JSON "profile" of the one
+    # thing that still needs deploy-time templating: KEDA scaler type/metadata.
+    # Every other Azure-specific static default (node selectors, tolerations, CSI
+    # driver, workload-identity pod label) is Kustomize-native and lives in
+    # deploy/k8s/overlays/azure/.
     $azureOverlayPath = Join-Path $root "deploy/overlays/azure-config.json"
     try {
         $azureOverlay = Get-Content -LiteralPath $azureOverlayPath -Raw | ConvertFrom-Json -AsHashtable
     } catch {
         throw "Azure overlay config '$azureOverlayPath' is not valid JSON: $($_.Exception.Message)"
     }
-    $overlayTokens = @{
-        WORKLOAD_CLIENT_ID = $workloadClientId
-        INPUT_STORAGE_ACCOUNT = $inputStorageAccount
-        INPUT_STORAGE_CONTAINER = $inputStorageContainer
-        OUTPUT_STORAGE_ACCOUNT = $outputStorageAccount
-        OUTPUT_STORAGE_CONTAINER = $outputStorageContainer
-        SERVICE_BUS_NAMESPACE_SHORT = $(if ([string]::IsNullOrWhiteSpace($serviceBusNamespace)) { "" } else { $serviceBusNamespace.Split(".")[0] })
-    }
-    $azureOverlay = Resolve-OverlayTokens $azureOverlay $overlayTokens
-
-    $serviceAccountAnnotations = Get-ConfigValue $azureOverlay "serviceAccountAnnotations" @{}
-    $podLabels = Get-ConfigValue $azureOverlay "podLabels" @{}
-    $controlPlaneNodeSelector = Get-ConfigValue $azureOverlay "controlPlaneNodeSelector" @{}
-    $controlPlaneTolerations = Get-ConfigValue $azureOverlay "controlPlaneTolerations" @()
-    $mediaNodeSelectorSpot = Get-ConfigValue $azureOverlay "mediaNodeSelectorSpot" @{}
-    $mediaNodeSelectorRegular = Get-ConfigValue $azureOverlay "mediaNodeSelectorRegular" @{}
-    $mediaTolerationsSpot = Get-ConfigValue $azureOverlay "mediaTolerationsSpot" @()
-    $mediaTolerationsRegular = Get-ConfigValue $azureOverlay "mediaTolerationsRegular" @()
-
-    $azureStorage = Get-RequiredConfigValue $azureOverlay "storage" $azureOverlayPath
-    $storageCsiDriver = [string](Get-RequiredConfigValue $azureStorage "csiDriver" $azureOverlayPath)
-    $inputCsiVolumeAttributes = Get-RequiredConfigValue $azureStorage "inputVolumeAttributes" $azureOverlayPath
-    $outputCsiVolumeAttributes = Get-RequiredConfigValue $azureStorage "outputVolumeAttributes" $azureOverlayPath
-
     $azureScalers = Get-RequiredConfigValue $azureOverlay "scaler" $azureOverlayPath
     $scaler = Get-RequiredConfigValue $azureScalers $MessageTransport $azureOverlayPath
-    $triggerAuthentication = Get-ConfigValue $scaler "triggerAuthentication"
 }
 
-$ladderProfilesPath = Join-Path $root "deploy/ladder-profiles.json"
-try {
-    $ladderProfiles = Get-Content $ladderProfilesPath -Raw | ConvertFrom-Json
-} catch {
-    throw "Ladder profile configuration '$ladderProfilesPath' is not valid JSON: $($_.Exception.Message)"
-}
-if ($null -eq $ladderProfiles.rungs -or $null -eq $ladderProfiles.presets -or
-    @($ladderProfiles.rungs.PSObject.Properties).Count -eq 0 -or
-    @($ladderProfiles.presets.PSObject.Properties).Count -eq 0) {
-    throw "Ladder profile configuration '$ladderProfilesPath' must contain non-empty 'rungs' and 'presets' objects."
+$overlayTokens = @{
+    WORKLOAD_CLIENT_ID = $workloadClientId
+    INPUT_STORAGE_ACCOUNT = $inputStorageAccount
+    INPUT_STORAGE_CONTAINER = $inputStorageContainer
+    OUTPUT_STORAGE_ACCOUNT = $outputStorageAccount
+    OUTPUT_STORAGE_CONTAINER = $outputStorageContainer
+    SERVICE_BUS_NAMESPACE_SHORT = $(if ([string]::IsNullOrWhiteSpace($serviceBusNamespace)) { "" } else { $serviceBusNamespace.Split(".")[0] })
 }
 
-$manifest = (Get-Content (Join-Path $root "deploy/k8s/video.yaml") -Raw) + `
-    "`n---`n" + `
-    (Get-Content (Join-Path $root "deploy/k8s/video-$MessageTransport.yaml") -Raw)
-$ladderProfilesJson = (Get-Content $ladderProfilesPath) | ForEach-Object { "    $_" } | Join-String -Separator "`n"
-$serviceBusShortName = if ([string]::IsNullOrWhiteSpace($serviceBusNamespace)) { "" } else { $serviceBusNamespace.Split(".")[0] }
-$analysisDeployment = if ($MessageTransport -eq "storagequeue") { "video-analyzer-storagequeue" } else { "video-analysis-servicebus" }
 $scalerMode = [string](Get-ConfigValue $scaler "mode" "none")
+if ($scalerMode -notin @("none", "keda")) {
+    throw "Scaler mode must be 'keda' or 'none'; got '$scalerMode'."
+}
 $triggerAuthenticationName = [string](Get-ConfigValue $scaler "authenticationRef" "video-workload-identity")
+$triggerAuthenticationSpec = Get-ConfigValue $scaler "triggerAuthentication"
 
-$replacements = @{
-    "__WORKLOAD_CLIENT_ID__" = $workloadClientId
-    "__SERVICE_BUS_NAMESPACE__" = $serviceBusNamespace
-    "__SERVICE_BUS_NAMESPACE_SHORT__" = $serviceBusShortName
-    "__INPUT_STORAGE_ACCOUNT__" = $inputStorageAccount
-    "__INPUT_STORAGE_CONTAINER__" = $inputStorageContainer
-    "__OUTPUT_STORAGE_ACCOUNT__" = $outputStorageAccount
-    "__OUTPUT_STORAGE_CONTAINER__" = $outputStorageContainer
-    "__IMAGE_REPOSITORY__" = $imageRepository
-    "__IMAGE_TAG__" = $ImageTag
-    "__DOTNET_MEDIA_IMAGE_TAG__" = $ImageTag
-    "__RUST_MEDIA_IMAGE_TAG__" = $ImageTag
-    "__MEDIA_RUNTIME__" = $MediaRuntime
-    "__KUBERNETES_NAMESPACE__" = $KubernetesNamespace
-    "__MAX_AUDIO_DURATION_SECONDS__" = [string]$MaxAudioDurationSeconds
-    "__LADDER_PROFILES_JSON__" = $ladderProfilesJson
-    "__SERVICE_ACCOUNT_NAME__" = $serviceAccountName
-    "__SERVICE_ACCOUNT_ANNOTATIONS__" = (ConvertTo-YamlProperty "annotations" $serviceAccountAnnotations 2 -OmitWhenEmpty)
-    "__POD_LABELS_8__" = ((ConvertTo-YamlLines $podLabels 8) -join "`n")
-    "__CONTROL_PLANE_NODE_SELECTOR__" = (ConvertTo-YamlProperty "nodeSelector" $controlPlaneNodeSelector 6 -OmitWhenEmpty)
-    "__CONTROL_PLANE_TOLERATIONS__" = (ConvertTo-YamlProperty "tolerations" $controlPlaneTolerations 6 -OmitWhenEmpty)
-    "__STORAGE_CSI_DRIVER__" = $storageCsiDriver
-    "__INPUT_CSI_VOLUME_ATTRIBUTES_14__" = ((ConvertTo-YamlLines $inputCsiVolumeAttributes 14) -join "`n")
-    "__OUTPUT_CSI_VOLUME_ATTRIBUTES_14__" = ((ConvertTo-YamlLines $outputCsiVolumeAttributes 14) -join "`n")
-    "__POD_LABELS_JSON__" = (ConvertTo-JsonConfig $podLabels).Replace("'", "''")
-    "__MEDIA_NODE_SELECTOR_SPOT_JSON__" = (ConvertTo-JsonConfig $mediaNodeSelectorSpot).Replace("'", "''")
-    "__MEDIA_NODE_SELECTOR_REGULAR_JSON__" = (ConvertTo-JsonConfig $mediaNodeSelectorRegular).Replace("'", "''")
-    "__MEDIA_TOLERATIONS_SPOT_JSON__" = (ConvertTo-JsonConfig $mediaTolerationsSpot).Replace("'", "''")
-    "__MEDIA_TOLERATIONS_REGULAR_JSON__" = (ConvertTo-JsonConfig $mediaTolerationsRegular).Replace("'", "''")
-    "__INPUT_CSI_VOLUME_ATTRIBUTES_JSON__" = (ConvertTo-JsonConfig $inputCsiVolumeAttributes).Replace("'", "''")
-    "__OUTPUT_CSI_VOLUME_ATTRIBUTES_JSON__" = (ConvertTo-JsonConfig $outputCsiVolumeAttributes).Replace("'", "''")
-    "__TRIGGER_AUTHENTICATION_RESOURCE__" = (New-TriggerAuthenticationResource $KubernetesNamespace $triggerAuthenticationName $triggerAuthentication)
-    "__SCALER_RESOURCE__" = (New-ScalerResource $KubernetesNamespace $analysisDeployment $scaler)
-    "__ANALYZER_REPLICAS__" = $(if ($scalerMode -eq "keda") { "0" } else { "1" })
+$analyzerImageName = if ($MessageTransport -eq "storagequeue") { "video-analysis-storagequeue" } else { "video-analysis-servicebus" }
+$completionImageName = if ($MessageTransport -eq "storagequeue") { "video-completion-storagequeue" } else { "video-completion-servicebus" }
+
+# --- Compute the deploy-time ConfigMap literal overrides (merged over the ---
+# --- transport/provider defaults already baked into the Kustomize tree).   ---
+$configLiterals = [System.Collections.Generic.List[string]]::new()
+$configLiterals.Add("Kubernetes__Namespace=$KubernetesNamespace")
+$configLiterals.Add("Kubernetes__ServiceAccountName=$serviceAccountName")
+$configLiterals.Add("WorkloadIdentity__ClientId=$workloadClientId")
+$configLiterals.Add("ServiceBus__Namespace=$serviceBusNamespace")
+$configLiterals.Add("Storage__InputAccountName=$inputStorageAccount")
+$configLiterals.Add("Storage__InputContainer=$inputStorageContainer")
+$configLiterals.Add("Storage__OutputAccountName=$outputStorageAccount")
+$configLiterals.Add("Storage__OutputContainer=$outputStorageContainer")
+$configLiterals.Add("Storage__WorkingContainer=$outputStorageContainer")
+$configLiterals.Add("Storage__CsiDriver=$storageCsiDriver")
+$configLiterals.Add("Encoding__MediaRuntimeDefault=$MediaRuntime")
+$configLiterals.Add("Encoding__MaxAudioDurationSeconds=$MaxAudioDurationSeconds")
+$configLiterals.Add("Images__Dotnet__Encoder=$imageRepository/video-encoder-dotnet:$ImageTag")
+$configLiterals.Add("Images__Dotnet__AudioEncoder=$imageRepository/video-audio-encoder-dotnet:$ImageTag")
+$configLiterals.Add("Images__Dotnet__Stitcher=$imageRepository/video-stitcher-dotnet:$ImageTag")
+$configLiterals.Add("Images__Rust__Encoder=$imageRepository/video-encoder-rust:$ImageTag")
+$configLiterals.Add("Images__Rust__AudioEncoder=$imageRepository/video-audio-encoder-rust:$ImageTag")
+$configLiterals.Add("Images__Rust__Stitcher=$imageRepository/video-stitcher-rust:$ImageTag")
+
+# --- Write the deploy-time generated overlay. ---
+$generatedName = "$DeploymentMode-$MessageTransport"
+$generatedDir = Join-Path $root "deploy/.generated/$generatedName"
+if (Test-Path -LiteralPath $generatedDir) {
+    Remove-Item -LiteralPath $generatedDir -Recurse -Force
 }
-foreach ($replacement in $replacements.GetEnumerator()) {
-    $manifest = $manifest.Replace($replacement.Key, [string]$replacement.Value)
+New-Item -ItemType Directory -Path $generatedDir -Force | Out-Null
+
+$providerOverlayRelativePath = if ($DeploymentMode -eq "azure") { "../../k8s/overlays/azure" } else { "../../k8s/overlays/external" }
+$transportOverlayRelativePath = "../../k8s/overlays/$MessageTransport"
+
+$analyzerReplicas = if ($scalerMode -eq "keda") { 0 } else { 1 }
+
+$patchAnalyzer = @"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: video-analyzer
+spec:
+  replicas: $analyzerReplicas
+  template:
+    spec:
+      containers:
+        - name: analyzer
+          image: "$imageRepository/$($analyzerImageName):$ImageTag"
+      volumes:
+        - name: input-storage
+          csi:
+            volumeAttributes:
+              storageAccount: $(ConvertTo-YamlScalar $inputStorageAccount)
+              containerName: $(ConvertTo-YamlScalar $inputStorageContainer)
+              ClientID: $(ConvertTo-YamlScalar $workloadClientId)
+        - name: output-storage
+          csi:
+            volumeAttributes:
+              storageAccount: $(ConvertTo-YamlScalar $outputStorageAccount)
+              containerName: $(ConvertTo-YamlScalar $outputStorageContainer)
+              ClientID: $(ConvertTo-YamlScalar $workloadClientId)
+"@
+Set-Content -LiteralPath (Join-Path $generatedDir "patch-analyzer.yaml") -Value $patchAnalyzer -Encoding UTF8
+
+$patchCompletion = @"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: video-completion
+spec:
+  template:
+    spec:
+      containers:
+        - name: completion
+          image: "$imageRepository/$($completionImageName):$ImageTag"
+"@
+Set-Content -LiteralPath (Join-Path $generatedDir "patch-completion.yaml") -Value $patchCompletion -Encoding UTF8
+
+$annotationLines = Format-FlatYamlMap $serviceAccountAnnotations 4
+$annotationsBlock = if ($annotationLines.Count -eq 0) { "  annotations: {}" } else { "  annotations:`n$($annotationLines -join "`n")" }
+$patchServiceAccount = @"
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: $serviceAccountName
+$annotationsBlock
+"@
+Set-Content -LiteralPath (Join-Path $generatedDir "patch-serviceaccount.yaml") -Value $patchServiceAccount -Encoding UTF8
+
+$extraAnalyzerPatchPath = $null
+$extraCompletionPatchPath = $null
+if ($DeploymentMode -eq "external") {
+    # overlays/external is intentionally inert (no static defaults). All node
+    # selectors/tolerations/CSI values come straight from the user's JSON, so
+    # generate them here rather than baking a specific external cluster's
+    # topology into the checked-in Kustomize tree.
+    $podLabelLines = Format-FlatYamlMap $podLabels 8
+    $controlPlaneNodeSelectorLines = Format-FlatYamlMap $controlPlaneNodeSelector 6
+    $inputAttributeLines = Format-FlatYamlMap $inputCsiVolumeAttributes 14
+    $outputAttributeLines = Format-FlatYamlMap $outputCsiVolumeAttributes 14
+
+    $patchExternalAnalyzer = @"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: video-analyzer
+spec:
+  template:
+    metadata:
+      labels:
+$(if ($podLabelLines.Count -eq 0) { "        {}" } else { $podLabelLines -join "`n" })
+    spec:
+      nodeSelector:
+$(if ($controlPlaneNodeSelectorLines.Count -eq 0) { "        {}" } else { $controlPlaneNodeSelectorLines -join "`n" })
+      volumes:
+        - name: input-storage
+          csi:
+            driver: $(ConvertTo-YamlScalar $storageCsiDriver)
+            volumeAttributes:
+$(if ($inputAttributeLines.Count -eq 0) { "              {}" } else { $inputAttributeLines -join "`n" })
+        - name: output-storage
+          csi:
+            driver: $(ConvertTo-YamlScalar $storageCsiDriver)
+            volumeAttributes:
+$(if ($outputAttributeLines.Count -eq 0) { "              {}" } else { $outputAttributeLines -join "`n" })
+"@
+    $extraAnalyzerPatchPath = Join-Path $generatedDir "patch-external-analyzer.yaml"
+    Set-Content -LiteralPath $extraAnalyzerPatchPath -Value $patchExternalAnalyzer -Encoding UTF8
+
+    $patchExternalCompletion = @"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: video-completion
+spec:
+  template:
+    metadata:
+      labels:
+$(if ($podLabelLines.Count -eq 0) { "        {}" } else { $podLabelLines -join "`n" })
+    spec:
+      nodeSelector:
+$(if ($controlPlaneNodeSelectorLines.Count -eq 0) { "        {}" } else { $controlPlaneNodeSelectorLines -join "`n" })
+"@
+    $extraCompletionPatchPath = Join-Path $generatedDir "patch-external-completion.yaml"
+    Set-Content -LiteralPath $extraCompletionPatchPath -Value $patchExternalCompletion -Encoding UTF8
 }
-if ($manifest -cmatch "__[A-Z0-9_]+__") {
-    throw "Rendered Kubernetes manifest contains unresolved placeholder '$($Matches[0])'."
+
+$kustomizationResources = [System.Collections.Generic.List[string]]::new()
+$kustomizationResources.Add($transportOverlayRelativePath)
+
+$kustomizationComponents = [System.Collections.Generic.List[string]]::new()
+$kustomizationComponents.Add($providerOverlayRelativePath)
+
+if ($scalerMode -eq "keda") {
+    $metadataLines = Format-FlatYamlMap (Get-RequiredConfigValue $scaler "metadata" "scaler") 8 $overlayTokens
+    $scalerType = Expand-Tokens ([string](Get-RequiredConfigValue $scaler "type" "scaler")) $overlayTokens
+    $scaledObject = @"
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: video-analyzer
+  namespace: $KubernetesNamespace
+spec:
+  scaleTargetRef:
+    name: video-analyzer
+  pollingInterval: 10
+  cooldownPeriod: 60
+  minReplicaCount: 0
+  maxReplicaCount: 10
+  triggers:
+    - type: $(ConvertTo-YamlScalar $scalerType)
+      metadata:
+$($metadataLines -join "`n")
+      authenticationRef:
+        name: $triggerAuthenticationName
+"@
+    Set-Content -LiteralPath (Join-Path $generatedDir "scaledobject.yaml") -Value $scaledObject -Encoding UTF8
+
+    if ($null -ne $triggerAuthenticationSpec -and $triggerAuthenticationSpec.Count -gt 0) {
+        $specLines = [System.Collections.Generic.List[string]]::new()
+        foreach ($key in $triggerAuthenticationSpec.Keys) {
+            $child = $triggerAuthenticationSpec[$key]
+            if ($child -is [System.Collections.IDictionary]) {
+                $specLines.Add("  $key`:")
+                foreach ($line in (Format-FlatYamlMap $child 4 $overlayTokens)) { $specLines.Add($line) }
+            } else {
+                $specLines.Add("  $key`: $(ConvertTo-YamlScalar (Expand-Tokens ([string]$child) $overlayTokens))")
+            }
+        }
+        $triggerAuthentication = @"
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: $triggerAuthenticationName
+  namespace: $KubernetesNamespace
+spec:
+$($specLines -join "`n")
+"@
+        Set-Content -LiteralPath (Join-Path $generatedDir "triggerauthentication.yaml") -Value $triggerAuthentication -Encoding UTF8
+        $kustomizationResources.Add("./triggerauthentication.yaml")
+    }
+    $kustomizationResources.Add("./scaledobject.yaml")
+}
+
+$literalsYaml = ($configLiterals | ForEach-Object { "      - $_" }) -join "`n"
+$resourcesYaml = ($kustomizationResources | ForEach-Object { "  - $_" }) -join "`n"
+$componentsYaml = ($kustomizationComponents | ForEach-Object { "  - $_" }) -join "`n"
+
+$kustomizationPatches = [System.Collections.Generic.List[string]]::new()
+$kustomizationPatches.Add("  - path: patch-analyzer.yaml")
+$kustomizationPatches.Add("  - path: patch-completion.yaml")
+$kustomizationPatches.Add("  - path: patch-serviceaccount.yaml")
+if ($null -ne $extraAnalyzerPatchPath) {
+    $kustomizationPatches.Add("  - path: $(Split-Path -Leaf $extraAnalyzerPatchPath)")
+}
+if ($null -ne $extraCompletionPatchPath) {
+    $kustomizationPatches.Add("  - path: $(Split-Path -Leaf $extraCompletionPatchPath)")
+}
+$patchesYaml = $kustomizationPatches -join "`n"
+
+$kustomization = @"
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# Generated by scripts/deploy.ps1 - do not edit by hand, do not commit.
+namespace: $KubernetesNamespace
+resources:
+$resourcesYaml
+components:
+$componentsYaml
+patches:
+$patchesYaml
+configMapGenerator:
+  - name: video-config
+    behavior: merge
+    literals:
+$literalsYaml
+generatorOptions:
+  disableNameSuffixHash: true
+"@
+Set-Content -LiteralPath (Join-Path $generatedDir "kustomization.yaml") -Value $kustomization -Encoding UTF8
+
+$manifest = kubectl kustomize $generatedDir
+Assert-NativeCommandSucceeded "Rendering the Kubernetes manifest with kubectl kustomize"
+if ($manifest -cmatch "__[A-Z0-9_]+__" -or $manifest -cmatch "\{\{[A-Z0-9_]+\}\}") {
+    throw "Rendered Kubernetes manifest contains an unresolved placeholder '$($Matches[0])'."
 }
 
 $renderedManifest = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($RenderedManifestPath)
@@ -478,7 +570,8 @@ Set-Content -Path $renderedManifest -Value $manifest -Encoding UTF8
 kubectl @kubectlContextArgs apply --filename $renderedManifest
 Assert-NativeCommandSucceeded "Applying the Kubernetes manifest"
 
-$completionDeployment = if ($MessageTransport -eq "storagequeue") { "video-completion-storagequeue" } else { "video-completion-servicebus" }
+$analysisDeployment = "video-analyzer"
+$completionDeployment = "video-completion"
 if ($scalerMode -eq "keda") {
     $unpausePatch = '{"metadata":{"annotations":{"autoscaling.keda.sh/paused":null,"autoscaling.keda.sh/paused-replicas":null}}}'
     kubectl @kubectlContextArgs patch "scaledobject/$analysisDeployment" --namespace $KubernetesNamespace --type merge --patch $unpausePatch

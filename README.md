@@ -84,6 +84,19 @@ Use ACR build agents instead of local Docker by adding `-AcrBuild`. The script s
 
 ## Deploy
 
+### Kubernetes manifests
+
+Deployment manifests live under `deploy/k8s/` as Kustomize bases, transport overlays, and provider components:
+
+- `deploy/k8s/base/` - namespace, service account, RBAC, the transport-agnostic analyzer/completion Deployments and PDB, and a `video-config` ConfigMap (plus a `video-ladder-profiles` ConfigMap generated from `deploy/ladder-profiles.json`) with safe/empty defaults for every provider-specific field.
+- `deploy/k8s/overlays/storagequeue/` and `deploy/k8s/overlays/servicebus/` - per-transport overlays that only swap the analyzer/completion container images for the transport-specific control-plane images.
+- `deploy/k8s/overlays/azure/` - an Azure/AKS **Kustomize component** (not a standalone overlay): Azure Workload Identity pod labels, AKS node selectors, the Azure Blob CSI driver, and static Azure `video-config` defaults (node selectors/tolerations for spot vs. regular media pools). Being a component, it composes with either transport overlay.
+- `deploy/k8s/overlays/external/` - the external-cluster counterpart component. It is intentionally inert (empty patches): every node selector, toleration, CSI driver, and identity value for an external cluster is user-supplied, so it is injected by the generated overlay below instead of being hardcoded here.
+
+Because storage account names, the workload identity client ID, the Service Bus namespace, image tags, and KEDA scaler metadata are only known at deploy time, `scripts/deploy.ps1` writes a small generated overlay to `deploy/.generated/<mode>-<transport>/` (gitignored) that lists the chosen transport overlay as a `resources:` entry, the chosen provider overlay as a `components:` entry, and adds patches/`configMapGenerator` literals (and, when KEDA is enabled, a generated `ScaledObject`/`TriggerAuthentication` pair) carrying the real values. `kubectl kustomize deploy/.generated/<mode>-<transport>` renders the final manifest; you can run that command yourself to inspect or diff what will be applied. Every checked-in base/overlay can also be rendered standalone without a cluster, e.g. `kubectl kustomize deploy/k8s/base` or `kubectl kustomize deploy/k8s/overlays/storagequeue`.
+
+`scripts/deploy.ps1` writes the rendered manifest to `-RenderedManifestPath` (default `deploy/rendered.yaml`, gitignored) for inspection, applies it with `kubectl apply --filename`, unpauses the KEDA `ScaledObject` when the scaler is enabled, and restarts the `video-analyzer`/`video-completion` Deployments so they pick up the new images - the same steps the old `__PLACEHOLDER__`-based script performed, just backed by Kustomize instead of string replacement.
+
 ### Azure (default)
 
 ```powershell
@@ -99,13 +112,8 @@ Audio is limited to six hours by default. Override the analysis-stage limit at d
 The default deploys the Rust Storage Queue control plane and Rust media workers. Deploy either or both control planes; select the media runtime independently for each namespace:
 
 ```powershell
-# Rust analyzer/completion over Storage Queue, with .NET encoder/stitcher
-./scripts/deploy.ps1 -Location westus2 `
-    -MessageTransport storagequeue -MediaRuntime dotnet
-
-# .NET analysis/completion over Service Bus, with Rust encoder/stitcher
-./scripts/deploy.ps1 -Location westus2 `
-    -MessageTransport servicebus -MediaRuntime rust
+./scripts/deploy.ps1 -Location westus2 -MessageTransport storagequeue -MediaRuntime dotnet
+./scripts/deploy.ps1 -Location westus2 -MessageTransport servicebus -MediaRuntime rust
 ```
 
 The resource group defaults to `<current-user-id>-video`, so each user gets an isolated deployment. Pass `-ResourceGroup` to override it. The Kubernetes namespace defaults to `video-storagequeue` or `video-servicebus`; pass `-KubernetesNamespace` to override it.
@@ -113,33 +121,24 @@ The resource group defaults to `<current-user-id>-video`, so each user gets an i
 To compile a specific FFmpeg release from the official GitHub mirror:
 
 ```powershell
-./scripts/deploy.ps1 `
-    -Location westus2 `
-    -FfmpegBuild custom `
-    -FfmpegVersion 9.0
+./scripts/deploy.ps1 -Location westus2 -FfmpegBuild custom -FfmpegVersion 9.0
 ```
 
-The script deploys [infra/main.bicep](infra/main.bicep), which creates or updates the selected broker and its RBAC assignments. Existing resources from the other mode are retained. It calls [scripts/build-images.ps1](scripts/build-images.ps1) to build the corresponding Rust or .NET control-plane images, build .NET and Rust encoder, audio encoder, and stitcher images for both `linux/amd64` and `linux/arm64`, and publish a multi-platform manifest for each media image. It then combines the shared [deploy/k8s/video.yaml](deploy/k8s/video.yaml) resources with the selected transport manifest. Each transport deployment only applies and restarts resources in its own namespace, allowing both control planes to remain active. The AKS system pool hosts analysis and completion. Dedicated x64 Spot, ARM64 Spot, and regular media-processing pools autoscale from zero. Encoding and stitching use any available Spot media architecture unless `useSpot` is `false`; no architecture-specific application code or image tag is required.
+The script still deploys `infra/main.bicep`, builds/pushes the selected images, and fetches AKS credentials. After the Azure deployment finishes, it reads `deploy/overlays/azure-config.json` - now a small JSON profile that only carries the KEDA scaler type/metadata per transport, since every other Azure default (node selectors, tolerations, CSI driver, workload-identity pod label) is Kustomize-native and lives in `deploy/k8s/overlays/azure/` - resolves its `{{TOKEN}}` placeholders from the Bicep deployment outputs, writes the generated overlay described above, renders it with `kubectl kustomize`, and applies only the selected transport namespace.
 
-The infrastructure also enables Container Insights with managed-identity authentication and retains container logs in Log Analytics for 30 days, including logs from pods deleted after KEDA scales a deployment to zero.
-
-When the infrastructure has not changed, skip the Bicep deployment and reuse the latest successful deployment outputs while rebuilding and deploying all container images:
+When the infrastructure has not changed, skip the Bicep deployment and reuse the latest successful deployment outputs while rebuilding and redeploying all container images:
 
 ```powershell
-./scripts/deploy.ps1 `
-    -SkipInfrastructureDeployment `
-    -MessageTransport storagequeue
+./scripts/deploy.ps1 -SkipInfrastructureDeployment -MessageTransport storagequeue
 ```
 
 When skipping infrastructure deployment, the script reuses the latest successful deployment record for the requested `-MessageTransport`. Run infrastructure deployment at least once for each transport so its broker RBAC and namespace-specific federated credential exist.
 
 Azure RBAC can take several minutes to propagate after first deployment. If the first pods report authorization failures, restart them after propagation.
 
-Azure-specific scheduling, CSI, and scaler defaults are not hardcoded in `scripts/deploy.ps1`; they live in [deploy/overlays/azure-config.json](deploy/overlays/azure-config.json), an overlay config in the same shape as the external-cluster config below. The script fills in `{{...}}` tokens (storage account names, container names, the workload identity client ID, and the Service Bus namespace short name) from the Bicep deployment outputs, then applies the overlay the same way it applies an external config. Edit that file to change Azure node selectors, tolerations, CSI mount options, or scaler tuning without touching the script.
-
 ### Existing Kubernetes cluster
 
-External mode renders and applies the same resources without invoking Azure CLI, Bicep, ACR, or image builds. Prerequisites are:
+External mode renders and applies the same Kustomize-based resources without invoking Azure CLI, Bicep, ACR, or image builds. Prerequisites are:
 
 - an existing kubeconfig context and namespace-creation permission;
 - FastVideo images already pushed under one registry repository prefix;
@@ -153,15 +152,10 @@ Copy [deploy/external-config.example.json](deploy/external-config.example.json) 
 ```powershell
 Copy-Item deploy/external-config.example.json ~/fastvideo-external.json
 # Edit ~/fastvideo-external.json; do not add credentials or connection strings.
-./scripts/deploy.ps1 `
-    -DeploymentMode external `
-    -ExternalConfigPath ~/fastvideo-external.json `
-    -MessageTransport storagequeue `
-    -MediaRuntime rust `
-    -ImageTag v1
+./scripts/deploy.ps1 -DeploymentMode external -ExternalConfigPath ~/fastvideo-external.json -MessageTransport storagequeue -MediaRuntime rust -ImageTag v1
 ```
 
-The config controls the kube context, namespace, image repository, service account and annotations, pod labels, CSI driver/attributes, control-plane and Spot/regular media node selectors and tolerations, and scaler type/metadata/authentication. `useSpot` selects the configured Spot or regular scheduling profile; it does not assume a provider-specific node label. With scaler mode `none`, scaling is deliberately disabled and the analyzer stays at one replica.
+The config remains the single user-editable JSON profile - there is no separate Kustomize authoring step. `scripts/deploy.ps1` reads it directly and writes every value (kube context, namespace, image repository, service account and annotations, pod labels, control-plane and Spot/regular media node selectors/tolerations, CSI driver/attributes, and scaler type/metadata/authentication) into the generated overlay at `deploy/.generated/external-<transport>/`, layered on the inert `deploy/k8s/overlays/external/` component. With scaler mode `none`, scaling is deliberately disabled and the analyzer stays at one replica.
 
 The portability boundary is Kubernetes scheduling, registry naming, CSI mounting, and scaler configuration. It is **not yet a provider-neutral data plane**: queue and result clients still use Azure Storage Queue or Azure Service Bus SDKs, blob paths and manifests still use Azure Blob-compatible HTTPS URLs, and authentication still expects Microsoft Entra credentials. A different broker or object store requires a worker adapter implementation; configuring another scaler or CSI driver alone does not add that adapter. The example therefore uses externally provisioned Azure-compatible services and contains identifiers only, never secrets or connection strings.
 

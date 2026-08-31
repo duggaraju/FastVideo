@@ -1,0 +1,30 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: video-analyzer
+spec:
+  template:
+    metadata:
+      labels:
+        azure.workload.identity/use: "true"
+    spec:
+      nodeSelector:
+        kubernetes.io/os: linux
+        kubernetes.azure.com/mode: system
+      volumes:
+        - name: input-storage
+          csi:
+            driver: blob.csi.azure.com
+            readOnly: true
+            volumeAttributes:
+              protocol: fuse2
+              mountWithWorkloadIdentityToken: "true"
+              mountOptions: --allow-other --use-attr-cache=true --file-cache-timeout-in-seconds=300 --cancel-list-on-mount-seconds=10
+        - name: output-storage
+          csi:
+            driver: blob.csi.azure.com
+            readOnly: false
+            volumeAttributes:
+              protocol: fuse2
+              mountWithWorkloadIdentityToken: "true"
+              mountOptions: --allow-other --use-attr-cache=true --file-cache-timeout-in-seconds=30 --disable-writeback-cache=true

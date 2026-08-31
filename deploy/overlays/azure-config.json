@@ -1,54 +1,5 @@
 {
-  "serviceAccountName": "video-worker",
-  "serviceAccountAnnotations": {
-    "azure.workload.identity/client-id": "{{WORKLOAD_CLIENT_ID}}"
-  },
-  "podLabels": {
-    "azure.workload.identity/use": "true"
-  },
-  "controlPlaneNodeSelector": {
-    "kubernetes.io/os": "linux",
-    "kubernetes.azure.com/mode": "system"
-  },
-  "controlPlaneTolerations": [],
-  "mediaNodeSelectorSpot": {
-    "workload": "video-encoding",
-    "kubernetes.azure.com/scalesetpriority": "spot",
-    "kubernetes.io/os": "linux"
-  },
-  "mediaNodeSelectorRegular": {
-    "workload": "video-encoding",
-    "kubernetes.azure.com/scalesetpriority": "regular",
-    "kubernetes.io/os": "linux"
-  },
-  "mediaTolerationsSpot": [
-    {
-      "key": "kubernetes.azure.com/scalesetpriority",
-      "operator": "Equal",
-      "value": "spot",
-      "effect": "NoSchedule"
-    }
-  ],
-  "mediaTolerationsRegular": [],
-  "storage": {
-    "csiDriver": "blob.csi.azure.com",
-    "inputVolumeAttributes": {
-      "protocol": "fuse2",
-      "storageAccount": "{{INPUT_STORAGE_ACCOUNT}}",
-      "containerName": "{{INPUT_STORAGE_CONTAINER}}",
-      "ClientID": "{{WORKLOAD_CLIENT_ID}}",
-      "mountWithWorkloadIdentityToken": "true",
-      "mountOptions": "--allow-other --use-attr-cache=true --file-cache-timeout-in-seconds=300 --cancel-list-on-mount-seconds=10"
-    },
-    "outputVolumeAttributes": {
-      "protocol": "fuse2",
-      "storageAccount": "{{OUTPUT_STORAGE_ACCOUNT}}",
-      "containerName": "{{OUTPUT_STORAGE_CONTAINER}}",
-      "ClientID": "{{WORKLOAD_CLIENT_ID}}",
-      "mountWithWorkloadIdentityToken": "true",
-      "mountOptions": "--allow-other --use-attr-cache=true --file-cache-timeout-in-seconds=30 --disable-writeback-cache=true"
-    }
-  },
+  "_comment": "Static Azure defaults that are Kustomize-native (workload identity pod labels/annotations, node selectors/tolerations, CSI driver, volume attributes) live in deploy/k8s/overlays/azure/. This file only carries the KEDA scaler configuration per message transport, because its trigger type/metadata shape is provider policy rather than a fixed Kubernetes field scripts/deploy.ps1 can patch generically. {{TOKEN}} placeholders are resolved by scripts/deploy.ps1 from Bicep deployment outputs before being written into the generated overlay.",
   "scaler": {
     "storagequeue": {
       "mode": "keda",
