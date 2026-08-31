@@ -5,6 +5,7 @@ use azure_identity::{DeveloperToolsCredential, WorkloadIdentityCredential};
 use azure_storage_queue::models::QueueMessage;
 use azure_storage_queue::{QueueClient, QueueServiceClient};
 use k8s_openapi::api::batch::v1::Job;
+use k8s_openapi::api::coordination::v1::Lease;
 use kube::api::{DeleteParams, Patch, PatchParams, PostParams};
 use kube::{Api, Client};
 use serde_json::json;
@@ -18,6 +19,11 @@ use video::{
     },
     parallelism,
 };
+
+mod leader_election;
+use leader_election::LeaseLeaderElector;
+
+const LEADER_LEASE_NAME: &str = "video-completion-leader";
 
 #[derive(Debug, Clone)]
 struct CompletionConfig {
@@ -40,14 +46,42 @@ async fn main() -> Result<()> {
     let client = Client::try_default()
         .await
         .context("Failed to initialize in-cluster Kubernetes client")?;
-    let jobs: Api<Job> = Api::namespaced(client, &cfg.namespace);
+    let jobs: Api<Job> = Api::namespaced(client.clone(), &cfg.namespace);
+    let leases: Api<Lease> = Api::namespaced(client, &cfg.namespace);
     let result_queue = queue_client(&cfg.output_storage_account, &cfg.result_queue)?;
+
+    let identity = std::env::var("POD_NAME")
+        .unwrap_or_else(|_| std::env::var("HOSTNAME").unwrap_or_else(|_| "completion".to_owned()));
+    let lease_duration_seconds = std::cmp::max(30, (cfg.poll_seconds as i32).saturating_mul(3));
+    let mut elector =
+        LeaseLeaderElector::new(leases, LEADER_LEASE_NAME, identity, lease_duration_seconds);
 
     tracing::info!(queue = %cfg.result_queue, "Completion worker started");
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(cfg.poll_seconds));
 
     loop {
-        interval.tick().await;
+        tokio::select! {
+            _ = interval.tick() => {}
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("Shutdown signal received; releasing completion leader lease");
+                if let Err(error) = elector.try_release().await {
+                    tracing::warn!(%error, "Failed to release completion leader lease during shutdown");
+                }
+                return Ok(());
+            }
+        }
+
+        let is_leader = match elector.try_acquire_or_renew().await {
+            Ok(leading) => leading,
+            Err(error) => {
+                tracing::error!(%error, "Leader election iteration failed");
+                false
+            }
+        };
+        if !is_leader {
+            tracing::debug!("Not the completion leader this cycle; skipping reconciliation");
+            continue;
+        }
         if let Err(error) = reconcile_once(&cfg, &jobs, &result_queue).await {
             tracing::error!(%error, "Completion reconciliation iteration failed");
         }
@@ -349,6 +383,10 @@ async fn submit_stitch_job(
     }
 
     let stitch_image = required_image(media_runtime, "Stitcher")?;
+    let stitch_active_deadline_seconds: i64 =
+        config::setting("Encoding__StitchJobActiveDeadlineSeconds", "21600")
+            .parse()
+            .context("Encoding__StitchJobActiveDeadlineSeconds is invalid")?;
     let stitch_job_json = json!({
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -365,6 +403,7 @@ async fn submit_stitch_job(
         },
         "spec": {
             "backoffLimit": 6,
+            "activeDeadlineSeconds": stitch_active_deadline_seconds,
             "ttlSecondsAfterFinished": 3600,
             "template": {
                 "metadata": {

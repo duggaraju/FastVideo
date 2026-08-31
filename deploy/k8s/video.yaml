@@ -23,6 +23,9 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -78,6 +81,9 @@ data:
   Encoding__MaxAudioDurationSeconds: "__MAX_AUDIO_DURATION_SECONDS__"
   Encoding__ParallelizationStrategy: "fixed-duration"
   Encoding__LadderProfilesPath: "/etc/video/ladder/ladder-profiles.json"
+  Encoding__EncodeJobActiveDeadlineSeconds: "21600"
+  Encoding__AudioEncodeJobActiveDeadlineSeconds: "21600"
+  Encoding__StitchJobActiveDeadlineSeconds: "21600"
 ---
 apiVersion: v1
 kind: ConfigMap
