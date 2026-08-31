@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/dotnet/">
+    <Project Path="VideoAnalysis/VideoAnalysis.csproj" />
+    <Project Path="VideoAudioEncoder/VideoAudioEncoder.csproj" />
+    <Project Path="VideoCompletion/VideoCompletion.csproj" />
+    <Project Path="VideoEncoder/VideoEncoder.csproj" />
+    <Project Path="VideoContracts/VideoContracts.csproj" />
+    <Project Path="VideoStitcher/VideoStitcher.csproj" />
+  </Folder>
+</Solution>
