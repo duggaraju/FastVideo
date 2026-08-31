@@ -6,8 +6,8 @@ Run commands from the repository root unless a command changes directories.
 
 ```powershell
 # .NET 10 solution
-dotnet restore Video.slnx
-dotnet build Video.slnx --no-restore --configuration Release
+dotnet restore dotnet/Video.slnx
+dotnet build dotnet/Video.slnx --no-restore --configuration Release
 
 # Rust 1.98 workspace
 Push-Location rust
@@ -27,7 +27,7 @@ cargo test --locked --package analyzer validates_submission_contract
 Pop-Location
 ```
 
-There are no .NET test projects in `Video.slnx`. The deployed end-to-end workflow test requires Azure access, an existing deployment, `az`, and `kubectl`:
+There are no .NET test projects in `dotnet/Video.slnx`. The deployed end-to-end workflow test requires Azure access, an existing deployment, `az`, and `kubectl`:
 
 ```powershell
 ./scripts/test-workflow.ps1

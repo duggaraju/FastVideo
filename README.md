@@ -40,8 +40,8 @@ Runtime containers use the .NET 10 Azure Linux 3 image and run as the non-root `
 ## Build
 
 ```powershell
-dotnet restore Video.slnx
-dotnet build Video.slnx --no-restore --configuration Release
+dotnet restore dotnet/Video.slnx
+dotnet build dotnet/Video.slnx --no-restore --configuration Release
 ```
 
 The Rust implementation in `rust` provides analyzer, completion, encoder, and stitcher workers:
