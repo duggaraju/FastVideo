@@ -40,7 +40,11 @@ function Assert-NativeCommandSucceeded([string] $Operation) {
 
 function Get-ConfigValue([System.Collections.IDictionary] $Config, [string] $Name, $Default = $null) {
     if ($null -ne $Config -and $Config.Contains($Name) -and $null -ne $Config[$Name]) {
-        return $Config[$Name]
+        $value = $Config[$Name]
+        if ($value -is [System.Collections.IEnumerable] -and $value -isnot [string] -and $value -isnot [System.Collections.IDictionary]) {
+            return , @($value)
+        }
+        return $value
     }
     return $Default
 }
@@ -112,6 +116,27 @@ function ConvertTo-JsonConfig($Value) {
         return $items | ConvertTo-Json -Compress -Depth 20 -AsArray
     }
     return $Value | ConvertTo-Json -Compress -Depth 20
+}
+
+function Resolve-OverlayTokens($Value, [System.Collections.IDictionary] $Tokens) {
+    if ($Value -is [string]) {
+        $result = $Value
+        foreach ($key in $Tokens.Keys) {
+            $result = $result.Replace("{{$key}}", [string]$Tokens[$key])
+        }
+        return $result
+    }
+    if ($Value -is [System.Collections.IDictionary]) {
+        $copy = [ordered]@{}
+        foreach ($key in $Value.Keys) { $copy[$key] = Resolve-OverlayTokens $Value[$key] $Tokens }
+        return $copy
+    }
+    if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
+        $resolvedItems = [System.Collections.Generic.List[object]]::new()
+        foreach ($item in $Value) { $resolvedItems.Add((Resolve-OverlayTokens $item $Tokens)) }
+        return , $resolvedItems.ToArray()
+    }
+    return $Value
 }
 
 function New-TriggerAuthenticationResource(
@@ -349,72 +374,40 @@ if ($DeploymentMode -eq "external") {
     $outputStorageAccount = [string]$deployment.outputStorageName.value
     $outputStorageContainer = [string]$deployment.outputContainerName.value
     $workloadClientId = [string]$deployment.workloadClientId.value
-    $serviceAccountAnnotations = @{ "azure.workload.identity/client-id" = $workloadClientId }
-    $podLabels = @{ "azure.workload.identity/use" = "true" }
-    $controlPlaneNodeSelector = @{
-        "kubernetes.io/os" = "linux"
-        "kubernetes.azure.com/mode" = "system"
+
+    $azureOverlayPath = Join-Path $root "deploy/overlays/azure-config.json"
+    try {
+        $azureOverlay = Get-Content -LiteralPath $azureOverlayPath -Raw | ConvertFrom-Json -AsHashtable
+    } catch {
+        throw "Azure overlay config '$azureOverlayPath' is not valid JSON: $($_.Exception.Message)"
     }
-    $mediaNodeSelectorSpot = @{
-        "workload" = "video-encoding"
-        "kubernetes.azure.com/scalesetpriority" = "spot"
-        "kubernetes.io/os" = "linux"
+    $overlayTokens = @{
+        WORKLOAD_CLIENT_ID = $workloadClientId
+        INPUT_STORAGE_ACCOUNT = $inputStorageAccount
+        INPUT_STORAGE_CONTAINER = $inputStorageContainer
+        OUTPUT_STORAGE_ACCOUNT = $outputStorageAccount
+        OUTPUT_STORAGE_CONTAINER = $outputStorageContainer
+        SERVICE_BUS_NAMESPACE_SHORT = $(if ([string]::IsNullOrWhiteSpace($serviceBusNamespace)) { "" } else { $serviceBusNamespace.Split(".")[0] })
     }
-    $mediaNodeSelectorRegular = @{
-        "workload" = "video-encoding"
-        "kubernetes.azure.com/scalesetpriority" = "regular"
-        "kubernetes.io/os" = "linux"
-    }
-    $mediaTolerationsSpot = @(@{
-        key = "kubernetes.azure.com/scalesetpriority"
-        operator = "Equal"
-        value = "spot"
-        effect = "NoSchedule"
-    })
-    $storageCsiDriver = "blob.csi.azure.com"
-    $inputCsiVolumeAttributes = @{
-        protocol = "fuse2"
-        storageAccount = $inputStorageAccount
-        containerName = $inputStorageContainer
-        ClientID = $workloadClientId
-        mountWithWorkloadIdentityToken = "true"
-        mountOptions = "--allow-other --use-attr-cache=true --file-cache-timeout-in-seconds=300 --cancel-list-on-mount-seconds=10"
-    }
-    $outputCsiVolumeAttributes = @{
-        protocol = "fuse2"
-        storageAccount = $outputStorageAccount
-        containerName = $outputStorageContainer
-        ClientID = $workloadClientId
-        mountWithWorkloadIdentityToken = "true"
-        mountOptions = "--allow-other --use-attr-cache=true --file-cache-timeout-in-seconds=30 --disable-writeback-cache=true"
-    }
-    $triggerAuthentication = @{
-        podIdentity = @{
-            provider = "azure-workload"
-            identityId = $workloadClientId
-        }
-    }
-    $scalerMetadata = if ($MessageTransport -eq "storagequeue") {
-        @{
-            accountName = $outputStorageAccount
-            queueName = "video-submitted"
-            queueLength = "1"
-            activationQueueLength = "0"
-        }
-    } else {
-        @{
-            namespace = $serviceBusNamespace.Split(".")[0]
-            queueName = "video-submitted"
-            messageCount = "1"
-            activationMessageCount = "0"
-        }
-    }
-    $scaler = @{
-        mode = "keda"
-        type = $(if ($MessageTransport -eq "storagequeue") { "azure-queue" } else { "azure-servicebus" })
-        metadata = $scalerMetadata
-        authenticationRef = "video-workload-identity"
-    }
+    $azureOverlay = Resolve-OverlayTokens $azureOverlay $overlayTokens
+
+    $serviceAccountAnnotations = Get-ConfigValue $azureOverlay "serviceAccountAnnotations" @{}
+    $podLabels = Get-ConfigValue $azureOverlay "podLabels" @{}
+    $controlPlaneNodeSelector = Get-ConfigValue $azureOverlay "controlPlaneNodeSelector" @{}
+    $controlPlaneTolerations = Get-ConfigValue $azureOverlay "controlPlaneTolerations" @()
+    $mediaNodeSelectorSpot = Get-ConfigValue $azureOverlay "mediaNodeSelectorSpot" @{}
+    $mediaNodeSelectorRegular = Get-ConfigValue $azureOverlay "mediaNodeSelectorRegular" @{}
+    $mediaTolerationsSpot = Get-ConfigValue $azureOverlay "mediaTolerationsSpot" @()
+    $mediaTolerationsRegular = Get-ConfigValue $azureOverlay "mediaTolerationsRegular" @()
+
+    $azureStorage = Get-RequiredConfigValue $azureOverlay "storage" $azureOverlayPath
+    $storageCsiDriver = [string](Get-RequiredConfigValue $azureStorage "csiDriver" $azureOverlayPath)
+    $inputCsiVolumeAttributes = Get-RequiredConfigValue $azureStorage "inputVolumeAttributes" $azureOverlayPath
+    $outputCsiVolumeAttributes = Get-RequiredConfigValue $azureStorage "outputVolumeAttributes" $azureOverlayPath
+
+    $azureScalers = Get-RequiredConfigValue $azureOverlay "scaler" $azureOverlayPath
+    $scaler = Get-RequiredConfigValue $azureScalers $MessageTransport $azureOverlayPath
+    $triggerAuthentication = Get-ConfigValue $scaler "triggerAuthentication"
 }
 
 $ladderProfilesPath = Join-Path $root "deploy/ladder-profiles.json"

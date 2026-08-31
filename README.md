@@ -135,6 +135,8 @@ When skipping infrastructure deployment, the script reuses the latest successful
 
 Azure RBAC can take several minutes to propagate after first deployment. If the first pods report authorization failures, restart them after propagation.
 
+Azure-specific scheduling, CSI, and scaler defaults are not hardcoded in `scripts/deploy.ps1`; they live in [deploy/overlays/azure-config.json](deploy/overlays/azure-config.json), an overlay config in the same shape as the external-cluster config below. The script fills in `{{...}}` tokens (storage account names, container names, the workload identity client ID, and the Service Bus namespace short name) from the Bicep deployment outputs, then applies the overlay the same way it applies an external config. Edit that file to change Azure node selectors, tolerations, CSI mount options, or scaler tuning without touching the script.
+
 ### Existing Kubernetes cluster
 
 External mode renders and applies the same resources without invoking Azure CLI, Bicep, ACR, or image builds. Prerequisites are:
