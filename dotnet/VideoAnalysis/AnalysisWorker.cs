@@ -1,4 +1,5 @@
 using System.Text.Json;
+using Azure;
 using Azure.Messaging.ServiceBus;
 using FFMpegCore;
 using k8s;
@@ -156,15 +157,34 @@ public sealed class AnalysisWorker(
                 sourceVideo.BitRate / 1000,
                 string.Join(",", encodingProfiles.Select(profile => $"{profile.Name}:{profile.Width}x{profile.Height}@{profile.MaxVideoBitrateKbps}k")));
         }
-        catch (JsonException exception)
+        catch (Exception exception) when (IsTransient(exception))
         {
-            await args.DeadLetterMessageAsync(args.Message, "InvalidMessage", exception.Message, args.CancellationToken);
+            logger.LogWarning(exception, "Transient failure processing analysis message; message will be retried");
         }
-        catch (ArgumentException exception)
+        catch (Exception exception)
         {
-            await args.DeadLetterMessageAsync(args.Message, "InvalidMessage", exception.Message, args.CancellationToken);
+            logger.LogWarning(exception, "Non-retryable failure processing analysis message; dead-lettering");
+            await args.DeadLetterMessageAsync(args.Message, exception.GetType().Name, exception.Message, args.CancellationToken);
         }
     }
+
+    /// <summary>
+    /// Determines whether an exception represents a transient condition (network blip, throttling,
+    /// timeout) that is worth retrying via message redelivery, as opposed to a deterministic
+    /// validation/configuration failure that will fail identically on every retry and should be
+    /// dead-lettered immediately instead of looping until Service Bus exhausts MaxDeliveryCount.
+    /// </summary>
+    private static bool IsTransient(Exception exception) =>
+        exception switch
+        {
+            OperationCanceledException => false,
+            IOException => true,
+            TimeoutException => true,
+            ServiceBusException { IsTransient: true } => true,
+            RequestFailedException requestFailed => requestFailed.Status is 408 or 429 or >= 500,
+            HttpRequestException => true,
+            _ => false
+        };
 
     private static Task ExtractAudioAsync(string inputPath, string audioPath, string audioCodec) =>
         FFMpegArguments
@@ -302,6 +322,7 @@ public sealed class AnalysisWorker(
                 Completions = manifest.SegmentCount,
                 Parallelism = Math.Min(manifest.SegmentCount, minParallelismPerJob),
                 BackoffLimitPerIndex = 5,
+                ActiveDeadlineSeconds = configuration.GetValue("Encoding:EncodeJobActiveDeadlineSeconds", 21600),
                 TtlSecondsAfterFinished = 86400
             }
         };
@@ -406,7 +427,7 @@ public sealed class AnalysisWorker(
                     [JobNames.JobIdAnnotation] = manifest.JobId
                 }
             },
-            Spec = new V1JobSpec { Template = pod, BackoffLimit = 6, TtlSecondsAfterFinished = 86400 }
+            Spec = new V1JobSpec { Template = pod, BackoffLimit = 6, ActiveDeadlineSeconds = configuration.GetValue("Encoding:AudioEncodeJobActiveDeadlineSeconds", 21600), TtlSecondsAfterFinished = 86400 }
         };
         await kubernetes.BatchV1.CreateNamespacedJobAsync(job, targetNamespace, cancellationToken: cancellationToken);
     }

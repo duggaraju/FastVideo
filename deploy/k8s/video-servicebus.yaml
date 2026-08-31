@@ -71,7 +71,7 @@ metadata:
   name: video-completion-servicebus
   namespace: __KUBERNETES_NAMESPACE__
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: video-completion-servicebus
@@ -90,12 +90,28 @@ spec:
         - name: completion
           image: "__ACR_LOGIN_SERVER__/video-completion-servicebus:__IMAGE_TAG__"
           imagePullPolicy: Always
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
           envFrom:
             - configMapRef:
                 name: video-config
           resources:
             requests: { cpu: "50m", memory: "128Mi" }
             limits: { cpu: "250m", memory: "512Mi" }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: video-completion-servicebus
+  namespace: __KUBERNETES_NAMESPACE__
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: video-completion-servicebus
 ---
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject

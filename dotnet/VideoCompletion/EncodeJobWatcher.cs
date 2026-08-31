@@ -19,24 +19,35 @@ public sealed class EncodeJobWatcher(
         await using var sender = serviceBus.CreateSender(
             configuration["ServiceBus:VideoResultQueue"] ?? "video-results");
 
-        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(10));
-        do
-        {
-            try
+        var targetNamespace = configuration["Kubernetes:Namespace"] ?? "video-servicebus";
+        var identity = Environment.GetEnvironmentVariable("POD_NAME") ?? Environment.MachineName;
+        var pollInterval = TimeSpan.FromSeconds(configuration.GetValue("Completion:PollSeconds", 10));
+        var elector = new LeaseLeaderElector(
+            kubernetes,
+            targetNamespace,
+            "video-completion-leader",
+            identity,
+            logger,
+            leaseDuration: TimeSpan.FromSeconds(Math.Max(30, pollInterval.TotalSeconds * 3)),
+            retryPeriod: pollInterval);
+
+        await elector.RunAsync(
+            async leaderToken =>
             {
-                await LogFailedPodsAsync(stoppingToken);
-                await ReportTerminalVideosAsync(sender, stoppingToken);
-            }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
-            {
-                break;
-            }
-            catch (Exception exception)
-            {
-                logger.LogError(exception, "Encode job watcher iteration failed");
-            }
-        }
-        while (await timer.WaitForNextTickAsync(stoppingToken));
+                try
+                {
+                    await LogFailedPodsAsync(leaderToken);
+                    await ReportTerminalVideosAsync(sender, leaderToken);
+                }
+                catch (OperationCanceledException) when (leaderToken.IsCancellationRequested)
+                {
+                }
+                catch (Exception exception)
+                {
+                    logger.LogError(exception, "Encode job watcher iteration failed");
+                }
+            },
+            stoppingToken);
     }
 
     private async Task LogFailedPodsAsync(CancellationToken cancellationToken)
@@ -326,7 +337,7 @@ public sealed class EncodeJobWatcher(
                     [JobNames.JobIdAnnotation] = jobId
                 }
             },
-            Spec = new V1JobSpec { Template = pod, BackoffLimit = 6, TtlSecondsAfterFinished = 3600 }
+            Spec = new V1JobSpec { Template = pod, BackoffLimit = 6, ActiveDeadlineSeconds = configuration.GetValue("Encoding:StitchJobActiveDeadlineSeconds", 21600), TtlSecondsAfterFinished = 3600 }
         };
         await kubernetes.BatchV1.CreateNamespacedJobAsync(stitchJob, targetNamespace, cancellationToken: cancellationToken);
         logger.LogInformation("Submitted stitch job for {JobId}", jobId);

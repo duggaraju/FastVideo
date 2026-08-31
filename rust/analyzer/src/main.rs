@@ -536,6 +536,10 @@ async fn submit_encoding_job(
     }
 
     let encoder_image = required_image(media_runtime, "Encoder")?;
+    let encode_active_deadline_seconds: i64 =
+        config::setting("Encoding__EncodeJobActiveDeadlineSeconds", "21600")
+            .parse()
+            .context("Encoding__EncodeJobActiveDeadlineSeconds is invalid")?;
 
     let job_json = json!({
         "apiVersion": "batch/v1",
@@ -554,6 +558,7 @@ async fn submit_encoding_job(
             "completions": manifest.segment_count,
             "parallelism": std::cmp::min(manifest.segment_count as i32, cfg.min_parallelism_per_job),
             "backoffLimitPerIndex": 5,
+            "activeDeadlineSeconds": encode_active_deadline_seconds,
             "ttlSecondsAfterFinished": 86400,
             "template": {
                 "metadata": {
@@ -684,6 +689,10 @@ async fn submit_audio_encoding_job(
     }
 
     let audio_encoder_image = required_image(media_runtime, "AudioEncoder")?;
+    let audio_encode_active_deadline_seconds: i64 =
+        config::setting("Encoding__AudioEncodeJobActiveDeadlineSeconds", "21600")
+            .parse()
+            .context("Encoding__AudioEncodeJobActiveDeadlineSeconds is invalid")?;
     let job_json = json!({
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -698,6 +707,7 @@ async fn submit_audio_encoding_job(
         },
         "spec": {
             "backoffLimit": 6,
+            "activeDeadlineSeconds": audio_encode_active_deadline_seconds,
             "ttlSecondsAfterFinished": 86400,
             "template": {
                 "metadata": { "labels": {
