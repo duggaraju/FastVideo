@@ -1,0 +1,82 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: video-encoder-template
+  labels:
+    app.kubernetes.io/name: video-encoder
+    video/job-id: placeholder
+  annotations:
+    video/job-id: placeholder
+    video/audio-blob-name: placeholder/audio.m4a
+    video/audio-encoding-required: "false"
+    video/output-path: https://example.invalid/output
+    video/output-type: mp4
+    video/calculate-vmaf: "false"
+    video/media-runtime: rust
+    video.fastvideo/use-spot: "true"
+spec:
+  completionMode: Indexed
+  completions: 1
+  parallelism: 1
+  backoffLimitPerIndex: 5
+  activeDeadlineSeconds: 21600
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: video-encoder
+        video/job-id: placeholder
+    spec:
+      serviceAccountName: video-worker
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 120
+      nodeSelector: {}
+      tolerations: []
+      volumes:
+        - name: input-storage
+          csi:
+            driver: ""
+            readOnly: true
+            volumeAttributes: {}
+        - name: output-storage
+          csi:
+            driver: ""
+            readOnly: false
+            volumeAttributes: {}
+      containers:
+        - name: encoder
+          image: video-encoder-rust:latest
+          env:
+            - name: JOB_COMPLETION_INDEX
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+            - name: JOB_ID
+              value: ""
+            - name: SOURCE_VIDEO_URI
+              value: https://example.invalid/input.mp4
+            - name: VIDEO_CODEC
+              value: libsvtav1
+            - name: CALCULATE_VMAF
+              value: "false"
+            - name: INPUT_STORAGE_ACCOUNT_NAME
+              value: ""
+            - name: INPUT_STORAGE_CONTAINER
+              value: ""
+            - name: INPUT_MOUNT_PATH
+              value: /mnt/input
+            - name: OUTPUT_STORAGE_ACCOUNT_NAME
+              value: ""
+            - name: OUTPUT_STORAGE_CONTAINER
+              value: ""
+            - name: OUTPUT_MOUNT_PATH
+              value: /mnt/output
+          volumeMounts:
+            - name: input-storage
+              mountPath: /mnt/input
+              readOnly: true
+            - name: output-storage
+              mountPath: /mnt/output
+          resources:
+            requests: { cpu: "1750m", memory: "4Gi" }
+            limits: { cpu: "4", memory: "8Gi" }

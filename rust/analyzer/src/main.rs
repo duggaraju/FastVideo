@@ -4,10 +4,12 @@ use azure_core::http::Url;
 use azure_identity::{DeveloperToolsCredential, WorkloadIdentityCredential};
 use azure_storage_queue::models::{QueueClientReceiveMessagesOptions, ReceivedMessage};
 use azure_storage_queue::{QueueClient, QueueServiceClient};
-use k8s_openapi::api::batch::v1::Job;
+use k8s_openapi::api::batch::v1::{Job, JobSpec};
+use k8s_openapi::api::core::v1::{Container, PodSpec};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::PostParams;
 use kube::{Api, Client};
-use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 use video::{
@@ -23,12 +25,6 @@ use video::{
 #[derive(Debug, Clone)]
 struct AnalyzerConfig {
     namespace: String,
-    service_account_name: String,
-    pod_labels: Value,
-    media_node_selector_spot: Value,
-    media_node_selector_regular: Value,
-    media_tolerations_spot: Value,
-    media_tolerations_regular: Value,
     input_storage_account: String,
     input_storage_container: String,
     input_mount_path: String,
@@ -36,9 +32,6 @@ struct AnalyzerConfig {
     output_storage_container: String,
     output_mount_path: String,
     working_container: String,
-    storage_csi_driver: String,
-    input_csi_volume_attributes: Value,
-    output_csi_volume_attributes: Value,
     submission_queue: String,
     max_parallelism: i32,
     min_parallelism_per_job: i32,
@@ -165,21 +158,6 @@ impl AnalyzerConfig {
 
         Ok(Self {
             namespace: config::setting("Kubernetes__Namespace", "video-storagequeue"),
-            service_account_name: config::setting("Kubernetes__ServiceAccountName", "video-worker"),
-            pod_labels: json_object_setting("Kubernetes__PodLabels", "{}")?,
-            media_node_selector_spot: json_object_setting(
-                "Kubernetes__MediaNodeSelectorSpot",
-                "{}",
-            )?,
-            media_node_selector_regular: json_object_setting(
-                "Kubernetes__MediaNodeSelectorRegular",
-                "{}",
-            )?,
-            media_tolerations_spot: json_array_setting("Kubernetes__MediaTolerationsSpot", "[]")?,
-            media_tolerations_regular: json_array_setting(
-                "Kubernetes__MediaTolerationsRegular",
-                "[]",
-            )?,
             input_storage_account: config::required("Storage__InputAccountName")?,
             input_storage_container: config::required("Storage__InputContainer")?,
             input_mount_path: config::setting("Storage__InputMountPath", "/mnt/input"),
@@ -187,15 +165,6 @@ impl AnalyzerConfig {
             output_storage_container: config::required("Storage__OutputContainer")?,
             output_mount_path: config::setting("Storage__OutputMountPath", "/mnt/output"),
             working_container: config::setting("Storage__WorkingContainer", "videos"),
-            storage_csi_driver: config::required("Storage__CsiDriver")?,
-            input_csi_volume_attributes: json_object_setting(
-                "Storage__InputCsiVolumeAttributes",
-                "{}",
-            )?,
-            output_csi_volume_attributes: json_object_setting(
-                "Storage__OutputCsiVolumeAttributes",
-                "{}",
-            )?,
             submission_queue: config::setting("Storage__SubmissionQueue", "video-submitted"),
             max_parallelism,
             min_parallelism_per_job,
@@ -441,7 +410,7 @@ async fn process_submission(
         bail!("Parallelization strategy produced no segments");
     }
 
-    let media_runtime = normalize_media_runtime(
+    let media_runtime = video::job_templates::normalize_media_runtime(
         request
             .media_runtime
             .as_deref()
@@ -548,122 +517,128 @@ async fn submit_encoding_job(
         None => None,
     };
 
-    let annotations = json!({
-        JOB_ID_ANNOTATION: manifest.job_id,
-        AUDIO_BLOB_NAME_ANNOTATION: manifest.audio_blob_name,
-        AUDIO_ENCODING_REQUIRED_ANNOTATION: (!manifest.audio_codec.eq_ignore_ascii_case("copy")).to_string(),
-        OUTPUT_PATH_ANNOTATION: manifest.output_path.to_string(),
-        OUTPUT_TYPE_ANNOTATION: manifest.output_type,
-        CALCULATE_VMAF_ANNOTATION: if manifest.calculate_vmaf { "true" } else { "false" },
-        MEDIA_RUNTIME_ANNOTATION: media_runtime,
-        "video.fastvideo/use-spot": if manifest.use_spot { "true" } else { "false" },
-    });
-    let mut node_selector = if manifest.use_spot {
-        cfg.media_node_selector_spot.clone()
-    } else {
-        cfg.media_node_selector_regular.clone()
-    };
-    if let Some(arch) = architecture {
-        node_selector["kubernetes.io/arch"] = json!(arch);
-    }
+    let mut job = load_job_template("encode", media_runtime, manifest.use_spot)?;
+    job.metadata.name = Some(encode_job_name.clone());
 
-    let encoder_image = required_image(media_runtime, "Encoder")?;
+    let labels = labels_mut(&mut job.metadata);
+    labels.insert(
+        "app.kubernetes.io/name".to_owned(),
+        "video-encoder".to_owned(),
+    );
+    labels.insert(
+        "video/job-id".to_owned(),
+        video::contracts::label_value(&manifest.job_id),
+    );
+
+    let annotations = annotations_mut(&mut job.metadata);
+    annotations.insert(JOB_ID_ANNOTATION.to_owned(), manifest.job_id.clone());
+    annotations.insert(
+        AUDIO_BLOB_NAME_ANNOTATION.to_owned(),
+        manifest.audio_blob_name.clone(),
+    );
+    annotations.insert(
+        AUDIO_ENCODING_REQUIRED_ANNOTATION.to_owned(),
+        (!manifest.audio_codec.eq_ignore_ascii_case("copy")).to_string(),
+    );
+    annotations.insert(
+        OUTPUT_PATH_ANNOTATION.to_owned(),
+        manifest.output_path.to_string(),
+    );
+    annotations.insert(
+        OUTPUT_TYPE_ANNOTATION.to_owned(),
+        manifest.output_type.clone(),
+    );
+    annotations.insert(
+        CALCULATE_VMAF_ANNOTATION.to_owned(),
+        if manifest.calculate_vmaf {
+            "true".to_owned()
+        } else {
+            "false".to_owned()
+        },
+    );
+    annotations.insert(
+        MEDIA_RUNTIME_ANNOTATION.to_owned(),
+        media_runtime.to_owned(),
+    );
+    annotations.insert(
+        "video.fastvideo/use-spot".to_owned(),
+        if manifest.use_spot {
+            "true".to_owned()
+        } else {
+            "false".to_owned()
+        },
+    );
+
     let encode_active_deadline_seconds: i64 =
         config::setting("Encoding__EncodeJobActiveDeadlineSeconds", "21600")
             .parse()
             .context("Encoding__EncodeJobActiveDeadlineSeconds is invalid")?;
+    let spec = job_spec_mut(&mut job)?;
+    spec.completions = Some(manifest.segment_count as i32);
+    spec.parallelism = Some(std::cmp::min(
+        manifest.segment_count as i32,
+        cfg.min_parallelism_per_job,
+    ));
+    spec.active_deadline_seconds = Some(encode_active_deadline_seconds);
 
-    let mut labels = cfg.pod_labels.clone();
-    labels["app.kubernetes.io/name"] = json!("video-encoder");
-    labels["video/job-id"] = json!(video::contracts::label_value(&manifest.job_id));
-    let tolerations = if manifest.use_spot {
-        cfg.media_tolerations_spot.clone()
-    } else {
-        cfg.media_tolerations_regular.clone()
-    };
-    let job_json = json!({
-        "apiVersion": "batch/v1",
-        "kind": "Job",
-        "metadata": {
-            "name": encode_job_name,
-            "labels": labels,
-            "annotations": annotations
+    let pod_labels = labels_mut(pod_metadata_mut(spec));
+    pod_labels.insert(
+        "app.kubernetes.io/name".to_owned(),
+        "video-encoder".to_owned(),
+    );
+    pod_labels.insert(
+        "video/job-id".to_owned(),
+        video::contracts::label_value(&manifest.job_id),
+    );
+
+    let pod_spec = pod_spec_mut(spec)?;
+    if let Some(arch) = architecture {
+        pod_spec
+            .node_selector
+            .get_or_insert_with(Default::default)
+            .insert("kubernetes.io/arch".to_owned(), arch.to_owned());
+    }
+
+    let container = container_mut(pod_spec, "encoder")?;
+    set_env_var(container, "JOB_ID", &manifest.job_id)?;
+    set_env_var(
+        container,
+        "SOURCE_VIDEO_URI",
+        manifest.input_video_uri.as_ref(),
+    )?;
+    set_env_var(container, "VIDEO_CODEC", &manifest.video_codec)?;
+    set_env_var(
+        container,
+        "CALCULATE_VMAF",
+        if manifest.calculate_vmaf {
+            "true"
+        } else {
+            "false"
         },
-        "spec": {
-            "completionMode": "Indexed",
-            "completions": manifest.segment_count,
-            "parallelism": std::cmp::min(manifest.segment_count as i32, cfg.min_parallelism_per_job),
-            "backoffLimitPerIndex": 5,
-            "activeDeadlineSeconds": encode_active_deadline_seconds,
-            "ttlSecondsAfterFinished": 86400,
-            "template": {
-                "metadata": {
-                    "labels": labels
-                },
-                "spec": {
-                    "serviceAccountName": cfg.service_account_name,
-                    "restartPolicy": "Never",
-                    "terminationGracePeriodSeconds": 120,
-                    "nodeSelector": node_selector,
-                    "tolerations": tolerations,
-                    "volumes": [
-                        {
-                            "name": "input-storage",
-                            "csi": {
-                                "driver": cfg.storage_csi_driver,
-                                "readOnly": true,
-                                "volumeAttributes": cfg.input_csi_volume_attributes
-                            }
-                        },
-                        {
-                            "name": "output-storage",
-                            "csi": {
-                                "driver": cfg.storage_csi_driver,
-                                "readOnly": false,
-                                "volumeAttributes": cfg.output_csi_volume_attributes
-                            }
-                        }
-                    ],
-                    "containers": [
-                        {
-                            "name": "encoder",
-                            "image": encoder_image,
-                            "env": [
-                                {
-                                    "name": "JOB_COMPLETION_INDEX",
-                                    "valueFrom": {
-                                        "fieldRef": {
-                                            "fieldPath": "metadata.annotations['batch.kubernetes.io/job-completion-index']"
-                                        }
-                                    }
-                                },
-                                { "name": "JOB_ID", "value": manifest.job_id },
-                                { "name": "SOURCE_VIDEO_URI", "value": manifest.input_video_uri.to_string() },
-                                { "name": "VIDEO_CODEC", "value": manifest.video_codec },
-                                { "name": "CALCULATE_VMAF", "value": if manifest.calculate_vmaf { "true" } else { "false" } },
-                                { "name": "INPUT_STORAGE_ACCOUNT_NAME", "value": cfg.input_storage_account },
-                                { "name": "INPUT_STORAGE_CONTAINER", "value": cfg.input_storage_container },
-                                { "name": "INPUT_MOUNT_PATH", "value": cfg.input_mount_path },
-                                { "name": "OUTPUT_STORAGE_ACCOUNT_NAME", "value": cfg.output_storage_account },
-                                { "name": "OUTPUT_STORAGE_CONTAINER", "value": cfg.output_storage_container },
-                                { "name": "OUTPUT_MOUNT_PATH", "value": cfg.output_mount_path }
-                            ],
-                            "volumeMounts": [
-                                { "name": "input-storage", "mountPath": cfg.input_mount_path, "readOnly": true },
-                                { "name": "output-storage", "mountPath": cfg.output_mount_path }
-                            ],
-                            "resources": {
-                                "requests": { "cpu": "1750m", "memory": "4Gi" },
-                                "limits": { "cpu": "4", "memory": "8Gi" }
-                            }
-                        }
-                    ]
-                }
-            }
-        }
-    });
+    )?;
+    set_env_var(
+        container,
+        "INPUT_STORAGE_ACCOUNT_NAME",
+        &cfg.input_storage_account,
+    )?;
+    set_env_var(
+        container,
+        "INPUT_STORAGE_CONTAINER",
+        &cfg.input_storage_container,
+    )?;
+    set_env_var(container, "INPUT_MOUNT_PATH", &cfg.input_mount_path)?;
+    set_env_var(
+        container,
+        "OUTPUT_STORAGE_ACCOUNT_NAME",
+        &cfg.output_storage_account,
+    )?;
+    set_env_var(
+        container,
+        "OUTPUT_STORAGE_CONTAINER",
+        &cfg.output_storage_container,
+    )?;
+    set_env_var(container, "OUTPUT_MOUNT_PATH", &cfg.output_mount_path)?;
 
-    let job: Job = serde_json::from_value(job_json).context("Failed to serialize encode job")?;
     match jobs.create(&PostParams::default(), &job).await {
         Ok(_) => Ok(()),
         Err(kube::Error::Api(error)) if error.code == 409 => Ok(()),
@@ -691,91 +666,78 @@ async fn submit_audio_encoding_job(
         Some(other) => bail!("architecture must be amd64 or arm64; got '{other}'"),
         None => None,
     };
-    let annotations = json!({
-        JOB_ID_ANNOTATION: manifest.job_id,
-        "video.fastvideo/use-spot": if manifest.use_spot { "true" } else { "false" }
-    });
-    let mut node_selector = if manifest.use_spot {
-        cfg.media_node_selector_spot.clone()
-    } else {
-        cfg.media_node_selector_regular.clone()
-    };
-    if let Some(arch) = architecture {
-        node_selector["kubernetes.io/arch"] = json!(arch);
-    }
 
-    let audio_encoder_image = required_image(media_runtime, "AudioEncoder")?;
+    let mut job = load_job_template("audio-encode", media_runtime, manifest.use_spot)?;
+    job.metadata.name = Some(audio_job_name.clone());
+
+    let labels = labels_mut(&mut job.metadata);
+    labels.insert(
+        "app.kubernetes.io/name".to_owned(),
+        "video-audio-encoder".to_owned(),
+    );
+    labels.insert(
+        "video/job-id".to_owned(),
+        video::contracts::label_value(&manifest.job_id),
+    );
+
+    let annotations = annotations_mut(&mut job.metadata);
+    annotations.insert(JOB_ID_ANNOTATION.to_owned(), manifest.job_id.clone());
+    annotations.insert(
+        "video.fastvideo/use-spot".to_owned(),
+        if manifest.use_spot {
+            "true".to_owned()
+        } else {
+            "false".to_owned()
+        },
+    );
+
     let audio_encode_active_deadline_seconds: i64 =
         config::setting("Encoding__AudioEncodeJobActiveDeadlineSeconds", "21600")
             .parse()
             .context("Encoding__AudioEncodeJobActiveDeadlineSeconds is invalid")?;
-    let mut labels = cfg.pod_labels.clone();
-    labels["app.kubernetes.io/name"] = json!("video-audio-encoder");
-    labels["video/job-id"] = json!(video::contracts::label_value(&manifest.job_id));
-    let tolerations = if manifest.use_spot {
-        cfg.media_tolerations_spot.clone()
-    } else {
-        cfg.media_tolerations_regular.clone()
-    };
-    let job_json = json!({
-        "apiVersion": "batch/v1",
-        "kind": "Job",
-        "metadata": {
-            "name": audio_job_name,
-            "labels": labels,
-            "annotations": annotations
-        },
-        "spec": {
-            "backoffLimit": 6,
-            "activeDeadlineSeconds": audio_encode_active_deadline_seconds,
-            "ttlSecondsAfterFinished": 86400,
-            "template": {
-                "metadata": { "labels": labels },
-                "spec": {
-                    "serviceAccountName": cfg.service_account_name,
-                    "restartPolicy": "Never",
-                    "terminationGracePeriodSeconds": 120,
-                    "nodeSelector": node_selector,
-                    "tolerations": tolerations,
-                    "volumes": [
-                        { "name": "input-storage", "csi": {
-                            "driver": cfg.storage_csi_driver, "readOnly": true,
-                            "volumeAttributes": cfg.input_csi_volume_attributes
-                        }},
-                        { "name": "output-storage", "csi": {
-                            "driver": cfg.storage_csi_driver, "readOnly": false,
-                            "volumeAttributes": cfg.output_csi_volume_attributes
-                        }}
-                    ],
-                    "containers": [{
-                        "name": "audio-encoder",
-                        "image": audio_encoder_image,
-                        "env": [
-                            { "name": "JOB_ID", "value": manifest.job_id },
-                            { "name": "SOURCE_VIDEO_URI", "value": manifest.input_video_uri.to_string() },
-                            { "name": "AUDIO_BLOB_NAME", "value": manifest.audio_blob_name },
-                            { "name": "AUDIO_CODEC", "value": manifest.audio_codec },
-                            { "name": "INPUT_STORAGE_ACCOUNT_NAME", "value": cfg.input_storage_account },
-                            { "name": "INPUT_STORAGE_CONTAINER", "value": cfg.input_storage_container },
-                            { "name": "INPUT_MOUNT_PATH", "value": cfg.input_mount_path },
-                            { "name": "OUTPUT_MOUNT_PATH", "value": cfg.output_mount_path }
-                        ],
-                        "volumeMounts": [
-                            { "name": "input-storage", "mountPath": cfg.input_mount_path, "readOnly": true },
-                            { "name": "output-storage", "mountPath": cfg.output_mount_path }
-                        ],
-                        "resources": {
-                            "requests": { "cpu": "1", "memory": "1Gi" },
-                            "limits": { "cpu": "2", "memory": "2Gi" }
-                        }
-                    }]
-                }
-            }
-        }
-    });
+    let spec = job_spec_mut(&mut job)?;
+    spec.active_deadline_seconds = Some(audio_encode_active_deadline_seconds);
 
-    let job: Job =
-        serde_json::from_value(job_json).context("Failed to serialize audio encode job")?;
+    let pod_labels = labels_mut(pod_metadata_mut(spec));
+    pod_labels.insert(
+        "app.kubernetes.io/name".to_owned(),
+        "video-audio-encoder".to_owned(),
+    );
+    pod_labels.insert(
+        "video/job-id".to_owned(),
+        video::contracts::label_value(&manifest.job_id),
+    );
+
+    let pod_spec = pod_spec_mut(spec)?;
+    if let Some(arch) = architecture {
+        pod_spec
+            .node_selector
+            .get_or_insert_with(Default::default)
+            .insert("kubernetes.io/arch".to_owned(), arch.to_owned());
+    }
+
+    let container = container_mut(pod_spec, "audio-encoder")?;
+    set_env_var(container, "JOB_ID", &manifest.job_id)?;
+    set_env_var(
+        container,
+        "SOURCE_VIDEO_URI",
+        manifest.input_video_uri.as_ref(),
+    )?;
+    set_env_var(container, "AUDIO_BLOB_NAME", &manifest.audio_blob_name)?;
+    set_env_var(container, "AUDIO_CODEC", &manifest.audio_codec)?;
+    set_env_var(
+        container,
+        "INPUT_STORAGE_ACCOUNT_NAME",
+        &cfg.input_storage_account,
+    )?;
+    set_env_var(
+        container,
+        "INPUT_STORAGE_CONTAINER",
+        &cfg.input_storage_container,
+    )?;
+    set_env_var(container, "INPUT_MOUNT_PATH", &cfg.input_mount_path)?;
+    set_env_var(container, "OUTPUT_MOUNT_PATH", &cfg.output_mount_path)?;
+
     match jobs.create(&PostParams::default(), &job).await {
         Ok(_) => Ok(()),
         Err(kube::Error::Api(error)) if error.code == 409 => Ok(()),
@@ -783,22 +745,76 @@ async fn submit_audio_encoding_job(
     }
 }
 
-fn json_object_setting(name: &str, default: &str) -> Result<Value> {
-    let value: Value = serde_json::from_str(&config::setting(name, default))
-        .with_context(|| format!("{name} must be valid JSON"))?;
-    if !value.is_object() {
-        bail!("{name} must be a JSON object");
-    }
-    Ok(value)
+fn load_job_template(role: &str, media_runtime: &str, use_spot: bool) -> Result<Job> {
+    let path = video::job_templates::template_path(role, media_runtime, use_spot)?;
+    let yaml = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read job template '{}'", path.display()))?;
+    serde_yaml::from_str(&yaml)
+        .with_context(|| format!("Failed to parse job template '{}'", path.display()))
 }
 
-fn json_array_setting(name: &str, default: &str) -> Result<Value> {
-    let value: Value = serde_json::from_str(&config::setting(name, default))
-        .with_context(|| format!("{name} must be valid JSON"))?;
-    if !value.is_array() {
-        bail!("{name} must be a JSON array");
-    }
-    Ok(value)
+fn job_spec_mut(job: &mut Job) -> Result<&mut JobSpec> {
+    job.spec.as_mut().ok_or_else(|| {
+        anyhow!(
+            "Job template '{}' is missing spec",
+            metadata_name(&job.metadata)
+        )
+    })
+}
+
+fn pod_metadata_mut(spec: &mut JobSpec) -> &mut ObjectMeta {
+    spec.template.metadata.get_or_insert_with(Default::default)
+}
+
+fn pod_spec_mut(spec: &mut JobSpec) -> Result<&mut PodSpec> {
+    spec.template.spec.as_mut().ok_or_else(|| {
+        anyhow!(
+            "Job template '{}' is missing pod spec",
+            metadata_name(
+                spec.template
+                    .metadata
+                    .as_ref()
+                    .unwrap_or(&ObjectMeta::default())
+            )
+        )
+    })
+}
+
+fn container_mut<'a>(pod_spec: &'a mut PodSpec, name: &str) -> Result<&'a mut Container> {
+    pod_spec
+        .containers
+        .iter_mut()
+        .find(|container| container.name == name)
+        .ok_or_else(|| anyhow!("Job template is missing container '{name}'"))
+}
+
+fn labels_mut(metadata: &mut ObjectMeta) -> &mut BTreeMap<String, String> {
+    metadata.labels.get_or_insert_with(Default::default)
+}
+
+fn annotations_mut(metadata: &mut ObjectMeta) -> &mut BTreeMap<String, String> {
+    metadata.annotations.get_or_insert_with(Default::default)
+}
+
+fn metadata_name(metadata: &ObjectMeta) -> String {
+    metadata
+        .name
+        .clone()
+        .unwrap_or_else(|| "<unnamed>".to_owned())
+}
+
+fn set_env_var(container: &mut Container, name: &str, value: &str) -> Result<()> {
+    let env = container
+        .env
+        .as_mut()
+        .ok_or_else(|| anyhow!("Container '{}' is missing env entries", container.name))?;
+    let entry = env
+        .iter_mut()
+        .find(|candidate| candidate.name == name)
+        .ok_or_else(|| anyhow!("Container '{}' is missing env var '{name}'", container.name))?;
+    entry.value = Some(value.to_owned());
+    entry.value_from = None;
+    Ok(())
 }
 
 fn calculate_segment_duration_seconds(
@@ -856,30 +872,6 @@ fn validate_submission(request: &VideoSubmitted) -> Result<()> {
     Ok(())
 }
 
-fn required_image(media_runtime: &str, role: &str) -> Result<String> {
-    let runtime = normalize_media_runtime(media_runtime)?;
-    let key = format!("Images__{}__{}", capitalize(runtime), role);
-    std::env::var(&key)
-        .or_else(|_| std::env::var(format!("Images__{role}")))
-        .map_err(|_| anyhow!("{key} is required"))
-}
-
-fn normalize_media_runtime(value: &str) -> Result<&'static str> {
-    match value.to_ascii_lowercase().as_str() {
-        "dotnet" => Ok("dotnet"),
-        "rust" => Ok("rust"),
-        _ => bail!("MediaRuntime must be dotnet or rust"),
-    }
-}
-
-fn capitalize(value: &str) -> &'static str {
-    match value {
-        "dotnet" => "Dotnet",
-        "rust" => "Rust",
-        _ => "",
-    }
-}
-
 fn queue_client(account: &str, queue_name: &str) -> Result<QueueClient> {
     let service_url = Url::parse(&format!("https://{account}.queue.core.windows.net/"))?;
     let credential = build_credential()?;
@@ -924,6 +916,7 @@ fn format_dotnet_timespan(duration_seconds: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn submission() -> VideoSubmitted {
         serde_json::from_value(json!({

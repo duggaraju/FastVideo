@@ -31,9 +31,8 @@ param(
 # deploy/k8s/base                    - provider/transport-agnostic resources
 # deploy/k8s/overlays/storagequeue   - Storage Queue transport resource variants
 # deploy/k8s/overlays/servicebus     - Service Bus transport resource variants
-# deploy/k8s/overlays/azure          - Azure/AKS provider component (workload
-#                                      identity, node selectors/tolerations, CSI)
-# deploy/k8s/overlays/external       - external-cluster provider component (inert
+# deploy/k8s/components/providers/azure    - Azure/AKS provider component
+# deploy/k8s/components/providers/external - external-cluster provider component
 #                                      defaults; every value comes from the user's
 #                                      -ExternalConfigPath JSON)
 #
@@ -112,6 +111,204 @@ function Format-FlatYamlMap([System.Collections.IDictionary] $Map, [int] $Indent
     return , $lines.ToArray()
 }
 
+function ConvertTo-InlineJson($Value) {
+    if ($null -eq $Value) {
+        return "null"
+    }
+    return ($Value | ConvertTo-Json -Compress -Depth 20)
+}
+
+function Split-YamlDocuments([string] $Yaml) {
+    $normalized = $Yaml -replace "`r`n", "`n"
+    $documents = [regex]::Split($normalized, "(?m)^---\s*$") | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { ($_.Trim() + "`n") }
+    return , @($documents)
+}
+
+function Get-JobTemplateRole([string] $Document) {
+    if ($Document -match "(?m)^  name: video-encoder-template\s*$") { return "encode" }
+    if ($Document -match "(?m)^  name: video-audio-encoder-template\s*$") { return "audio-encode" }
+    if ($Document -match "(?m)^  name: video-stitcher-template\s*$") { return "stitch" }
+    throw "Unrecognized rendered job template document."
+}
+
+function Render-JobTemplateSet([string] $GeneratedDir, [string] $Runtime, [string] $Scheduling) {
+    $renderDir = Join-Path $GeneratedDir "job-template-build/$Runtime-$Scheduling"
+    if (Test-Path -LiteralPath $renderDir) {
+        Remove-Item -LiteralPath $renderDir -Recurse -Force
+    }
+    New-Item -ItemType Directory -Path $renderDir -Force | Out-Null
+
+    $runtimeOverlay = "../../../../k8s/jobs/overlays/$Runtime"
+    $providerComponent = if ($DeploymentMode -eq "azure") { "../../../../k8s/jobs/components/providers/azure" } else { "../../../../k8s/jobs/components/providers/external" }
+    $jobComponents = [System.Collections.Generic.List[string]]::new()
+    $jobComponents.Add($providerComponent)
+
+    $patchNames = [System.Collections.Generic.List[string]]::new()
+    if ($DeploymentMode -eq "azure") {
+        $jobComponents.Add("../../../../k8s/jobs/components/scheduling/azure/$Scheduling")
+        $jobPatch = @"
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: video-encoder-template
+spec:
+  template:
+    spec:
+      serviceAccountName: $(ConvertTo-YamlScalar $serviceAccountName)
+      volumes:
+        - name: input-storage
+          csi:
+            volumeAttributes:
+              storageAccount: $(ConvertTo-YamlScalar $inputStorageAccount)
+              containerName: $(ConvertTo-YamlScalar $inputStorageContainer)
+              ClientID: $(ConvertTo-YamlScalar $workloadClientId)
+        - name: output-storage
+          csi:
+            volumeAttributes:
+              storageAccount: $(ConvertTo-YamlScalar $outputStorageAccount)
+              containerName: $(ConvertTo-YamlScalar $outputStorageContainer)
+              ClientID: $(ConvertTo-YamlScalar $workloadClientId)
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: video-audio-encoder-template
+spec:
+  template:
+    spec:
+      serviceAccountName: $(ConvertTo-YamlScalar $serviceAccountName)
+      volumes:
+        - name: input-storage
+          csi:
+            volumeAttributes:
+              storageAccount: $(ConvertTo-YamlScalar $inputStorageAccount)
+              containerName: $(ConvertTo-YamlScalar $inputStorageContainer)
+              ClientID: $(ConvertTo-YamlScalar $workloadClientId)
+        - name: output-storage
+          csi:
+            volumeAttributes:
+              storageAccount: $(ConvertTo-YamlScalar $outputStorageAccount)
+              containerName: $(ConvertTo-YamlScalar $outputStorageContainer)
+              ClientID: $(ConvertTo-YamlScalar $workloadClientId)
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: video-stitcher-template
+spec:
+  template:
+    spec:
+      serviceAccountName: $(ConvertTo-YamlScalar $serviceAccountName)
+      volumes:
+        - name: output-storage
+          csi:
+            volumeAttributes:
+              storageAccount: $(ConvertTo-YamlScalar $outputStorageAccount)
+              containerName: $(ConvertTo-YamlScalar $outputStorageContainer)
+              ClientID: $(ConvertTo-YamlScalar $workloadClientId)
+"@
+        Set-Content -LiteralPath (Join-Path $renderDir "patch-storage.yaml") -Value $jobPatch -Encoding UTF8
+        $patchNames.Add("patch-storage.yaml")
+    } else {
+        $scheduleNodeSelector = if ($Scheduling -eq "spot") { $mediaNodeSelectorSpot } else { $mediaNodeSelectorRegular }
+        $scheduleTolerations = if ($Scheduling -eq "spot") { $mediaTolerationsSpot } else { $mediaTolerationsRegular }
+        $jobPatch = @"
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: video-encoder-template
+spec:
+  template:
+    metadata:
+      labels: $(ConvertTo-InlineJson $podLabels)
+    spec:
+      serviceAccountName: $(ConvertTo-YamlScalar $serviceAccountName)
+      nodeSelector: $(ConvertTo-InlineJson $scheduleNodeSelector)
+      tolerations: $(ConvertTo-InlineJson $scheduleTolerations)
+      volumes:
+        - name: input-storage
+          csi:
+            driver: $(ConvertTo-YamlScalar $storageCsiDriver)
+            volumeAttributes: $(ConvertTo-InlineJson $inputCsiVolumeAttributes)
+        - name: output-storage
+          csi:
+            driver: $(ConvertTo-YamlScalar $storageCsiDriver)
+            volumeAttributes: $(ConvertTo-InlineJson $outputCsiVolumeAttributes)
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: video-audio-encoder-template
+spec:
+  template:
+    metadata:
+      labels: $(ConvertTo-InlineJson $podLabels)
+    spec:
+      serviceAccountName: $(ConvertTo-YamlScalar $serviceAccountName)
+      nodeSelector: $(ConvertTo-InlineJson $scheduleNodeSelector)
+      tolerations: $(ConvertTo-InlineJson $scheduleTolerations)
+      volumes:
+        - name: input-storage
+          csi:
+            driver: $(ConvertTo-YamlScalar $storageCsiDriver)
+            volumeAttributes: $(ConvertTo-InlineJson $inputCsiVolumeAttributes)
+        - name: output-storage
+          csi:
+            driver: $(ConvertTo-YamlScalar $storageCsiDriver)
+            volumeAttributes: $(ConvertTo-InlineJson $outputCsiVolumeAttributes)
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: video-stitcher-template
+spec:
+  template:
+    metadata:
+      labels: $(ConvertTo-InlineJson $podLabels)
+    spec:
+      serviceAccountName: $(ConvertTo-YamlScalar $serviceAccountName)
+      nodeSelector: $(ConvertTo-InlineJson $scheduleNodeSelector)
+      tolerations: $(ConvertTo-InlineJson $scheduleTolerations)
+      volumes:
+        - name: output-storage
+          csi:
+            driver: $(ConvertTo-YamlScalar $storageCsiDriver)
+            volumeAttributes: $(ConvertTo-InlineJson $outputCsiVolumeAttributes)
+"@
+        Set-Content -LiteralPath (Join-Path $renderDir "patch-external.yaml") -Value $jobPatch -Encoding UTF8
+        $patchNames.Add("patch-external.yaml")
+    }
+
+    $resourcesYaml = "  - $runtimeOverlay"
+    $componentsYaml = ($jobComponents | ForEach-Object { "  - $_" }) -join "`n"
+    $patchesYaml = if ($patchNames.Count -eq 0) { "  []" } else { ($patchNames | ForEach-Object { "  - path: $_" }) -join "`n" }
+    $kustomization = @"
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+$resourcesYaml
+components:
+$componentsYaml
+patches:
+$patchesYaml
+"@
+    Set-Content -LiteralPath (Join-Path $renderDir "kustomization.yaml") -Value $kustomization -Encoding UTF8
+
+    $manifest = kubectl kustomize $renderDir
+    Assert-NativeCommandSucceeded "Rendering $Runtime/$Scheduling job templates with kubectl kustomize"
+
+    $outputDir = Join-Path $GeneratedDir "job-templates"
+    New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+    $entries = [System.Collections.Generic.List[string]]::new()
+    foreach ($document in (Split-YamlDocuments $manifest)) {
+        $role = Get-JobTemplateRole $document
+        $fileName = "$role-$Runtime-$Scheduling.yaml"
+        Set-Content -LiteralPath (Join-Path $outputDir $fileName) -Value $document -Encoding UTF8
+        $entries.Add("      - $fileName=job-templates/$fileName")
+    }
+    return , $entries.ToArray()
+}
+
 $deployment = $null
 $deploymentName = $null
 $kubeContext = $null
@@ -179,6 +376,8 @@ if ($DeploymentMode -eq "external") {
     $outputStorageAccount = [string](Get-RequiredConfigValue $storage "outputAccountName" "storage")
     $outputStorageContainer = [string](Get-RequiredConfigValue $storage "outputContainer" "storage")
     $storageCsiDriver = [string](Get-RequiredConfigValue $storage "csiDriver" "storage")
+    $inputCsiVolumeAttributes = Get-RequiredConfigValue $storage "inputVolumeAttributes" "storage"
+    $outputCsiVolumeAttributes = Get-RequiredConfigValue $storage "outputVolumeAttributes" "storage"
     $podLabels = Get-ConfigValue $external "podLabels" @{}
     $controlPlaneNodeSelector = Get-ConfigValue $external "controlPlaneNodeSelector" @{}
     $controlPlaneTolerations = @(Get-ConfigValue $external "controlPlaneTolerations" @())
@@ -289,7 +488,7 @@ if ($DeploymentMode -eq "external") {
     # thing that still needs deploy-time templating: KEDA scaler type/metadata.
     # Every other Azure-specific static default (node selectors, tolerations, CSI
     # driver, workload-identity pod label) is Kustomize-native and lives in
-    # deploy/k8s/overlays/azure/.
+    # deploy/k8s/components/providers/azure/ and deploy/k8s/jobs/components/providers/azure/.
     $azureOverlayPath = Join-Path $root "deploy/overlays/azure-config.json"
     try {
         $azureOverlay = Get-Content -LiteralPath $azureOverlayPath -Raw | ConvertFrom-Json -AsHashtable
@@ -325,13 +524,14 @@ $configLiterals = [System.Collections.Generic.List[string]]::new()
 $configLiterals.Add("Kubernetes__Namespace=$KubernetesNamespace")
 $configLiterals.Add("Kubernetes__ServiceAccountName=$serviceAccountName")
 $configLiterals.Add("WorkloadIdentity__ClientId=$workloadClientId")
-$configLiterals.Add("ServiceBus__Namespace=$serviceBusNamespace")
+if ($MessageTransport -eq "servicebus") {
+    $configLiterals.Add("ServiceBus__Namespace=$serviceBusNamespace")
+}
 $configLiterals.Add("Storage__InputAccountName=$inputStorageAccount")
 $configLiterals.Add("Storage__InputContainer=$inputStorageContainer")
 $configLiterals.Add("Storage__OutputAccountName=$outputStorageAccount")
 $configLiterals.Add("Storage__OutputContainer=$outputStorageContainer")
 $configLiterals.Add("Storage__WorkingContainer=$outputStorageContainer")
-$configLiterals.Add("Storage__CsiDriver=$storageCsiDriver")
 $configLiterals.Add("Encoding__MediaRuntimeDefault=$MediaRuntime")
 $configLiterals.Add("Encoding__MaxAudioDurationSeconds=$MaxAudioDurationSeconds")
 $configLiterals.Add("Images__Dotnet__Encoder=$imageRepository/video-encoder-dotnet:$ImageTag")
@@ -349,7 +549,7 @@ if (Test-Path -LiteralPath $generatedDir) {
 }
 New-Item -ItemType Directory -Path $generatedDir -Force | Out-Null
 
-$providerOverlayRelativePath = if ($DeploymentMode -eq "azure") { "../../k8s/overlays/azure" } else { "../../k8s/overlays/external" }
+$providerOverlayRelativePath = if ($DeploymentMode -eq "azure") { "../../k8s/components/providers/azure" } else { "../../k8s/components/providers/external" }
 $transportOverlayRelativePath = "../../k8s/overlays/$MessageTransport"
 
 $analyzerReplicas = if ($scalerMode -eq "keda") { 0 } else { 1 }
@@ -363,6 +563,7 @@ spec:
   replicas: $analyzerReplicas
   template:
     spec:
+      serviceAccountName: $serviceAccountName
       containers:
         - name: analyzer
           image: "$imageRepository/$($analyzerImageName):$ImageTag"
@@ -390,6 +591,7 @@ metadata:
 spec:
   template:
     spec:
+      serviceAccountName: $serviceAccountName
       containers:
         - name: completion
           image: "$imageRepository/$($completionImageName):$ImageTag"
@@ -398,27 +600,53 @@ Set-Content -LiteralPath (Join-Path $generatedDir "patch-completion.yaml") -Valu
 
 $annotationLines = Format-FlatYamlMap $serviceAccountAnnotations 4
 $annotationsBlock = if ($annotationLines.Count -eq 0) { "  annotations: {}" } else { "  annotations:`n$($annotationLines -join "`n")" }
-$patchServiceAccount = @"
+$customServiceAccountResourcePath = $null
+$deleteServiceAccountPatchPath = $null
+if ($serviceAccountName -eq "video-worker") {
+    $patchServiceAccount = @"
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: video-worker
+$annotationsBlock
+"@
+    Set-Content -LiteralPath (Join-Path $generatedDir "patch-serviceaccount.yaml") -Value $patchServiceAccount -Encoding UTF8
+} else {
+    $customServiceAccount = @"
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: $serviceAccountName
 $annotationsBlock
 "@
-Set-Content -LiteralPath (Join-Path $generatedDir "patch-serviceaccount.yaml") -Value $patchServiceAccount -Encoding UTF8
+    $customServiceAccountResourcePath = Join-Path $generatedDir "serviceaccount-custom.yaml"
+    Set-Content -LiteralPath $customServiceAccountResourcePath -Value $customServiceAccount -Encoding UTF8
+
+    $deleteServiceAccount = @'
+$patch: delete
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: video-worker
+'@
+    $deleteServiceAccountPatchPath = Join-Path $generatedDir "patch-delete-serviceaccount.yaml"
+    Set-Content -LiteralPath $deleteServiceAccountPatchPath -Value $deleteServiceAccount -Encoding UTF8
+}
+
+$patchRoleBinding = @"
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: video-job-manager
+subjects:
+  - kind: ServiceAccount
+    name: $serviceAccountName
+"@
+Set-Content -LiteralPath (Join-Path $generatedDir "patch-rolebinding.yaml") -Value $patchRoleBinding -Encoding UTF8
 
 $extraAnalyzerPatchPath = $null
 $extraCompletionPatchPath = $null
 if ($DeploymentMode -eq "external") {
-    # overlays/external is intentionally inert (no static defaults). All node
-    # selectors/tolerations/CSI values come straight from the user's JSON, so
-    # generate them here rather than baking a specific external cluster's
-    # topology into the checked-in Kustomize tree.
-    $podLabelLines = Format-FlatYamlMap $podLabels 8
-    $controlPlaneNodeSelectorLines = Format-FlatYamlMap $controlPlaneNodeSelector 6
-    $inputAttributeLines = Format-FlatYamlMap $inputCsiVolumeAttributes 14
-    $outputAttributeLines = Format-FlatYamlMap $outputCsiVolumeAttributes 14
-
     $patchExternalAnalyzer = @"
 apiVersion: apps/v1
 kind: Deployment
@@ -427,22 +655,19 @@ metadata:
 spec:
   template:
     metadata:
-      labels:
-$(if ($podLabelLines.Count -eq 0) { "        {}" } else { $podLabelLines -join "`n" })
+      labels: $(ConvertTo-InlineJson $podLabels)
     spec:
-      nodeSelector:
-$(if ($controlPlaneNodeSelectorLines.Count -eq 0) { "        {}" } else { $controlPlaneNodeSelectorLines -join "`n" })
+      nodeSelector: $(ConvertTo-InlineJson $controlPlaneNodeSelector)
+      tolerations: $(ConvertTo-InlineJson $controlPlaneTolerations)
       volumes:
         - name: input-storage
           csi:
             driver: $(ConvertTo-YamlScalar $storageCsiDriver)
-            volumeAttributes:
-$(if ($inputAttributeLines.Count -eq 0) { "              {}" } else { $inputAttributeLines -join "`n" })
+            volumeAttributes: $(ConvertTo-InlineJson $inputCsiVolumeAttributes)
         - name: output-storage
           csi:
             driver: $(ConvertTo-YamlScalar $storageCsiDriver)
-            volumeAttributes:
-$(if ($outputAttributeLines.Count -eq 0) { "              {}" } else { $outputAttributeLines -join "`n" })
+            volumeAttributes: $(ConvertTo-InlineJson $outputCsiVolumeAttributes)
 "@
     $extraAnalyzerPatchPath = Join-Path $generatedDir "patch-external-analyzer.yaml"
     Set-Content -LiteralPath $extraAnalyzerPatchPath -Value $patchExternalAnalyzer -Encoding UTF8
@@ -455,18 +680,29 @@ metadata:
 spec:
   template:
     metadata:
-      labels:
-$(if ($podLabelLines.Count -eq 0) { "        {}" } else { $podLabelLines -join "`n" })
+      labels: $(ConvertTo-InlineJson $podLabels)
     spec:
-      nodeSelector:
-$(if ($controlPlaneNodeSelectorLines.Count -eq 0) { "        {}" } else { $controlPlaneNodeSelectorLines -join "`n" })
+      nodeSelector: $(ConvertTo-InlineJson $controlPlaneNodeSelector)
+      tolerations: $(ConvertTo-InlineJson $controlPlaneTolerations)
 "@
     $extraCompletionPatchPath = Join-Path $generatedDir "patch-external-completion.yaml"
     Set-Content -LiteralPath $extraCompletionPatchPath -Value $patchExternalCompletion -Encoding UTF8
 }
 
+$jobTemplateFileEntries = [System.Collections.Generic.List[string]]::new()
+foreach ($runtime in @("dotnet", "rust")) {
+    foreach ($scheduling in @("spot", "regular")) {
+        foreach ($entry in (Render-JobTemplateSet $generatedDir $runtime $scheduling)) {
+            $jobTemplateFileEntries.Add($entry)
+        }
+    }
+}
+
 $kustomizationResources = [System.Collections.Generic.List[string]]::new()
 $kustomizationResources.Add($transportOverlayRelativePath)
+if ($null -ne $customServiceAccountResourcePath) {
+    $kustomizationResources.Add("./$(Split-Path -Leaf $customServiceAccountResourcePath)")
+}
 
 $kustomizationComponents = [System.Collections.Generic.List[string]]::new()
 $kustomizationComponents.Add($providerOverlayRelativePath)
@@ -523,13 +759,19 @@ $($specLines -join "`n")
 }
 
 $literalsYaml = ($configLiterals | ForEach-Object { "      - $_" }) -join "`n"
+$jobTemplateFilesYaml = $jobTemplateFileEntries -join "`n"
 $resourcesYaml = ($kustomizationResources | ForEach-Object { "  - $_" }) -join "`n"
 $componentsYaml = ($kustomizationComponents | ForEach-Object { "  - $_" }) -join "`n"
 
 $kustomizationPatches = [System.Collections.Generic.List[string]]::new()
 $kustomizationPatches.Add("  - path: patch-analyzer.yaml")
 $kustomizationPatches.Add("  - path: patch-completion.yaml")
-$kustomizationPatches.Add("  - path: patch-serviceaccount.yaml")
+if ($serviceAccountName -eq "video-worker") {
+    $kustomizationPatches.Add("  - path: patch-serviceaccount.yaml")
+} elseif ($null -ne $deleteServiceAccountPatchPath) {
+    $kustomizationPatches.Add("  - path: $(Split-Path -Leaf $deleteServiceAccountPatchPath)")
+}
+$kustomizationPatches.Add("  - path: patch-rolebinding.yaml")
 if ($null -ne $extraAnalyzerPatchPath) {
     $kustomizationPatches.Add("  - path: $(Split-Path -Leaf $extraAnalyzerPatchPath)")
 }
@@ -554,6 +796,10 @@ configMapGenerator:
     behavior: merge
     literals:
 $literalsYaml
+  - name: video-job-templates
+    behavior: create
+    files:
+$jobTemplateFilesYaml
 generatorOptions:
   disableNameSuffixHash: true
 "@

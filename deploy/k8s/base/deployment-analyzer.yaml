@@ -25,6 +25,9 @@ spec:
             - name: ladder-profiles
               mountPath: /etc/video/ladder
               readOnly: true
+            - name: job-templates
+              mountPath: /etc/video/job-templates
+              readOnly: true
             - name: input-storage
               mountPath: /mnt/input
               readOnly: true
@@ -37,6 +40,9 @@ spec:
         - name: ladder-profiles
           configMap:
             name: video-ladder-profiles
+        - name: job-templates
+          configMap:
+            name: video-job-templates
         - name: input-storage
           csi:
             driver: ""

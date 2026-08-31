@@ -1,5 +1,5 @@
 {
-  "_comment": "Static Azure defaults that are Kustomize-native (workload identity pod labels/annotations, node selectors/tolerations, CSI driver, volume attributes) live in deploy/k8s/overlays/azure/. This file only carries the KEDA scaler configuration per message transport, because its trigger type/metadata shape is provider policy rather than a fixed Kubernetes field scripts/deploy.ps1 can patch generically. {{TOKEN}} placeholders are resolved by scripts/deploy.ps1 from Bicep deployment outputs before being written into the generated overlay.",
+  "_comment": "Static Azure defaults that are Kustomize-native (workload identity pod labels/annotations, node selectors/tolerations, CSI driver, volume attributes) live in deploy/k8s/components/providers/azure/ and deploy/k8s/jobs/components/providers/azure/. This file only carries the KEDA scaler configuration per message transport, because its trigger type/metadata shape is provider policy rather than a fixed Kubernetes field scripts/deploy.ps1 can patch generically. {{TOKEN}} placeholders are resolved by scripts/deploy.ps1 from Bicep deployment outputs before being written into the generated overlay.",
   "scaler": {
     "storagequeue": {
       "mode": "keda",

@@ -231,96 +231,51 @@ public sealed class AnalysisWorker(
         {
         }
 
-        var environment = new List<V1EnvVar>
-        {
-            new() { Name = "JOB_COMPLETION_INDEX", ValueFrom = new V1EnvVarSource { FieldRef = new V1ObjectFieldSelector { FieldPath = "metadata.annotations['batch.kubernetes.io/job-completion-index']" } } },
-            Env("JOB_ID", manifest.JobId),
-            Env("SOURCE_VIDEO_URI", manifest.InputVideoUri.ToString()),
-            Env("VIDEO_CODEC", manifest.VideoCodec),
-            Env("CALCULATE_VMAF", manifest.CalculateVmaf ? "true" : "false"),
-            Env("INPUT_STORAGE_ACCOUNT_NAME", inputAccount),
-            Env("INPUT_STORAGE_CONTAINER", inputContainer),
-            Env("INPUT_MOUNT_PATH", inputMountPath),
-            Env("OUTPUT_STORAGE_ACCOUNT_NAME", outputAccount),
-            Env("OUTPUT_STORAGE_CONTAINER", outputContainer),
-            Env("OUTPUT_MOUNT_PATH", outputMountPath)
-        };
-        var inputVolumeName = "input-storage";
-        var outputVolumeName = "output-storage";
-        var labels = StringMapConfig("Kubernetes:PodLabels");
+        var mediaRuntime = JobTemplateFiles.NormalizeMediaRuntime(manifest.MediaRuntime);
+        var job = await LoadJobTemplateAsync("encode", mediaRuntime, manifest.UseSpot, cancellationToken);
+        job.Metadata ??= new V1ObjectMeta();
+        job.Metadata.Name = jobName;
+        var labels = EnsureLabels(job.Metadata);
         labels["app.kubernetes.io/name"] = "video-encoder";
         labels["video/job-id"] = JobNames.LabelValue(manifest.JobId);
-        var nodeSelector = StringMapConfig(
-            manifest.UseSpot ? "Kubernetes:MediaNodeSelectorSpot" : "Kubernetes:MediaNodeSelectorRegular");
-        if (architecture is not null)
-            nodeSelector["kubernetes.io/arch"] = architecture;
+        var annotations = EnsureAnnotations(job.Metadata);
+        annotations[JobNames.JobIdAnnotation] = manifest.JobId;
+        annotations[JobNames.AudioBlobNameAnnotation] = manifest.AudioBlobName;
+        annotations[JobNames.AudioEncodingRequiredAnnotation] = (!string.Equals(manifest.AudioCodec, "copy", StringComparison.OrdinalIgnoreCase)).ToString();
+        annotations[JobNames.OutputPathAnnotation] = manifest.OutputPath.ToString();
+        annotations[JobNames.OutputTypeAnnotation] = manifest.OutputType;
+        annotations[JobNames.CalculateVmafAnnotation] = manifest.CalculateVmaf ? "true" : "false";
+        annotations[JobNames.MediaRuntimeAnnotation] = mediaRuntime;
+        annotations[UseSpotAnnotation] = manifest.UseSpot ? "true" : "false";
 
-        var pod = new V1PodTemplateSpec
+        var spec = RequiredSpec(job);
+        spec.Completions = manifest.SegmentCount;
+        spec.Parallelism = Math.Min(manifest.SegmentCount, minParallelismPerJob);
+        spec.ActiveDeadlineSeconds = configuration.GetValue("Encoding:EncodeJobActiveDeadlineSeconds", 21600);
+
+        var podLabels = EnsureLabels(spec.Template.Metadata ??= new V1ObjectMeta());
+        podLabels["app.kubernetes.io/name"] = "video-encoder";
+        podLabels["video/job-id"] = JobNames.LabelValue(manifest.JobId);
+
+        var podSpec = RequiredPodSpec(spec.Template, jobName);
+        if (architecture is not null)
         {
-            Metadata = new V1ObjectMeta { Labels = labels },
-            Spec = new V1PodSpec
-            {
-                Containers =
-                [
-                    new V1Container
-                    {
-                        Name = "encoder",
-                        Image = RequiredImage(manifest.MediaRuntime, "Encoder"),
-                        Env = environment,
-                        VolumeMounts =
-                        [
-                            new V1VolumeMount { Name = inputVolumeName, MountPath = inputMountPath, ReadOnlyProperty = true },
-                            new V1VolumeMount { Name = outputVolumeName, MountPath = outputMountPath }
-                        ],
-                        Resources = new V1ResourceRequirements
-                        {
-                            Requests = new Dictionary<string, ResourceQuantity> { ["cpu"] = new("1750m"), ["memory"] = new("4Gi") },
-                            Limits = new Dictionary<string, ResourceQuantity> { ["cpu"] = new("4"), ["memory"] = new("8Gi") }
-                        }
-                    }
-                ],
-                Volumes =
-                [
-                    CsiVolume(inputVolumeName, "Storage:InputCsiVolumeAttributes", readOnly: true),
-                    CsiVolume(outputVolumeName, "Storage:OutputCsiVolumeAttributes", readOnly: false)
-                ],
-                RestartPolicy = "Never",
-                ServiceAccountName = configuration["Kubernetes:ServiceAccountName"] ?? "video-worker",
-                Tolerations = TolerationsConfig(
-                    manifest.UseSpot ? "Kubernetes:MediaTolerationsSpot" : "Kubernetes:MediaTolerationsRegular"),
-                NodeSelector = nodeSelector,
-                TerminationGracePeriodSeconds = 120
-            }
-        };
-        var job = new V1Job
-        {
-            Metadata = new V1ObjectMeta
-            {
-                Name = jobName,
-                Labels = labels,
-                Annotations = new Dictionary<string, string>
-                {
-                    [JobNames.JobIdAnnotation] = manifest.JobId,
-                    [JobNames.AudioBlobNameAnnotation] = manifest.AudioBlobName,
-                    [JobNames.AudioEncodingRequiredAnnotation] = (!string.Equals(manifest.AudioCodec, "copy", StringComparison.OrdinalIgnoreCase)).ToString(),
-                    [JobNames.OutputPathAnnotation] = manifest.OutputPath.ToString(),
-                    [JobNames.OutputTypeAnnotation] = manifest.OutputType,
-                    [JobNames.CalculateVmafAnnotation] = manifest.CalculateVmaf ? "true" : "false",
-                    [JobNames.MediaRuntimeAnnotation] = manifest.MediaRuntime,
-                    [UseSpotAnnotation] = manifest.UseSpot ? "true" : "false"
-                }
-            },
-            Spec = new V1JobSpec
-            {
-                Template = pod,
-                CompletionMode = "Indexed",
-                Completions = manifest.SegmentCount,
-                Parallelism = Math.Min(manifest.SegmentCount, minParallelismPerJob),
-                BackoffLimitPerIndex = 5,
-                ActiveDeadlineSeconds = configuration.GetValue("Encoding:EncodeJobActiveDeadlineSeconds", 21600),
-                TtlSecondsAfterFinished = 86400
-            }
-        };
+            podSpec.NodeSelector ??= new Dictionary<string, string>(StringComparer.Ordinal);
+            podSpec.NodeSelector["kubernetes.io/arch"] = architecture;
+        }
+
+        var container = RequiredContainer(podSpec, "encoder", jobName);
+        SetEnvValue(container, "JOB_ID", manifest.JobId);
+        SetEnvValue(container, "SOURCE_VIDEO_URI", manifest.InputVideoUri.ToString());
+        SetEnvValue(container, "VIDEO_CODEC", manifest.VideoCodec);
+        SetEnvValue(container, "CALCULATE_VMAF", manifest.CalculateVmaf ? "true" : "false");
+        SetEnvValue(container, "INPUT_STORAGE_ACCOUNT_NAME", inputAccount);
+        SetEnvValue(container, "INPUT_STORAGE_CONTAINER", inputContainer);
+        SetEnvValue(container, "INPUT_MOUNT_PATH", inputMountPath);
+        SetEnvValue(container, "OUTPUT_STORAGE_ACCOUNT_NAME", outputAccount);
+        SetEnvValue(container, "OUTPUT_STORAGE_CONTAINER", outputContainer);
+        SetEnvValue(container, "OUTPUT_MOUNT_PATH", outputMountPath);
+
         await kubernetes.BatchV1.CreateNamespacedJobAsync(job, targetNamespace, cancellationToken: cancellationToken);
     }
 
@@ -346,97 +301,90 @@ public sealed class AnalysisWorker(
         {
         }
 
-        var labels = StringMapConfig("Kubernetes:PodLabels");
+        var mediaRuntime = JobTemplateFiles.NormalizeMediaRuntime(manifest.MediaRuntime);
+        var job = await LoadJobTemplateAsync("audio-encode", mediaRuntime, manifest.UseSpot, cancellationToken);
+        job.Metadata ??= new V1ObjectMeta();
+        job.Metadata.Name = jobName;
+        var labels = EnsureLabels(job.Metadata);
         labels["app.kubernetes.io/name"] = "video-audio-encoder";
         labels["video/job-id"] = JobNames.LabelValue(manifest.JobId);
-        var nodeSelector = StringMapConfig(
-            manifest.UseSpot ? "Kubernetes:MediaNodeSelectorSpot" : "Kubernetes:MediaNodeSelectorRegular");
-        if (architecture is not null)
-            nodeSelector["kubernetes.io/arch"] = architecture;
+        var annotations = EnsureAnnotations(job.Metadata);
+        annotations[JobNames.JobIdAnnotation] = manifest.JobId;
+        annotations[UseSpotAnnotation] = manifest.UseSpot ? "true" : "false";
 
-        var inputVolumeName = "input-storage";
-        var outputVolumeName = "output-storage";
-        var pod = new V1PodTemplateSpec
+        var spec = RequiredSpec(job);
+        spec.ActiveDeadlineSeconds = configuration.GetValue("Encoding:AudioEncodeJobActiveDeadlineSeconds", 21600);
+
+        var podLabels = EnsureLabels(spec.Template.Metadata ??= new V1ObjectMeta());
+        podLabels["app.kubernetes.io/name"] = "video-audio-encoder";
+        podLabels["video/job-id"] = JobNames.LabelValue(manifest.JobId);
+
+        var podSpec = RequiredPodSpec(spec.Template, jobName);
+        if (architecture is not null)
         {
-            Metadata = new V1ObjectMeta { Labels = labels },
-            Spec = new V1PodSpec
-            {
-                Containers =
-                [
-                    new V1Container
-                    {
-                        Name = "audio-encoder",
-                        Image = RequiredImage(manifest.MediaRuntime, "AudioEncoder"),
-                        Env =
-                        [
-                            Env("JOB_ID", manifest.JobId),
-                            Env("SOURCE_VIDEO_URI", manifest.InputVideoUri.ToString()),
-                            Env("AUDIO_BLOB_NAME", manifest.AudioBlobName),
-                            Env("AUDIO_CODEC", manifest.AudioCodec),
-                            Env("INPUT_STORAGE_ACCOUNT_NAME", inputAccount),
-                            Env("INPUT_STORAGE_CONTAINER", inputContainer),
-                            Env("INPUT_MOUNT_PATH", inputMountPath),
-                            Env("OUTPUT_MOUNT_PATH", outputMountPath)
-                        ],
-                        VolumeMounts =
-                        [
-                            new V1VolumeMount { Name = inputVolumeName, MountPath = inputMountPath, ReadOnlyProperty = true },
-                            new V1VolumeMount { Name = outputVolumeName, MountPath = outputMountPath }
-                        ],
-                        Resources = new V1ResourceRequirements
-                        {
-                            Requests = new Dictionary<string, ResourceQuantity> { ["cpu"] = new("1"), ["memory"] = new("1Gi") },
-                            Limits = new Dictionary<string, ResourceQuantity> { ["cpu"] = new("2"), ["memory"] = new("2Gi") }
-                        }
-                    }
-                ],
-                Volumes =
-                [
-                    CsiVolume(inputVolumeName, "Storage:InputCsiVolumeAttributes", readOnly: true),
-                    CsiVolume(outputVolumeName, "Storage:OutputCsiVolumeAttributes", readOnly: false)
-                ],
-                RestartPolicy = "Never",
-                ServiceAccountName = configuration["Kubernetes:ServiceAccountName"] ?? "video-worker",
-                Tolerations = TolerationsConfig(
-                    manifest.UseSpot ? "Kubernetes:MediaTolerationsSpot" : "Kubernetes:MediaTolerationsRegular"),
-                NodeSelector = nodeSelector,
-                TerminationGracePeriodSeconds = 120
-            }
-        };
-        var job = new V1Job
-        {
-            Metadata = new V1ObjectMeta
-            {
-                Name = jobName,
-                Labels = labels,
-                Annotations = new Dictionary<string, string>
-                {
-                    [JobNames.JobIdAnnotation] = manifest.JobId,
-                    [UseSpotAnnotation] = manifest.UseSpot ? "true" : "false"
-                }
-            },
-            Spec = new V1JobSpec { Template = pod, BackoffLimit = 6, ActiveDeadlineSeconds = configuration.GetValue("Encoding:AudioEncodeJobActiveDeadlineSeconds", 21600), TtlSecondsAfterFinished = 86400 }
-        };
+            podSpec.NodeSelector ??= new Dictionary<string, string>(StringComparer.Ordinal);
+            podSpec.NodeSelector["kubernetes.io/arch"] = architecture;
+        }
+
+        var container = RequiredContainer(podSpec, "audio-encoder", jobName);
+        SetEnvValue(container, "JOB_ID", manifest.JobId);
+        SetEnvValue(container, "SOURCE_VIDEO_URI", manifest.InputVideoUri.ToString());
+        SetEnvValue(container, "AUDIO_BLOB_NAME", manifest.AudioBlobName);
+        SetEnvValue(container, "AUDIO_CODEC", manifest.AudioCodec);
+        SetEnvValue(container, "INPUT_STORAGE_ACCOUNT_NAME", inputAccount);
+        SetEnvValue(container, "INPUT_STORAGE_CONTAINER", inputContainer);
+        SetEnvValue(container, "INPUT_MOUNT_PATH", inputMountPath);
+        SetEnvValue(container, "OUTPUT_MOUNT_PATH", outputMountPath);
+
         await kubernetes.BatchV1.CreateNamespacedJobAsync(job, targetNamespace, cancellationToken: cancellationToken);
     }
 
-    private string RequiredImage(string mediaRuntime, string role)
+    private static V1JobSpec RequiredSpec(V1Job job) =>
+        job.Spec ?? throw new InvalidOperationException($"Job template '{job.Metadata?.Name ?? "<unnamed>"}' is missing spec");
+
+    private static V1PodSpec RequiredPodSpec(V1PodTemplateSpec template, string jobName) =>
+        template.Spec ?? throw new InvalidOperationException($"Job template '{jobName}' is missing pod spec");
+
+    private static V1Container RequiredContainer(V1PodSpec podSpec, string name, string jobName) =>
+        podSpec.Containers.SingleOrDefault(container => string.Equals(container.Name, name, StringComparison.Ordinal))
+        ?? throw new InvalidOperationException($"Job template '{jobName}' is missing container '{name}'");
+
+    private static IDictionary<string, string> EnsureLabels(V1ObjectMeta metadata)
     {
-        var key = $"Images:{mediaRuntime}:{role}";
-        return configuration[key]
-            ?? configuration[$"Images:{role}"]
-            ?? throw new InvalidOperationException($"{key} is required");
+        metadata.Labels ??= new Dictionary<string, string>(StringComparer.Ordinal);
+        return metadata.Labels;
+    }
+
+    private static IDictionary<string, string> EnsureAnnotations(V1ObjectMeta metadata)
+    {
+        metadata.Annotations ??= new Dictionary<string, string>(StringComparer.Ordinal);
+        return metadata.Annotations;
+    }
+
+    private static void SetEnvValue(V1Container container, string name, string value)
+    {
+        var env = container.Env ?? throw new InvalidOperationException($"Container '{container.Name}' is missing env vars");
+        var entry = env.SingleOrDefault(candidate => string.Equals(candidate.Name, name, StringComparison.Ordinal))
+            ?? throw new InvalidOperationException($"Container '{container.Name}' is missing env var '{name}'");
+        entry.Value = value;
+        entry.ValueFrom = null;
+    }
+
+    private static async Task<V1Job> LoadJobTemplateAsync(string role, string mediaRuntime, bool useSpot, CancellationToken cancellationToken)
+    {
+        var path = JobTemplateFiles.PathFor(role, mediaRuntime, useSpot);
+        if (!File.Exists(path))
+            throw new InvalidOperationException($"Job template '{path}' does not exist");
+
+        var yaml = await File.ReadAllTextAsync(path, cancellationToken);
+        return KubernetesYaml.Deserialize<V1Job>(yaml, false)
+            ?? throw new InvalidOperationException($"Job template '{path}' is empty");
     }
 
     private static string GetMediaRuntime(string? requestedRuntime, string defaultRuntime)
     {
         var mediaRuntime = string.IsNullOrWhiteSpace(requestedRuntime) ? defaultRuntime : requestedRuntime;
-        return mediaRuntime?.ToLowerInvariant() switch
-        {
-            "dotnet" => "dotnet",
-            "rust" => "rust",
-            _ => throw new ArgumentException("MediaRuntime must be dotnet or rust")
-        };
+        return JobTemplateFiles.NormalizeMediaRuntime(mediaRuntime);
     }
 
     private static string? GetArchitecture(string? requestedArchitecture)
@@ -450,58 +398,12 @@ public sealed class AnalysisWorker(
             : throw new ArgumentException("Architecture must be amd64 or arm64");
     }
 
-    private static V1EnvVar Env(string name, string value) => new() { Name = name, Value = value };
-
     private static int CalculateSegmentDurationSeconds(TimeSpan duration, int maxParallelism, int minimumSegmentDurationSeconds)
     {
         var durationPerWorker = (int)Math.Ceiling(duration.TotalSeconds / maxParallelism);
         var maximumSegmentDurationSeconds = Math.Max(180, minimumSegmentDurationSeconds);
         return Math.Clamp(durationPerWorker, minimumSegmentDurationSeconds, maximumSegmentDurationSeconds);
     }
-
-    private V1Volume CsiVolume(string name, string attributesConfigKey, bool readOnly)
-    {
-        return new V1Volume
-        {
-            Name = name,
-            Csi = new V1CSIVolumeSource
-            {
-                Driver = RequiredConfig("Storage:CsiDriver"),
-                ReadOnlyProperty = readOnly,
-                VolumeAttributes = StringMapConfig(attributesConfigKey)
-            }
-        };
-    }
-
-    private Dictionary<string, string> StringMapConfig(string key)
-    {
-        var json = configuration[key] ?? "{}";
-        return JsonSerializer.Deserialize<Dictionary<string, string>>(json)
-            ?? throw new InvalidOperationException($"{key} must be a JSON object");
-    }
-
-    private IList<V1Toleration>? TolerationsConfig(string key)
-    {
-        var json = configuration[key] ?? "[]";
-        var settings = JsonSerializer.Deserialize<List<TolerationSetting>>(json, JsonSerializerOptions.Web)
-            ?? throw new InvalidOperationException($"{key} must be a JSON array");
-        var tolerations = settings.Select(setting => new V1Toleration
-        {
-            Key = setting.Key,
-            OperatorProperty = setting.Operator,
-            Value = setting.Value,
-            Effect = setting.Effect,
-            TolerationSeconds = setting.TolerationSeconds
-        }).ToList();
-        return tolerations.Count == 0 ? null : tolerations;
-    }
-
-    private sealed record TolerationSetting(
-        string? Key,
-        string? Operator,
-        string? Value,
-        string? Effect,
-        long? TolerationSeconds);
 
     private string RequiredConfig(string key) =>
         configuration[key] ?? throw new InvalidOperationException($"{key} is required");

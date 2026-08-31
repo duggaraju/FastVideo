@@ -1,5 +1,6 @@
 pub mod config;
 pub mod contracts;
+pub mod job_templates;
 pub mod media;
 pub mod parallelism;
 pub mod paths;

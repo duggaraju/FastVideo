@@ -4,11 +4,14 @@ use azure_core::http::Url;
 use azure_identity::{DeveloperToolsCredential, WorkloadIdentityCredential};
 use azure_storage_queue::models::QueueMessage;
 use azure_storage_queue::{QueueClient, QueueServiceClient};
-use k8s_openapi::api::batch::v1::Job;
+use k8s_openapi::api::batch::v1::{Job, JobSpec};
 use k8s_openapi::api::coordination::v1::Lease;
+use k8s_openapi::api::core::v1::{Container, PodSpec};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::{DeleteParams, Patch, PatchParams, PostParams};
 use kube::{Api, Client};
-use serde_json::{Value, json};
+use serde_json::json;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use video::{
     config,
@@ -28,17 +31,9 @@ const LEADER_LEASE_NAME: &str = "video-completion-leader";
 #[derive(Debug, Clone)]
 struct CompletionConfig {
     namespace: String,
-    service_account_name: String,
-    pod_labels: Value,
-    media_node_selector_spot: Value,
-    media_node_selector_regular: Value,
-    media_tolerations_spot: Value,
-    media_tolerations_regular: Value,
     output_storage_account: String,
     output_storage_container: String,
     output_mount_path: String,
-    storage_csi_driver: String,
-    output_csi_volume_attributes: Value,
     result_queue: String,
     max_parallelism: i32,
     default_media_runtime: String,
@@ -106,29 +101,9 @@ impl CompletionConfig {
 
         Ok(Self {
             namespace: config::setting("Kubernetes__Namespace", "video-storagequeue"),
-            service_account_name: config::setting("Kubernetes__ServiceAccountName", "video-worker"),
-            pod_labels: json_object_setting("Kubernetes__PodLabels", "{}")?,
-            media_node_selector_spot: json_object_setting(
-                "Kubernetes__MediaNodeSelectorSpot",
-                "{}",
-            )?,
-            media_node_selector_regular: json_object_setting(
-                "Kubernetes__MediaNodeSelectorRegular",
-                "{}",
-            )?,
-            media_tolerations_spot: json_array_setting("Kubernetes__MediaTolerationsSpot", "[]")?,
-            media_tolerations_regular: json_array_setting(
-                "Kubernetes__MediaTolerationsRegular",
-                "[]",
-            )?,
             output_storage_account: config::required("Storage__OutputAccountName")?,
             output_storage_container: config::required("Storage__OutputContainer")?,
             output_mount_path: config::setting("Storage__OutputMountPath", "/mnt/output"),
-            storage_csi_driver: config::required("Storage__CsiDriver")?,
-            output_csi_volume_attributes: json_object_setting(
-                "Storage__OutputCsiVolumeAttributes",
-                "{}",
-            )?,
             result_queue: config::setting("Storage__ResultQueue", "video-results"),
             max_parallelism,
             default_media_runtime: config::setting("Encoding__MediaRuntimeDefault", "rust"),
@@ -396,101 +371,74 @@ async fn submit_stitch_job(
                 .and_then(|selector| selector.get("kubernetes.azure.com/scalesetpriority"))
                 .is_some_and(|priority| priority == "spot")
         });
-    let media_runtime = normalize_media_runtime(
+    let media_runtime = video::job_templates::normalize_media_runtime(
         annotations
             .get(MEDIA_RUNTIME_ANNOTATION)
             .map(String::as_str)
             .unwrap_or(&cfg.default_media_runtime),
     )?;
 
-    let mut node_selector = if use_spot {
-        cfg.media_node_selector_spot.clone()
-    } else {
-        cfg.media_node_selector_regular.clone()
-    };
-    if let Some(arch) = encode_node_selector.and_then(|selector| selector.get("kubernetes.io/arch"))
-    {
-        node_selector["kubernetes.io/arch"] = json!(arch);
-    }
-
-    let stitch_image = required_image(media_runtime, "Stitcher")?;
     let stitch_active_deadline_seconds: i64 =
         config::setting("Encoding__StitchJobActiveDeadlineSeconds", "21600")
             .parse()
             .context("Encoding__StitchJobActiveDeadlineSeconds is invalid")?;
-    let mut labels = cfg.pod_labels.clone();
-    labels["app.kubernetes.io/name"] = json!("video-stitcher");
-    labels["video/job-id"] = json!(video::contracts::label_value(&job_id));
-    let tolerations = if use_spot {
-        cfg.media_tolerations_spot.clone()
-    } else {
-        cfg.media_tolerations_regular.clone()
-    };
-    let stitch_job_json = json!({
-        "apiVersion": "batch/v1",
-        "kind": "Job",
-        "metadata": {
-            "name": stitch_name,
-            "labels": labels,
-            "annotations": {
-                JOB_ID_ANNOTATION: job_id,
-            }
-        },
-        "spec": {
-            "backoffLimit": 6,
-            "activeDeadlineSeconds": stitch_active_deadline_seconds,
-            "ttlSecondsAfterFinished": 3600,
-            "template": {
-                "metadata": {
-                    "labels": labels
-                },
-                "spec": {
-                    "serviceAccountName": cfg.service_account_name,
-                    "restartPolicy": "Never",
-                    "terminationGracePeriodSeconds": 120,
-                    "nodeSelector": node_selector,
-                    "tolerations": tolerations,
-                    "volumes": [
-                        {
-                            "name": "output-storage",
-                            "csi": {
-                                "driver": cfg.storage_csi_driver,
-                                "readOnly": false,
-                                "volumeAttributes": cfg.output_csi_volume_attributes
-                            }
-                        }
-                    ],
-                    "containers": [
-                        {
-                            "name": "stitcher",
-                            "image": stitch_image,
-                            "env": [
-                                { "name": "JOB_ID", "value": job_id },
-                                { "name": "SEGMENT_COUNT", "value": segment_count },
-                                { "name": "AUDIO_BLOB_NAME", "value": audio_blob_name },
-                                { "name": "OUTPUT_PATH", "value": output_path },
-                                { "name": "OUTPUT_TYPE", "value": output_type },
-                                { "name": "CALCULATE_VMAF", "value": calculate_vmaf },
-                                { "name": "OUTPUT_STORAGE_ACCOUNT_NAME", "value": cfg.output_storage_account },
-                                { "name": "OUTPUT_STORAGE_CONTAINER", "value": cfg.output_storage_container },
-                                { "name": "OUTPUT_MOUNT_PATH", "value": cfg.output_mount_path }
-                            ],
-                            "volumeMounts": [
-                                { "name": "output-storage", "mountPath": cfg.output_mount_path }
-                            ],
-                            "resources": {
-                                "requests": { "cpu": "1", "memory": "2Gi" },
-                                "limits": { "cpu": "2", "memory": "4Gi" }
-                            }
-                        }
-                    ]
-                }
-            }
-        }
-    });
+    let mut job = load_job_template("stitch", media_runtime, use_spot)?;
+    job.metadata.name = Some(stitch_name.clone());
 
-    let job: Job =
-        serde_json::from_value(stitch_job_json).context("Failed to serialize stitch job")?;
+    let labels = labels_mut(&mut job.metadata);
+    labels.insert(
+        "app.kubernetes.io/name".to_owned(),
+        "video-stitcher".to_owned(),
+    );
+    labels.insert(
+        "video/job-id".to_owned(),
+        video::contracts::label_value(&job_id),
+    );
+
+    let annotations_mutable = annotations_mut(&mut job.metadata);
+    annotations_mutable.insert(JOB_ID_ANNOTATION.to_owned(), job_id.clone());
+
+    let spec = job_spec_mut(&mut job)?;
+    spec.active_deadline_seconds = Some(stitch_active_deadline_seconds);
+
+    let pod_labels = labels_mut(pod_metadata_mut(spec));
+    pod_labels.insert(
+        "app.kubernetes.io/name".to_owned(),
+        "video-stitcher".to_owned(),
+    );
+    pod_labels.insert(
+        "video/job-id".to_owned(),
+        video::contracts::label_value(&job_id),
+    );
+
+    let pod_spec = pod_spec_mut(spec)?;
+    if let Some(arch) = encode_node_selector.and_then(|selector| selector.get("kubernetes.io/arch"))
+    {
+        pod_spec
+            .node_selector
+            .get_or_insert_with(Default::default)
+            .insert("kubernetes.io/arch".to_owned(), arch.clone());
+    }
+
+    let container = container_mut(pod_spec, "stitcher")?;
+    set_env_var(container, "JOB_ID", &job_id)?;
+    set_env_var(container, "SEGMENT_COUNT", &segment_count)?;
+    set_env_var(container, "AUDIO_BLOB_NAME", &audio_blob_name)?;
+    set_env_var(container, "OUTPUT_PATH", &output_path)?;
+    set_env_var(container, "OUTPUT_TYPE", &output_type)?;
+    set_env_var(container, "CALCULATE_VMAF", &calculate_vmaf)?;
+    set_env_var(
+        container,
+        "OUTPUT_STORAGE_ACCOUNT_NAME",
+        &cfg.output_storage_account,
+    )?;
+    set_env_var(
+        container,
+        "OUTPUT_STORAGE_CONTAINER",
+        &cfg.output_storage_container,
+    )?;
+    set_env_var(container, "OUTPUT_MOUNT_PATH", &cfg.output_mount_path)?;
+
     match jobs.create(&PostParams::default(), &job).await {
         Ok(_) => Ok(()),
         Err(kube::Error::Api(error)) if error.code == 409 => Ok(()),
@@ -498,22 +446,76 @@ async fn submit_stitch_job(
     }
 }
 
-fn json_object_setting(name: &str, default: &str) -> Result<Value> {
-    let value: Value = serde_json::from_str(&config::setting(name, default))
-        .with_context(|| format!("{name} must be valid JSON"))?;
-    if !value.is_object() {
-        bail!("{name} must be a JSON object");
-    }
-    Ok(value)
+fn load_job_template(role: &str, media_runtime: &str, use_spot: bool) -> Result<Job> {
+    let path = video::job_templates::template_path(role, media_runtime, use_spot)?;
+    let yaml = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read job template '{}'", path.display()))?;
+    serde_yaml::from_str(&yaml)
+        .with_context(|| format!("Failed to parse job template '{}'", path.display()))
 }
 
-fn json_array_setting(name: &str, default: &str) -> Result<Value> {
-    let value: Value = serde_json::from_str(&config::setting(name, default))
-        .with_context(|| format!("{name} must be valid JSON"))?;
-    if !value.is_array() {
-        bail!("{name} must be a JSON array");
-    }
-    Ok(value)
+fn job_spec_mut(job: &mut Job) -> Result<&mut JobSpec> {
+    job.spec.as_mut().ok_or_else(|| {
+        anyhow!(
+            "Job template '{}' is missing spec",
+            metadata_name(&job.metadata)
+        )
+    })
+}
+
+fn pod_metadata_mut(spec: &mut JobSpec) -> &mut ObjectMeta {
+    spec.template.metadata.get_or_insert_with(Default::default)
+}
+
+fn pod_spec_mut(spec: &mut JobSpec) -> Result<&mut PodSpec> {
+    spec.template.spec.as_mut().ok_or_else(|| {
+        anyhow!(
+            "Job template '{}' is missing pod spec",
+            metadata_name(
+                spec.template
+                    .metadata
+                    .as_ref()
+                    .unwrap_or(&ObjectMeta::default())
+            )
+        )
+    })
+}
+
+fn container_mut<'a>(pod_spec: &'a mut PodSpec, name: &str) -> Result<&'a mut Container> {
+    pod_spec
+        .containers
+        .iter_mut()
+        .find(|container| container.name == name)
+        .ok_or_else(|| anyhow!("Job template is missing container '{name}'"))
+}
+
+fn labels_mut(metadata: &mut ObjectMeta) -> &mut BTreeMap<String, String> {
+    metadata.labels.get_or_insert_with(Default::default)
+}
+
+fn annotations_mut(metadata: &mut ObjectMeta) -> &mut BTreeMap<String, String> {
+    metadata.annotations.get_or_insert_with(Default::default)
+}
+
+fn metadata_name(metadata: &ObjectMeta) -> String {
+    metadata
+        .name
+        .clone()
+        .unwrap_or_else(|| "<unnamed>".to_owned())
+}
+
+fn set_env_var(container: &mut Container, name: &str, value: &str) -> Result<()> {
+    let env = container
+        .env
+        .as_mut()
+        .ok_or_else(|| anyhow!("Container '{}' is missing env entries", container.name))?;
+    let entry = env
+        .iter_mut()
+        .find(|candidate| candidate.name == name)
+        .ok_or_else(|| anyhow!("Container '{}' is missing env var '{name}'", container.name))?;
+    entry.value = Some(value.to_owned());
+    entry.value_from = None;
+    Ok(())
 }
 
 async fn report_result(
@@ -620,30 +622,6 @@ fn build_credential() -> Result<Arc<dyn TokenCredential>> {
     DeveloperToolsCredential::new(None)
         .map(|credential| credential as Arc<dyn TokenCredential>)
         .context("Failed to initialize DeveloperToolsCredential")
-}
-
-fn required_image(media_runtime: &str, role: &str) -> Result<String> {
-    let runtime = normalize_media_runtime(media_runtime)?;
-    let key = format!("Images__{}__{}", capitalize(runtime), role);
-    std::env::var(&key)
-        .or_else(|_| std::env::var(format!("Images__{role}")))
-        .map_err(|_| anyhow!("{key} is required"))
-}
-
-fn normalize_media_runtime(value: &str) -> Result<&'static str> {
-    match value.to_ascii_lowercase().as_str() {
-        "dotnet" => Ok("dotnet"),
-        "rust" => Ok("rust"),
-        _ => bail!("MediaRuntime must be dotnet or rust"),
-    }
-}
-
-fn capitalize(value: &str) -> &'static str {
-    match value {
-        "dotnet" => "Dotnet",
-        "rust" => "Rust",
-        _ => "",
-    }
 }
 
 fn is_not_found(error: &kube::Error) -> bool {

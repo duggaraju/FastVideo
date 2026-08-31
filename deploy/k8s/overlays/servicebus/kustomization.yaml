@@ -5,3 +5,10 @@ resources:
 patches:
   - path: patch-analyzer.yaml
   - path: patch-completion.yaml
+configMapGenerator:
+  - name: video-config
+    behavior: merge
+    literals:
+      - ServiceBus__Namespace=
+      - ServiceBus__InputQueue=video-submitted
+      - ServiceBus__VideoResultQueue=video-results

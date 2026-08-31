@@ -12,9 +12,6 @@ configMapGenerator:
   - name: video-config
     behavior: create
     literals:
-      - ServiceBus__Namespace=
-      - ServiceBus__InputQueue=video-submitted
-      - ServiceBus__VideoResultQueue=video-results
       - Storage__InputAccountName=
       - Storage__InputContainer=
       - Storage__InputMountPath=/mnt/input
@@ -22,27 +19,10 @@ configMapGenerator:
       - Storage__OutputContainer=
       - Storage__OutputMountPath=/mnt/output
       - Storage__WorkingContainer=
-      - Storage__SubmissionQueue=video-submitted
-      - Storage__ResultQueue=video-results
-      - Storage__QueuePollSeconds=3
-      - Storage__QueueVisibilityTimeoutSeconds=900
-      - Storage__QueueVisibilityRenew=true
-      - Storage__QueueVisibilityRenewalSeconds=120
       - Completion__PollSeconds=10
       - WorkloadIdentity__ClientId=
       - Kubernetes__Namespace=video
       - Kubernetes__ServiceAccountName=video-worker
-      - Kubernetes__PodLabels={}
-      - Kubernetes__MediaNodeSelectorSpot={}
-      - Kubernetes__MediaNodeSelectorRegular={}
-      - Kubernetes__MediaTolerationsSpot=[]
-      - Kubernetes__MediaTolerationsRegular=[]
-      - Storage__CsiDriver=
-      - Storage__InputCsiVolumeAttributes={}
-      - Storage__OutputCsiVolumeAttributes={}
-      - Images__Encoder=video-encoder-rust:latest
-      - Images__AudioEncoder=video-audio-encoder-rust:latest
-      - Images__Stitcher=video-stitcher-rust:latest
       - Images__Dotnet__Encoder=video-encoder-dotnet:latest
       - Images__Dotnet__AudioEncoder=video-audio-encoder-dotnet:latest
       - Images__Dotnet__Stitcher=video-stitcher-dotnet:latest

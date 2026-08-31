@@ -1,0 +1,32 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: video-encoder-template
+spec:
+  template:
+    spec:
+      containers:
+        - name: encoder
+          image: video-encoder-rust:latest
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: video-audio-encoder-template
+spec:
+  template:
+    spec:
+      containers:
+        - name: audio-encoder
+          image: video-audio-encoder-rust:latest
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: video-stitcher-template
+spec:
+  template:
+    spec:
+      containers:
+        - name: stitcher
+          image: video-stitcher-rust:latest
