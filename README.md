@@ -1,6 +1,6 @@
 # FastVideo
 
-FastVideo is a .NET 10, Rust, and FFmpeg pipeline for horizontally parallel video encoding on Azure Kubernetes Service. It can use Spot nodes as a cost-saving mechanism, but the pipeline itself is about fast, scalable video processing on Spot or regular nodes.
+FastVideo is a .NET 10, Rust, and FFmpeg pipeline for horizontally parallel video encoding on Kubernetes. Azure Kubernetes Service has the complete infrastructure-as-code path; an external-cluster profile supports existing Kubernetes clusters with separately provisioned dependencies.
 
 The Storage Queue and Service Bus control planes can run side by side. `storagequeue` deploys the Rust analyzer and completion workers to `video-storagequeue`; `servicebus` deploys the .NET analysis and completion workers to `video-servicebus`. Each namespace has its own KEDA scaler, service account, RBAC, and workload-identity federation. The control-plane transport is independent from the `dotnet` or `rust` encoder and stitcher media runtime.
 
@@ -29,11 +29,9 @@ Indexed encode Jobs use Spot nodes by default and tolerate eviction. A request c
 ## Prerequisites
 
 - PowerShell 7 or later on Windows or Linux
-- .NET 10 SDK for local builds
-- Azure CLI with the Bicep extension
 - `kubectl`
-- An Azure subscription where the deployer can create AKS, role assignments, ACR, Storage, Service Bus, and managed identities
-- Permission to write Azure role assignments on the target scope (for example, Owner or User Access Administrator)
+
+Local builds require the .NET 10 SDK, Rust 1.98, and Docker. The default Azure deployment additionally requires Azure CLI with Bicep, an Azure subscription where the deployer can create AKS, role assignments, ACR, Storage, Service Bus, and managed identities, and permission to write role assignments on the target scope (for example, Owner or User Access Administrator). External mode has separate prerequisites below and does not invoke Azure CLI.
 
 Runtime containers use the .NET 10 Azure Linux 3 image and run as the non-root `app` user. They default to BtbN's latest Linux x64 GPL shared FFmpeg build; the release archive is verified against BtbN's published SHA-256 checksums during each image build. Set the Docker build argument `FFMPEG_BUILD=custom` (or deploy with `-FfmpegBuild custom`) to compile FFmpeg 9.0 with native AAC, `libx264`, `libsvtav1`, `libdav1d`, and `libvmaf`. Override the custom version with the `FFMPEG_VERSION` Docker build argument or `-FfmpegVersion` deployment parameter. Both variants include the VMAF model. Azure access uses AKS Workload Identity; no connection strings or account keys are deployed.
 
@@ -86,6 +84,8 @@ Use ACR build agents instead of local Docker by adding `-AcrBuild`. The script s
 
 ## Deploy
 
+### Azure (default)
+
 ```powershell
 ./scripts/deploy.ps1 -Location westus2
 ```
@@ -134,6 +134,34 @@ When the infrastructure has not changed, skip the Bicep deployment and reuse the
 When skipping infrastructure deployment, the script reuses the latest successful deployment record for the requested `-MessageTransport`. Run infrastructure deployment at least once for each transport so its broker RBAC and namespace-specific federated credential exist.
 
 Azure RBAC can take several minutes to propagate after first deployment. If the first pods report authorization failures, restart them after propagation.
+
+### Existing Kubernetes cluster
+
+External mode renders and applies the same resources without invoking Azure CLI, Bicep, ACR, or image builds. Prerequisites are:
+
+- an existing kubeconfig context and namespace-creation permission;
+- FastVideo images already pushed under one registry repository prefix;
+- externally provisioned Azure Blob Storage and either Azure Storage Queues or Azure Service Bus;
+- a CSI driver capable of mounting those containers, plus its required volume attributes;
+- a Kubernetes service account authentication setup that lets the current worker SDKs use Microsoft Entra credentials;
+- KEDA and a matching scaler, or `"scaler": { "mode": "none" }` to run one analyzer replica.
+
+Copy [deploy/external-config.example.json](deploy/external-config.example.json) outside source control, replace its example values, and deploy:
+
+```powershell
+Copy-Item deploy/external-config.example.json ~/fastvideo-external.json
+# Edit ~/fastvideo-external.json; do not add credentials or connection strings.
+./scripts/deploy.ps1 `
+    -DeploymentMode external `
+    -ExternalConfigPath ~/fastvideo-external.json `
+    -MessageTransport storagequeue `
+    -MediaRuntime rust `
+    -ImageTag v1
+```
+
+The config controls the kube context, namespace, image repository, service account and annotations, pod labels, CSI driver/attributes, control-plane and Spot/regular media node selectors and tolerations, and scaler type/metadata/authentication. `useSpot` selects the configured Spot or regular scheduling profile; it does not assume a provider-specific node label. With scaler mode `none`, scaling is deliberately disabled and the analyzer stays at one replica.
+
+The portability boundary is Kubernetes scheduling, registry naming, CSI mounting, and scaler configuration. It is **not yet a provider-neutral data plane**: queue and result clients still use Azure Storage Queue or Azure Service Bus SDKs, blob paths and manifests still use Azure Blob-compatible HTTPS URLs, and authentication still expects Microsoft Entra credentials. A different broker or object store requires a worker adapter implementation; configuring another scaler or CSI driver alone does not add that adapter. The example therefore uses externally provisioned Azure-compatible services and contains identifiers only, never secrets or connection strings.
 
 ## Submit Work
 

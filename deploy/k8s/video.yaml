@@ -6,10 +6,9 @@ metadata:
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: video-worker
+  name: __SERVICE_ACCOUNT_NAME__
   namespace: __KUBERNETES_NAMESPACE__
-  annotations:
-    azure.workload.identity/client-id: "__WORKLOAD_CLIENT_ID__"
+__SERVICE_ACCOUNT_ANNOTATIONS__
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -34,7 +33,7 @@ metadata:
   namespace: __KUBERNETES_NAMESPACE__
 subjects:
   - kind: ServiceAccount
-    name: video-worker
+    name: __SERVICE_ACCOUNT_NAME__
     namespace: __KUBERNETES_NAMESPACE__
 roleRef:
   apiGroup: rbac.authorization.k8s.io
@@ -66,15 +65,24 @@ data:
   Completion__PollSeconds: "10"
   WorkloadIdentity__ClientId: "__WORKLOAD_CLIENT_ID__"
   Kubernetes__Namespace: "__KUBERNETES_NAMESPACE__"
-  Images__Encoder: "__ACR_LOGIN_SERVER__/video-encoder-__MEDIA_RUNTIME__:__IMAGE_TAG__"
-  Images__AudioEncoder: "__ACR_LOGIN_SERVER__/video-audio-encoder-__MEDIA_RUNTIME__:__IMAGE_TAG__"
-  Images__Stitcher: "__ACR_LOGIN_SERVER__/video-stitcher-__MEDIA_RUNTIME__:__IMAGE_TAG__"
-  Images__Dotnet__Encoder: "__ACR_LOGIN_SERVER__/video-encoder-dotnet:__DOTNET_MEDIA_IMAGE_TAG__"
-  Images__Dotnet__AudioEncoder: "__ACR_LOGIN_SERVER__/video-audio-encoder-dotnet:__DOTNET_MEDIA_IMAGE_TAG__"
-  Images__Dotnet__Stitcher: "__ACR_LOGIN_SERVER__/video-stitcher-dotnet:__DOTNET_MEDIA_IMAGE_TAG__"
-  Images__Rust__Encoder: "__ACR_LOGIN_SERVER__/video-encoder-rust:__RUST_MEDIA_IMAGE_TAG__"
-  Images__Rust__AudioEncoder: "__ACR_LOGIN_SERVER__/video-audio-encoder-rust:__RUST_MEDIA_IMAGE_TAG__"
-  Images__Rust__Stitcher: "__ACR_LOGIN_SERVER__/video-stitcher-rust:__RUST_MEDIA_IMAGE_TAG__"
+  Kubernetes__ServiceAccountName: "__SERVICE_ACCOUNT_NAME__"
+  Kubernetes__PodLabels: '__POD_LABELS_JSON__'
+  Kubernetes__MediaNodeSelectorSpot: '__MEDIA_NODE_SELECTOR_SPOT_JSON__'
+  Kubernetes__MediaNodeSelectorRegular: '__MEDIA_NODE_SELECTOR_REGULAR_JSON__'
+  Kubernetes__MediaTolerationsSpot: '__MEDIA_TOLERATIONS_SPOT_JSON__'
+  Kubernetes__MediaTolerationsRegular: '__MEDIA_TOLERATIONS_REGULAR_JSON__'
+  Storage__CsiDriver: "__STORAGE_CSI_DRIVER__"
+  Storage__InputCsiVolumeAttributes: '__INPUT_CSI_VOLUME_ATTRIBUTES_JSON__'
+  Storage__OutputCsiVolumeAttributes: '__OUTPUT_CSI_VOLUME_ATTRIBUTES_JSON__'
+  Images__Encoder: "__IMAGE_REPOSITORY__/video-encoder-__MEDIA_RUNTIME__:__IMAGE_TAG__"
+  Images__AudioEncoder: "__IMAGE_REPOSITORY__/video-audio-encoder-__MEDIA_RUNTIME__:__IMAGE_TAG__"
+  Images__Stitcher: "__IMAGE_REPOSITORY__/video-stitcher-__MEDIA_RUNTIME__:__IMAGE_TAG__"
+  Images__Dotnet__Encoder: "__IMAGE_REPOSITORY__/video-encoder-dotnet:__DOTNET_MEDIA_IMAGE_TAG__"
+  Images__Dotnet__AudioEncoder: "__IMAGE_REPOSITORY__/video-audio-encoder-dotnet:__DOTNET_MEDIA_IMAGE_TAG__"
+  Images__Dotnet__Stitcher: "__IMAGE_REPOSITORY__/video-stitcher-dotnet:__DOTNET_MEDIA_IMAGE_TAG__"
+  Images__Rust__Encoder: "__IMAGE_REPOSITORY__/video-encoder-rust:__RUST_MEDIA_IMAGE_TAG__"
+  Images__Rust__AudioEncoder: "__IMAGE_REPOSITORY__/video-audio-encoder-rust:__RUST_MEDIA_IMAGE_TAG__"
+  Images__Rust__Stitcher: "__IMAGE_REPOSITORY__/video-stitcher-rust:__RUST_MEDIA_IMAGE_TAG__"
   Encoding__MediaRuntimeDefault: "__MEDIA_RUNTIME__"
   Encoding__MaxParallelism: "32"
   Encoding__MinParallelismPerJob: "2"
@@ -93,13 +101,4 @@ metadata:
 data:
   ladder-profiles.json: |-
 __LADDER_PROFILES_JSON__
----
-apiVersion: keda.sh/v1alpha1
-kind: TriggerAuthentication
-metadata:
-  name: video-workload-identity
-  namespace: __KUBERNETES_NAMESPACE__
-spec:
-  podIdentity:
-    provider: azure-workload
-    identityId: "__WORKLOAD_CLIENT_ID__"
+__TRIGGER_AUTHENTICATION_RESOURCE__

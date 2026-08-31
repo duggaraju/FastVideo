@@ -7,7 +7,7 @@ use azure_storage_queue::{QueueClient, QueueServiceClient};
 use k8s_openapi::api::batch::v1::Job;
 use kube::api::PostParams;
 use kube::{Api, Client};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
 use video::{
@@ -23,6 +23,12 @@ use video::{
 #[derive(Debug, Clone)]
 struct AnalyzerConfig {
     namespace: String,
+    service_account_name: String,
+    pod_labels: Value,
+    media_node_selector_spot: Value,
+    media_node_selector_regular: Value,
+    media_tolerations_spot: Value,
+    media_tolerations_regular: Value,
     input_storage_account: String,
     input_storage_container: String,
     input_mount_path: String,
@@ -30,7 +36,9 @@ struct AnalyzerConfig {
     output_storage_container: String,
     output_mount_path: String,
     working_container: String,
-    workload_client_id: String,
+    storage_csi_driver: String,
+    input_csi_volume_attributes: Value,
+    output_csi_volume_attributes: Value,
     submission_queue: String,
     max_parallelism: i32,
     min_parallelism_per_job: i32,
@@ -157,6 +165,21 @@ impl AnalyzerConfig {
 
         Ok(Self {
             namespace: config::setting("Kubernetes__Namespace", "video-storagequeue"),
+            service_account_name: config::setting("Kubernetes__ServiceAccountName", "video-worker"),
+            pod_labels: json_object_setting("Kubernetes__PodLabels", "{}")?,
+            media_node_selector_spot: json_object_setting(
+                "Kubernetes__MediaNodeSelectorSpot",
+                "{}",
+            )?,
+            media_node_selector_regular: json_object_setting(
+                "Kubernetes__MediaNodeSelectorRegular",
+                "{}",
+            )?,
+            media_tolerations_spot: json_array_setting("Kubernetes__MediaTolerationsSpot", "[]")?,
+            media_tolerations_regular: json_array_setting(
+                "Kubernetes__MediaTolerationsRegular",
+                "[]",
+            )?,
             input_storage_account: config::required("Storage__InputAccountName")?,
             input_storage_container: config::required("Storage__InputContainer")?,
             input_mount_path: config::setting("Storage__InputMountPath", "/mnt/input"),
@@ -164,7 +187,15 @@ impl AnalyzerConfig {
             output_storage_container: config::required("Storage__OutputContainer")?,
             output_mount_path: config::setting("Storage__OutputMountPath", "/mnt/output"),
             working_container: config::setting("Storage__WorkingContainer", "videos"),
-            workload_client_id: config::required("WorkloadIdentity__ClientId")?,
+            storage_csi_driver: config::required("Storage__CsiDriver")?,
+            input_csi_volume_attributes: json_object_setting(
+                "Storage__InputCsiVolumeAttributes",
+                "{}",
+            )?,
+            output_csi_volume_attributes: json_object_setting(
+                "Storage__OutputCsiVolumeAttributes",
+                "{}",
+            )?,
             submission_queue: config::setting("Storage__SubmissionQueue", "video-submitted"),
             max_parallelism,
             min_parallelism_per_job,
@@ -525,12 +556,13 @@ async fn submit_encoding_job(
         OUTPUT_TYPE_ANNOTATION: manifest.output_type,
         CALCULATE_VMAF_ANNOTATION: if manifest.calculate_vmaf { "true" } else { "false" },
         MEDIA_RUNTIME_ANNOTATION: media_runtime,
+        "video.fastvideo/use-spot": if manifest.use_spot { "true" } else { "false" },
     });
-    let mut node_selector = json!({
-        "workload": "video-encoding",
-        "kubernetes.azure.com/scalesetpriority": if manifest.use_spot { "spot" } else { "regular" },
-        "kubernetes.io/os": "linux",
-    });
+    let mut node_selector = if manifest.use_spot {
+        cfg.media_node_selector_spot.clone()
+    } else {
+        cfg.media_node_selector_regular.clone()
+    };
     if let Some(arch) = architecture {
         node_selector["kubernetes.io/arch"] = json!(arch);
     }
@@ -541,16 +573,20 @@ async fn submit_encoding_job(
             .parse()
             .context("Encoding__EncodeJobActiveDeadlineSeconds is invalid")?;
 
+    let mut labels = cfg.pod_labels.clone();
+    labels["app.kubernetes.io/name"] = json!("video-encoder");
+    labels["video/job-id"] = json!(video::contracts::label_value(&manifest.job_id));
+    let tolerations = if manifest.use_spot {
+        cfg.media_tolerations_spot.clone()
+    } else {
+        cfg.media_tolerations_regular.clone()
+    };
     let job_json = json!({
         "apiVersion": "batch/v1",
         "kind": "Job",
         "metadata": {
             "name": encode_job_name,
-            "labels": {
-                "app.kubernetes.io/name": "video-encoder",
-                "video/job-id": video::contracts::label_value(&manifest.job_id),
-                "azure.workload.identity/use": "true"
-            },
+            "labels": labels,
             "annotations": annotations
         },
         "spec": {
@@ -562,52 +598,29 @@ async fn submit_encoding_job(
             "ttlSecondsAfterFinished": 86400,
             "template": {
                 "metadata": {
-                    "labels": {
-                        "app.kubernetes.io/name": "video-encoder",
-                        "video/job-id": video::contracts::label_value(&manifest.job_id),
-                        "azure.workload.identity/use": "true"
-                    }
+                    "labels": labels
                 },
                 "spec": {
-                    "serviceAccountName": "video-worker",
+                    "serviceAccountName": cfg.service_account_name,
                     "restartPolicy": "Never",
                     "terminationGracePeriodSeconds": 120,
                     "nodeSelector": node_selector,
-                    "tolerations": manifest.use_spot.then(|| vec![json!({
-                        "key": "kubernetes.azure.com/scalesetpriority",
-                        "operator": "Equal",
-                        "value": "spot",
-                        "effect": "NoSchedule"
-                    })]),
+                    "tolerations": tolerations,
                     "volumes": [
                         {
                             "name": "input-storage",
                             "csi": {
-                                "driver": "blob.csi.azure.com",
+                                "driver": cfg.storage_csi_driver,
                                 "readOnly": true,
-                                "volumeAttributes": {
-                                    "protocol": "fuse2",
-                                    "storageAccount": cfg.input_storage_account,
-                                    "containerName": cfg.input_storage_container,
-                                    "ClientID": cfg.workload_client_id,
-                                    "mountWithWorkloadIdentityToken": "true",
-                                    "mountOptions": "--allow-other --use-attr-cache=true --cancel-list-on-mount-seconds=10"
-                                }
+                                "volumeAttributes": cfg.input_csi_volume_attributes
                             }
                         },
                         {
                             "name": "output-storage",
                             "csi": {
-                                "driver": "blob.csi.azure.com",
+                                "driver": cfg.storage_csi_driver,
                                 "readOnly": false,
-                                "volumeAttributes": {
-                                    "protocol": "fuse2",
-                                    "storageAccount": cfg.output_storage_account,
-                                    "containerName": cfg.output_storage_container,
-                                    "ClientID": cfg.workload_client_id,
-                                    "mountWithWorkloadIdentityToken": "true",
-                                    "mountOptions": "--allow-other --use-attr-cache=true --disable-writeback-cache=true"
-                                }
+                                "volumeAttributes": cfg.output_csi_volume_attributes
                             }
                         }
                     ],
@@ -678,12 +691,15 @@ async fn submit_audio_encoding_job(
         Some(other) => bail!("architecture must be amd64 or arm64; got '{other}'"),
         None => None,
     };
-    let annotations = json!({ JOB_ID_ANNOTATION: manifest.job_id });
-    let mut node_selector = json!({
-        "workload": "video-encoding",
-        "kubernetes.azure.com/scalesetpriority": if manifest.use_spot { "spot" } else { "regular" },
-        "kubernetes.io/os": "linux",
+    let annotations = json!({
+        JOB_ID_ANNOTATION: manifest.job_id,
+        "video.fastvideo/use-spot": if manifest.use_spot { "true" } else { "false" }
     });
+    let mut node_selector = if manifest.use_spot {
+        cfg.media_node_selector_spot.clone()
+    } else {
+        cfg.media_node_selector_regular.clone()
+    };
     if let Some(arch) = architecture {
         node_selector["kubernetes.io/arch"] = json!(arch);
     }
@@ -693,16 +709,20 @@ async fn submit_audio_encoding_job(
         config::setting("Encoding__AudioEncodeJobActiveDeadlineSeconds", "21600")
             .parse()
             .context("Encoding__AudioEncodeJobActiveDeadlineSeconds is invalid")?;
+    let mut labels = cfg.pod_labels.clone();
+    labels["app.kubernetes.io/name"] = json!("video-audio-encoder");
+    labels["video/job-id"] = json!(video::contracts::label_value(&manifest.job_id));
+    let tolerations = if manifest.use_spot {
+        cfg.media_tolerations_spot.clone()
+    } else {
+        cfg.media_tolerations_regular.clone()
+    };
     let job_json = json!({
         "apiVersion": "batch/v1",
         "kind": "Job",
         "metadata": {
             "name": audio_job_name,
-            "labels": {
-                "app.kubernetes.io/name": "video-audio-encoder",
-                "video/job-id": video::contracts::label_value(&manifest.job_id),
-                "azure.workload.identity/use": "true"
-            },
+            "labels": labels,
             "annotations": annotations
         },
         "spec": {
@@ -710,40 +730,21 @@ async fn submit_audio_encoding_job(
             "activeDeadlineSeconds": audio_encode_active_deadline_seconds,
             "ttlSecondsAfterFinished": 86400,
             "template": {
-                "metadata": { "labels": {
-                    "app.kubernetes.io/name": "video-audio-encoder",
-                    "video/job-id": video::contracts::label_value(&manifest.job_id),
-                    "azure.workload.identity/use": "true"
-                }},
+                "metadata": { "labels": labels },
                 "spec": {
-                    "serviceAccountName": "video-worker",
+                    "serviceAccountName": cfg.service_account_name,
                     "restartPolicy": "Never",
                     "terminationGracePeriodSeconds": 120,
                     "nodeSelector": node_selector,
-                    "tolerations": manifest.use_spot.then(|| vec![json!({
-                        "key": "kubernetes.azure.com/scalesetpriority",
-                        "operator": "Equal",
-                        "value": "spot",
-                        "effect": "NoSchedule"
-                    })]),
+                    "tolerations": tolerations,
                     "volumes": [
                         { "name": "input-storage", "csi": {
-                            "driver": "blob.csi.azure.com", "readOnly": true,
-                            "volumeAttributes": {
-                                "protocol": "fuse2", "storageAccount": cfg.input_storage_account,
-                                "containerName": cfg.input_storage_container, "ClientID": cfg.workload_client_id,
-                                "mountWithWorkloadIdentityToken": "true",
-                                "mountOptions": "--allow-other --use-attr-cache=true --cancel-list-on-mount-seconds=10"
-                            }
+                            "driver": cfg.storage_csi_driver, "readOnly": true,
+                            "volumeAttributes": cfg.input_csi_volume_attributes
                         }},
                         { "name": "output-storage", "csi": {
-                            "driver": "blob.csi.azure.com", "readOnly": false,
-                            "volumeAttributes": {
-                                "protocol": "fuse2", "storageAccount": cfg.output_storage_account,
-                                "containerName": cfg.output_storage_container, "ClientID": cfg.workload_client_id,
-                                "mountWithWorkloadIdentityToken": "true",
-                                "mountOptions": "--allow-other --use-attr-cache=true --disable-writeback-cache=true"
-                            }
+                            "driver": cfg.storage_csi_driver, "readOnly": false,
+                            "volumeAttributes": cfg.output_csi_volume_attributes
                         }}
                     ],
                     "containers": [{
@@ -780,6 +781,24 @@ async fn submit_audio_encoding_job(
         Err(kube::Error::Api(error)) if error.code == 409 => Ok(()),
         Err(error) => Err(error).context("Failed to create audio encode job"),
     }
+}
+
+fn json_object_setting(name: &str, default: &str) -> Result<Value> {
+    let value: Value = serde_json::from_str(&config::setting(name, default))
+        .with_context(|| format!("{name} must be valid JSON"))?;
+    if !value.is_object() {
+        bail!("{name} must be a JSON object");
+    }
+    Ok(value)
+}
+
+fn json_array_setting(name: &str, default: &str) -> Result<Value> {
+    let value: Value = serde_json::from_str(&config::setting(name, default))
+        .with_context(|| format!("{name} must be valid JSON"))?;
+    if !value.is_array() {
+        bail!("{name} must be a JSON array");
+    }
+    Ok(value)
 }
 
 fn calculate_segment_duration_seconds(

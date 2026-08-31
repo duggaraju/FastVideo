@@ -15,6 +15,7 @@ public sealed class AnalysisWorker(
     IConfiguration configuration,
     ILogger<AnalysisWorker> logger) : BackgroundService
 {
+    private const string UseSpotAnnotation = "video.fastvideo/use-spot";
     private ServiceBusProcessor? _processor;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -246,17 +247,11 @@ public sealed class AnalysisWorker(
         };
         var inputVolumeName = "input-storage";
         var outputVolumeName = "output-storage";
-        var labels = new Dictionary<string, string>
-        {
-            ["app.kubernetes.io/name"] = "video-encoder",
-            ["video/job-id"] = JobNames.LabelValue(manifest.JobId),
-            ["azure.workload.identity/use"] = "true"
-        };
-        var nodeSelector = new Dictionary<string, string>
-        {
-            ["workload"] = "video-encoding",
-            ["kubernetes.azure.com/scalesetpriority"] = manifest.UseSpot ? "spot" : "regular"
-        };
+        var labels = StringMapConfig("Kubernetes:PodLabels");
+        labels["app.kubernetes.io/name"] = "video-encoder";
+        labels["video/job-id"] = JobNames.LabelValue(manifest.JobId);
+        var nodeSelector = StringMapConfig(
+            manifest.UseSpot ? "Kubernetes:MediaNodeSelectorSpot" : "Kubernetes:MediaNodeSelectorRegular");
         if (architecture is not null)
             nodeSelector["kubernetes.io/arch"] = architecture;
 
@@ -286,14 +281,13 @@ public sealed class AnalysisWorker(
                 ],
                 Volumes =
                 [
-                    BlobFuseVolume(inputVolumeName, inputAccount, inputContainer, RequiredConfig("WorkloadIdentity:ClientId"), readOnly: true),
-                    BlobFuseVolume(outputVolumeName, outputAccount, outputContainer, RequiredConfig("WorkloadIdentity:ClientId"), readOnly: false)
+                    CsiVolume(inputVolumeName, "Storage:InputCsiVolumeAttributes", readOnly: true),
+                    CsiVolume(outputVolumeName, "Storage:OutputCsiVolumeAttributes", readOnly: false)
                 ],
                 RestartPolicy = "Never",
-                ServiceAccountName = "video-worker",
-                Tolerations = manifest.UseSpot
-                    ? [new V1Toleration { Effect = "NoSchedule", OperatorProperty = "Equal", Key = "kubernetes.azure.com/scalesetpriority", Value = "spot" }]
-                    : null,
+                ServiceAccountName = configuration["Kubernetes:ServiceAccountName"] ?? "video-worker",
+                Tolerations = TolerationsConfig(
+                    manifest.UseSpot ? "Kubernetes:MediaTolerationsSpot" : "Kubernetes:MediaTolerationsRegular"),
                 NodeSelector = nodeSelector,
                 TerminationGracePeriodSeconds = 120
             }
@@ -312,7 +306,8 @@ public sealed class AnalysisWorker(
                     [JobNames.OutputPathAnnotation] = manifest.OutputPath.ToString(),
                     [JobNames.OutputTypeAnnotation] = manifest.OutputType,
                     [JobNames.CalculateVmafAnnotation] = manifest.CalculateVmaf ? "true" : "false",
-                    [JobNames.MediaRuntimeAnnotation] = manifest.MediaRuntime
+                    [JobNames.MediaRuntimeAnnotation] = manifest.MediaRuntime,
+                    [UseSpotAnnotation] = manifest.UseSpot ? "true" : "false"
                 }
             },
             Spec = new V1JobSpec
@@ -351,18 +346,11 @@ public sealed class AnalysisWorker(
         {
         }
 
-        var labels = new Dictionary<string, string>
-        {
-            ["app.kubernetes.io/name"] = "video-audio-encoder",
-            ["video/job-id"] = JobNames.LabelValue(manifest.JobId),
-            ["azure.workload.identity/use"] = "true"
-        };
-        var nodeSelector = new Dictionary<string, string>
-        {
-            ["workload"] = "video-encoding",
-            ["kubernetes.azure.com/scalesetpriority"] = manifest.UseSpot ? "spot" : "regular",
-            ["kubernetes.io/os"] = "linux"
-        };
+        var labels = StringMapConfig("Kubernetes:PodLabels");
+        labels["app.kubernetes.io/name"] = "video-audio-encoder";
+        labels["video/job-id"] = JobNames.LabelValue(manifest.JobId);
+        var nodeSelector = StringMapConfig(
+            manifest.UseSpot ? "Kubernetes:MediaNodeSelectorSpot" : "Kubernetes:MediaNodeSelectorRegular");
         if (architecture is not null)
             nodeSelector["kubernetes.io/arch"] = architecture;
 
@@ -404,14 +392,13 @@ public sealed class AnalysisWorker(
                 ],
                 Volumes =
                 [
-                    BlobFuseVolume(inputVolumeName, inputAccount, inputContainer, RequiredConfig("WorkloadIdentity:ClientId"), readOnly: true),
-                    BlobFuseVolume(outputVolumeName, outputAccount, outputContainer, RequiredConfig("WorkloadIdentity:ClientId"), readOnly: false)
+                    CsiVolume(inputVolumeName, "Storage:InputCsiVolumeAttributes", readOnly: true),
+                    CsiVolume(outputVolumeName, "Storage:OutputCsiVolumeAttributes", readOnly: false)
                 ],
                 RestartPolicy = "Never",
-                ServiceAccountName = "video-worker",
-                Tolerations = manifest.UseSpot
-                    ? [new V1Toleration { Effect = "NoSchedule", OperatorProperty = "Equal", Key = "kubernetes.azure.com/scalesetpriority", Value = "spot" }]
-                    : null,
+                ServiceAccountName = configuration["Kubernetes:ServiceAccountName"] ?? "video-worker",
+                Tolerations = TolerationsConfig(
+                    manifest.UseSpot ? "Kubernetes:MediaTolerationsSpot" : "Kubernetes:MediaTolerationsRegular"),
                 NodeSelector = nodeSelector,
                 TerminationGracePeriodSeconds = 120
             }
@@ -424,7 +411,8 @@ public sealed class AnalysisWorker(
                 Labels = labels,
                 Annotations = new Dictionary<string, string>
                 {
-                    [JobNames.JobIdAnnotation] = manifest.JobId
+                    [JobNames.JobIdAnnotation] = manifest.JobId,
+                    [UseSpotAnnotation] = manifest.UseSpot ? "true" : "false"
                 }
             },
             Spec = new V1JobSpec { Template = pod, BackoffLimit = 6, ActiveDeadlineSeconds = configuration.GetValue("Encoding:AudioEncodeJobActiveDeadlineSeconds", 21600), TtlSecondsAfterFinished = 86400 }
@@ -471,30 +459,49 @@ public sealed class AnalysisWorker(
         return Math.Clamp(durationPerWorker, minimumSegmentDurationSeconds, maximumSegmentDurationSeconds);
     }
 
-    private static V1Volume BlobFuseVolume(string name, string storageAccount, string containerName, string clientId, bool readOnly)
+    private V1Volume CsiVolume(string name, string attributesConfigKey, bool readOnly)
     {
-        var mountOptions = readOnly
-            ? "--allow-other --use-attr-cache=true --cancel-list-on-mount-seconds=10"
-            : "--allow-other --use-attr-cache=true --disable-writeback-cache=true";
         return new V1Volume
         {
             Name = name,
             Csi = new V1CSIVolumeSource
             {
-                Driver = "blob.csi.azure.com",
+                Driver = RequiredConfig("Storage:CsiDriver"),
                 ReadOnlyProperty = readOnly,
-                VolumeAttributes = new Dictionary<string, string>
-                {
-                    ["protocol"] = "fuse2",
-                    ["storageAccount"] = storageAccount,
-                    ["containerName"] = containerName,
-                    ["ClientID"] = clientId,
-                    ["mountWithWorkloadIdentityToken"] = "true",
-                    ["mountOptions"] = mountOptions
-                }
+                VolumeAttributes = StringMapConfig(attributesConfigKey)
             }
         };
     }
+
+    private Dictionary<string, string> StringMapConfig(string key)
+    {
+        var json = configuration[key] ?? "{}";
+        return JsonSerializer.Deserialize<Dictionary<string, string>>(json)
+            ?? throw new InvalidOperationException($"{key} must be a JSON object");
+    }
+
+    private IList<V1Toleration>? TolerationsConfig(string key)
+    {
+        var json = configuration[key] ?? "[]";
+        var settings = JsonSerializer.Deserialize<List<TolerationSetting>>(json, JsonSerializerOptions.Web)
+            ?? throw new InvalidOperationException($"{key} must be a JSON array");
+        var tolerations = settings.Select(setting => new V1Toleration
+        {
+            Key = setting.Key,
+            OperatorProperty = setting.Operator,
+            Value = setting.Value,
+            Effect = setting.Effect,
+            TolerationSeconds = setting.TolerationSeconds
+        }).ToList();
+        return tolerations.Count == 0 ? null : tolerations;
+    }
+
+    private sealed record TolerationSetting(
+        string? Key,
+        string? Operator,
+        string? Value,
+        string? Effect,
+        long? TolerationSeconds);
 
     private string RequiredConfig(string key) =>
         configuration[key] ?? throw new InvalidOperationException($"{key} is required");

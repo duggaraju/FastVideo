@@ -8,7 +8,7 @@ use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::coordination::v1::Lease;
 use kube::api::{DeleteParams, Patch, PatchParams, PostParams};
 use kube::{Api, Client};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::sync::Arc;
 use video::{
     config,
@@ -28,10 +28,17 @@ const LEADER_LEASE_NAME: &str = "video-completion-leader";
 #[derive(Debug, Clone)]
 struct CompletionConfig {
     namespace: String,
+    service_account_name: String,
+    pod_labels: Value,
+    media_node_selector_spot: Value,
+    media_node_selector_regular: Value,
+    media_tolerations_spot: Value,
+    media_tolerations_regular: Value,
     output_storage_account: String,
     output_storage_container: String,
     output_mount_path: String,
-    workload_client_id: String,
+    storage_csi_driver: String,
+    output_csi_volume_attributes: Value,
     result_queue: String,
     max_parallelism: i32,
     default_media_runtime: String,
@@ -99,10 +106,29 @@ impl CompletionConfig {
 
         Ok(Self {
             namespace: config::setting("Kubernetes__Namespace", "video-storagequeue"),
+            service_account_name: config::setting("Kubernetes__ServiceAccountName", "video-worker"),
+            pod_labels: json_object_setting("Kubernetes__PodLabels", "{}")?,
+            media_node_selector_spot: json_object_setting(
+                "Kubernetes__MediaNodeSelectorSpot",
+                "{}",
+            )?,
+            media_node_selector_regular: json_object_setting(
+                "Kubernetes__MediaNodeSelectorRegular",
+                "{}",
+            )?,
+            media_tolerations_spot: json_array_setting("Kubernetes__MediaTolerationsSpot", "[]")?,
+            media_tolerations_regular: json_array_setting(
+                "Kubernetes__MediaTolerationsRegular",
+                "[]",
+            )?,
             output_storage_account: config::required("Storage__OutputAccountName")?,
             output_storage_container: config::required("Storage__OutputContainer")?,
             output_mount_path: config::setting("Storage__OutputMountPath", "/mnt/output"),
-            workload_client_id: config::required("WorkloadIdentity__ClientId")?,
+            storage_csi_driver: config::required("Storage__CsiDriver")?,
+            output_csi_volume_attributes: json_object_setting(
+                "Storage__OutputCsiVolumeAttributes",
+                "{}",
+            )?,
             result_queue: config::setting("Storage__ResultQueue", "video-results"),
             max_parallelism,
             default_media_runtime: config::setting("Encoding__MediaRuntimeDefault", "rust"),
@@ -362,9 +388,14 @@ async fn submit_stitch_job(
         .as_ref()
         .and_then(|spec| spec.template.spec.as_ref())
         .and_then(|spec| spec.node_selector.as_ref());
-    let use_spot = encode_node_selector
-        .and_then(|selector| selector.get("kubernetes.azure.com/scalesetpriority"))
-        .is_some_and(|priority| priority == "spot");
+    let use_spot = annotations
+        .get("video.fastvideo/use-spot")
+        .map(|value| value == "true")
+        .unwrap_or_else(|| {
+            encode_node_selector
+                .and_then(|selector| selector.get("kubernetes.azure.com/scalesetpriority"))
+                .is_some_and(|priority| priority == "spot")
+        });
     let media_runtime = normalize_media_runtime(
         annotations
             .get(MEDIA_RUNTIME_ANNOTATION)
@@ -372,11 +403,11 @@ async fn submit_stitch_job(
             .unwrap_or(&cfg.default_media_runtime),
     )?;
 
-    let mut node_selector = json!({
-        "workload": "video-encoding",
-        "kubernetes.azure.com/scalesetpriority": if use_spot { "spot" } else { "regular" },
-        "kubernetes.io/os": "linux"
-    });
+    let mut node_selector = if use_spot {
+        cfg.media_node_selector_spot.clone()
+    } else {
+        cfg.media_node_selector_regular.clone()
+    };
     if let Some(arch) = encode_node_selector.and_then(|selector| selector.get("kubernetes.io/arch"))
     {
         node_selector["kubernetes.io/arch"] = json!(arch);
@@ -387,16 +418,20 @@ async fn submit_stitch_job(
         config::setting("Encoding__StitchJobActiveDeadlineSeconds", "21600")
             .parse()
             .context("Encoding__StitchJobActiveDeadlineSeconds is invalid")?;
+    let mut labels = cfg.pod_labels.clone();
+    labels["app.kubernetes.io/name"] = json!("video-stitcher");
+    labels["video/job-id"] = json!(video::contracts::label_value(&job_id));
+    let tolerations = if use_spot {
+        cfg.media_tolerations_spot.clone()
+    } else {
+        cfg.media_tolerations_regular.clone()
+    };
     let stitch_job_json = json!({
         "apiVersion": "batch/v1",
         "kind": "Job",
         "metadata": {
             "name": stitch_name,
-            "labels": {
-                "app.kubernetes.io/name": "video-stitcher",
-                "video/job-id": video::contracts::label_value(&job_id),
-                "azure.workload.identity/use": "true"
-            },
+            "labels": labels,
             "annotations": {
                 JOB_ID_ANNOTATION: job_id,
             }
@@ -407,37 +442,21 @@ async fn submit_stitch_job(
             "ttlSecondsAfterFinished": 3600,
             "template": {
                 "metadata": {
-                    "labels": {
-                        "app.kubernetes.io/name": "video-stitcher",
-                        "video/job-id": video::contracts::label_value(&job_id),
-                        "azure.workload.identity/use": "true"
-                    }
+                    "labels": labels
                 },
                 "spec": {
-                    "serviceAccountName": "video-worker",
+                    "serviceAccountName": cfg.service_account_name,
                     "restartPolicy": "Never",
                     "terminationGracePeriodSeconds": 120,
                     "nodeSelector": node_selector,
-                    "tolerations": use_spot.then(|| vec![json!({
-                        "key": "kubernetes.azure.com/scalesetpriority",
-                        "operator": "Equal",
-                        "value": "spot",
-                        "effect": "NoSchedule"
-                    })]),
+                    "tolerations": tolerations,
                     "volumes": [
                         {
                             "name": "output-storage",
                             "csi": {
-                                "driver": "blob.csi.azure.com",
+                                "driver": cfg.storage_csi_driver,
                                 "readOnly": false,
-                                "volumeAttributes": {
-                                    "protocol": "fuse2",
-                                    "storageAccount": cfg.output_storage_account,
-                                    "containerName": cfg.output_storage_container,
-                                    "ClientID": cfg.workload_client_id,
-                                    "mountWithWorkloadIdentityToken": "true",
-                                    "mountOptions": "--allow-other --use-attr-cache=true --file-cache-timeout-in-seconds=30 --disable-writeback-cache=true"
-                                }
+                                "volumeAttributes": cfg.output_csi_volume_attributes
                             }
                         }
                     ],
@@ -477,6 +496,24 @@ async fn submit_stitch_job(
         Err(kube::Error::Api(error)) if error.code == 409 => Ok(()),
         Err(error) => Err(error).context("Failed to create stitch job"),
     }
+}
+
+fn json_object_setting(name: &str, default: &str) -> Result<Value> {
+    let value: Value = serde_json::from_str(&config::setting(name, default))
+        .with_context(|| format!("{name} must be valid JSON"))?;
+    if !value.is_object() {
+        bail!("{name} must be a JSON object");
+    }
+    Ok(value)
+}
+
+fn json_array_setting(name: &str, default: &str) -> Result<Value> {
+    let value: Value = serde_json::from_str(&config::setting(name, default))
+        .with_context(|| format!("{name} must be valid JSON"))?;
+    if !value.is_array() {
+        bail!("{name} must be a JSON array");
+    }
+    Ok(value)
 }
 
 async fn report_result(

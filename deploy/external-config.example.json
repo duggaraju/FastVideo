@@ -1,0 +1,68 @@
+{
+  "kubeContext": "existing-cluster",
+  "namespace": "video-storagequeue",
+  "imageRepository": "registry.example.com/fastvideo",
+  "workloadClientId": "<externally-provisioned-entra-application-client-id>",
+  "serviceAccountName": "video-worker",
+  "serviceAccountAnnotations": {
+    "azure.workload.identity/client-id": "<externally-provisioned-entra-application-client-id>"
+  },
+  "podLabels": {
+    "azure.workload.identity/use": "true"
+  },
+  "storage": {
+    "inputAccountName": "<azure-storage-account>",
+    "inputContainer": "input",
+    "outputAccountName": "<azure-storage-account>",
+    "outputContainer": "videos",
+    "csiDriver": "blob.csi.azure.com",
+    "inputVolumeAttributes": {
+      "protocol": "fuse2",
+      "storageAccount": "<azure-storage-account>",
+      "containerName": "input",
+      "ClientID": "<externally-provisioned-entra-application-client-id>",
+      "mountWithWorkloadIdentityToken": "true",
+      "mountOptions": "--allow-other --use-attr-cache=true --file-cache-timeout-in-seconds=300 --cancel-list-on-mount-seconds=10"
+    },
+    "outputVolumeAttributes": {
+      "protocol": "fuse2",
+      "storageAccount": "<azure-storage-account>",
+      "containerName": "videos",
+      "ClientID": "<externally-provisioned-entra-application-client-id>",
+      "mountWithWorkloadIdentityToken": "true",
+      "mountOptions": "--allow-other --use-attr-cache=true --file-cache-timeout-in-seconds=30 --disable-writeback-cache=true"
+    }
+  },
+  "serviceBusNamespace": "",
+  "controlPlaneNodeSelector": {
+    "kubernetes.io/os": "linux"
+  },
+  "controlPlaneTolerations": [],
+  "mediaNodeSelectorSpot": {
+    "kubernetes.io/os": "linux",
+    "workload": "video-encoding"
+  },
+  "mediaNodeSelectorRegular": {
+    "kubernetes.io/os": "linux",
+    "workload": "video-encoding"
+  },
+  "mediaTolerationsSpot": [],
+  "mediaTolerationsRegular": [],
+  "scaler": {
+    "mode": "keda",
+    "type": "azure-queue",
+    "metadata": {
+      "accountName": "<azure-storage-account>",
+      "queueName": "video-submitted",
+      "queueLength": "1",
+      "activationQueueLength": "0"
+    },
+    "authenticationRef": "video-workload-identity",
+    "triggerAuthentication": {
+      "podIdentity": {
+        "provider": "azure-workload",
+        "identityId": "<externally-provisioned-entra-application-client-id>"
+      }
+    }
+  }
+}

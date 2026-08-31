@@ -12,6 +12,7 @@ public sealed class EncodeJobWatcher(
     IConfiguration configuration,
     ILogger<EncodeJobWatcher> logger) : BackgroundService
 {
+    private const string UseSpotAnnotation = "video.fastvideo/use-spot";
     private readonly HashSet<string> _loggedFailedPods = [];
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -241,9 +242,11 @@ public sealed class EncodeJobWatcher(
         var jobId = RequiredAnnotation(annotations, JobNames.JobIdAnnotation);
         var stitchJobName = JobNames.For("stitch", jobId);
         var encodeNodeSelector = encodeJob.Spec?.Template?.Spec?.NodeSelector;
-        var useSpot = encodeNodeSelector?.TryGetValue(
-            "kubernetes.azure.com/scalesetpriority",
-            out var scaleSetPriority) == true && scaleSetPriority == "spot";
+        var useSpot = annotations.TryGetValue(UseSpotAnnotation, out var useSpotValue)
+            ? bool.Parse(useSpotValue)
+            : encodeNodeSelector?.TryGetValue(
+                "kubernetes.azure.com/scalesetpriority",
+                out var scaleSetPriority) == true && scaleSetPriority == "spot";
         var mediaRuntime = OptionalAnnotation(
             annotations,
             JobNames.MediaRuntimeAnnotation,
@@ -260,20 +263,13 @@ public sealed class EncodeJobWatcher(
         {
         }
 
-        var labels = new Dictionary<string, string>
-        {
-            ["app.kubernetes.io/name"] = "video-stitcher",
-            ["video/job-id"] = JobNames.LabelValue(jobId),
-            ["azure.workload.identity/use"] = "true"
-        };
+        var labels = StringMapConfig("Kubernetes:PodLabels");
+        labels["app.kubernetes.io/name"] = "video-stitcher";
+        labels["video/job-id"] = JobNames.LabelValue(jobId);
         var outputVolumeName = "output-storage";
         var outputMountPath = configuration["Storage:OutputMountPath"] ?? "/mnt/output";
-        var nodeSelector = new Dictionary<string, string>
-        {
-            ["workload"] = "video-encoding",
-            ["kubernetes.azure.com/scalesetpriority"] = useSpot ? "spot" : "regular",
-            ["kubernetes.io/os"] = "linux"
-        };
+        var nodeSelector = StringMapConfig(
+            useSpot ? "Kubernetes:MediaNodeSelectorSpot" : "Kubernetes:MediaNodeSelectorRegular");
         if (!string.IsNullOrEmpty(architecture))
             nodeSelector["kubernetes.io/arch"] = architecture;
 
@@ -311,17 +307,12 @@ public sealed class EncodeJobWatcher(
                 ],
                 Volumes =
                 [
-                    BlobFuseVolume(
-                        outputVolumeName,
-                        RequiredConfig("Storage:OutputAccountName"),
-                        RequiredConfig("Storage:OutputContainer"),
-                        RequiredConfig("WorkloadIdentity:ClientId"))
+                    CsiVolume(outputVolumeName, "Storage:OutputCsiVolumeAttributes")
                 ],
                 RestartPolicy = "Never",
-                ServiceAccountName = "video-worker",
-                Tolerations = useSpot
-                    ? [new V1Toleration { Effect = "NoSchedule", OperatorProperty = "Equal", Key = "kubernetes.azure.com/scalesetpriority", Value = "spot" }]
-                    : null,
+                ServiceAccountName = configuration["Kubernetes:ServiceAccountName"] ?? "video-worker",
+                Tolerations = TolerationsConfig(
+                    useSpot ? "Kubernetes:MediaTolerationsSpot" : "Kubernetes:MediaTolerationsRegular"),
                 NodeSelector = nodeSelector,
                 TerminationGracePeriodSeconds = 120
             }
@@ -441,25 +432,47 @@ public sealed class EncodeJobWatcher(
             ?? throw new InvalidOperationException($"{key} is required");
     }
 
-    private static V1Volume BlobFuseVolume(string name, string storageAccount, string containerName, string clientId) =>
+    private V1Volume CsiVolume(string name, string attributesConfigKey) =>
         new()
         {
             Name = name,
             Csi = new V1CSIVolumeSource
             {
-                Driver = "blob.csi.azure.com",
+                Driver = RequiredConfig("Storage:CsiDriver"),
                 ReadOnlyProperty = false,
-                VolumeAttributes = new Dictionary<string, string>
-                {
-                    ["protocol"] = "fuse2",
-                    ["storageAccount"] = storageAccount,
-                    ["containerName"] = containerName,
-                    ["ClientID"] = clientId,
-                    ["mountWithWorkloadIdentityToken"] = "true",
-                    ["mountOptions"] = "--allow-other --use-attr-cache=true --file-cache-timeout-in-seconds=30 --disable-writeback-cache=true"
-                }
+                VolumeAttributes = StringMapConfig(attributesConfigKey)
             }
         };
+
+    private Dictionary<string, string> StringMapConfig(string key)
+    {
+        var json = configuration[key] ?? "{}";
+        return JsonSerializer.Deserialize<Dictionary<string, string>>(json)
+            ?? throw new InvalidOperationException($"{key} must be a JSON object");
+    }
+
+    private IList<V1Toleration>? TolerationsConfig(string key)
+    {
+        var json = configuration[key] ?? "[]";
+        var settings = JsonSerializer.Deserialize<List<TolerationSetting>>(json, JsonSerializerOptions.Web)
+            ?? throw new InvalidOperationException($"{key} must be a JSON array");
+        var tolerations = settings.Select(setting => new V1Toleration
+        {
+            Key = setting.Key,
+            OperatorProperty = setting.Operator,
+            Value = setting.Value,
+            Effect = setting.Effect,
+            TolerationSeconds = setting.TolerationSeconds
+        }).ToList();
+        return tolerations.Count == 0 ? null : tolerations;
+    }
+
+    private sealed record TolerationSetting(
+        string? Key,
+        string? Operator,
+        string? Value,
+        string? Effect,
+        long? TolerationSeconds);
 
     private string RequiredConfig(string key) =>
         configuration[key] ?? throw new InvalidOperationException($"{key} is required");

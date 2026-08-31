@@ -4,7 +4,7 @@ metadata:
   name: video-analyzer-storagequeue
   namespace: __KUBERNETES_NAMESPACE__
 spec:
-  replicas: 0
+  replicas: __ANALYZER_REPLICAS__
   selector:
     matchLabels:
       app: video-analyzer-storagequeue
@@ -12,16 +12,15 @@ spec:
     metadata:
       labels:
         app: video-analyzer-storagequeue
-        azure.workload.identity/use: "true"
+__POD_LABELS_8__
     spec:
-      serviceAccountName: video-worker
-      nodeSelector:
-        kubernetes.io/os: linux
-        kubernetes.azure.com/mode: system
+      serviceAccountName: __SERVICE_ACCOUNT_NAME__
+__CONTROL_PLANE_NODE_SELECTOR__
+__CONTROL_PLANE_TOLERATIONS__
       terminationGracePeriodSeconds: 60
       containers:
         - name: analyzer
-          image: "__ACR_LOGIN_SERVER__/video-analysis-storagequeue:__IMAGE_TAG__"
+          image: "__IMAGE_REPOSITORY__/video-analysis-storagequeue:__IMAGE_TAG__"
           imagePullPolicy: Always
           envFrom:
             - configMapRef:
@@ -44,26 +43,16 @@ spec:
             name: video-ladder-profiles
         - name: input-storage
           csi:
-            driver: blob.csi.azure.com
+            driver: "__STORAGE_CSI_DRIVER__"
             readOnly: true
             volumeAttributes:
-              protocol: fuse2
-              storageAccount: "__INPUT_STORAGE_ACCOUNT__"
-              containerName: "__INPUT_STORAGE_CONTAINER__"
-              ClientID: "__WORKLOAD_CLIENT_ID__"
-              mountWithWorkloadIdentityToken: "true"
-              mountOptions: "--allow-other --use-attr-cache=true --file-cache-timeout-in-seconds=300 --cancel-list-on-mount-seconds=10"
+__INPUT_CSI_VOLUME_ATTRIBUTES_14__
         - name: output-storage
           csi:
-            driver: blob.csi.azure.com
+            driver: "__STORAGE_CSI_DRIVER__"
             readOnly: false
             volumeAttributes:
-              protocol: fuse2
-              storageAccount: "__OUTPUT_STORAGE_ACCOUNT__"
-              containerName: "__OUTPUT_STORAGE_CONTAINER__"
-              ClientID: "__WORKLOAD_CLIENT_ID__"
-              mountWithWorkloadIdentityToken: "true"
-              mountOptions: "--allow-other --use-attr-cache=true --file-cache-timeout-in-seconds=30 --disable-writeback-cache=true"
+__OUTPUT_CSI_VOLUME_ATTRIBUTES_14__
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -79,16 +68,15 @@ spec:
     metadata:
       labels:
         app: video-completion-storagequeue
-        azure.workload.identity/use: "true"
+__POD_LABELS_8__
     spec:
-      serviceAccountName: video-worker
-      nodeSelector:
-        kubernetes.io/os: linux
-        kubernetes.azure.com/mode: system
+      serviceAccountName: __SERVICE_ACCOUNT_NAME__
+__CONTROL_PLANE_NODE_SELECTOR__
+__CONTROL_PLANE_TOLERATIONS__
       terminationGracePeriodSeconds: 60
       containers:
         - name: completion
-          image: "__ACR_LOGIN_SERVER__/video-completion-storagequeue:__IMAGE_TAG__"
+          image: "__IMAGE_REPOSITORY__/video-completion-storagequeue:__IMAGE_TAG__"
           imagePullPolicy: Always
           env:
             - name: POD_NAME
@@ -112,25 +100,4 @@ spec:
   selector:
     matchLabels:
       app: video-completion-storagequeue
----
-apiVersion: keda.sh/v1alpha1
-kind: ScaledObject
-metadata:
-  name: video-analyzer-storagequeue
-  namespace: __KUBERNETES_NAMESPACE__
-spec:
-  scaleTargetRef:
-    name: video-analyzer-storagequeue
-  pollingInterval: 10
-  cooldownPeriod: 60
-  minReplicaCount: 0
-  maxReplicaCount: 10
-  triggers:
-    - type: azure-queue
-      metadata:
-        accountName: "__OUTPUT_STORAGE_ACCOUNT__"
-        queueName: video-submitted
-        queueLength: "1"
-        activationQueueLength: "0"
-      authenticationRef:
-        name: video-workload-identity
+__SCALER_RESOURCE__
