@@ -12,15 +12,9 @@ configMapGenerator:
   - name: video-config
     behavior: create
     literals:
-      - Storage__InputAccountName=
-      - Storage__InputContainer=
       - Storage__InputMountPath=/mnt/input
-      - Storage__OutputAccountName=
-      - Storage__OutputContainer=
       - Storage__OutputMountPath=/mnt/output
-      - Storage__WorkingContainer=
       - Completion__PollSeconds=10
-      - WorkloadIdentity__ClientId=
       - Kubernetes__Namespace=video
       - Kubernetes__ServiceAccountName=video-worker
       - Images__Dotnet__Encoder=video-encoder-dotnet:latest
