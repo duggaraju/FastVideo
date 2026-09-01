@@ -1,0 +1,10 @@
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+# Azure-specific provider component: adds Azure Workload Identity labels and
+# Azure Blob CSI volume wiring to the transport-agnostic control-plane Deployments.
+# deploy-time generated overlays layer this component on top of the selected
+# transport overlay and patch in the real storage accounts/client ID.
+patches:
+  - path: patch-serviceaccount.yaml
+  - path: patch-analyzer.yaml
+  - path: patch-completion.yaml

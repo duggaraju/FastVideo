@@ -1,0 +1,39 @@
+{
+  "_comment": "Static Azure defaults that are Kustomize-native (workload identity pod labels/annotations, node selectors/tolerations, CSI driver, volume attributes) live in deploy/k8s/components/providers/azure/ and deploy/k8s/jobs/components/providers/azure/. This file only carries the KEDA scaler configuration per message transport, because its trigger type/metadata shape is provider policy rather than a fixed Kubernetes field scripts/deploy.ps1 can patch generically. {{TOKEN}} placeholders are resolved by scripts/deploy.ps1 from Bicep deployment outputs before being written into the generated overlay.",
+  "scaler": {
+    "storagequeue": {
+      "mode": "keda",
+      "type": "azure-queue",
+      "metadata": {
+        "accountName": "{{OUTPUT_STORAGE_ACCOUNT}}",
+        "queueName": "video-submitted",
+        "queueLength": "1",
+        "activationQueueLength": "0"
+      },
+      "authenticationRef": "video-workload-identity",
+      "triggerAuthentication": {
+        "podIdentity": {
+          "provider": "azure-workload",
+          "identityId": "{{WORKLOAD_CLIENT_ID}}"
+        }
+      }
+    },
+    "servicebus": {
+      "mode": "keda",
+      "type": "azure-servicebus",
+      "metadata": {
+        "namespace": "{{SERVICE_BUS_NAMESPACE_SHORT}}",
+        "queueName": "video-submitted",
+        "messageCount": "1",
+        "activationMessageCount": "0"
+      },
+      "authenticationRef": "video-workload-identity",
+      "triggerAuthentication": {
+        "podIdentity": {
+          "provider": "azure-workload",
+          "identityId": "{{WORKLOAD_CLIENT_ID}}"
+        }
+      }
+    }
+  }
+}

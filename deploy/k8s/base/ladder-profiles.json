@@ -1,0 +1,27 @@
+{
+  "rungs": {
+    "2160p": { "width": 3840, "height": 2160, "maxVideoBitrateKbps": 16000 },
+    "1440p": { "width": 2560, "height": 1440, "maxVideoBitrateKbps": 9000 },
+    "1080p": { "width": 1920, "height": 1080, "maxVideoBitrateKbps": 5000 },
+    "720p": { "width": 1280, "height": 720, "maxVideoBitrateKbps": 2800 },
+    "480p": { "width": 854, "height": 480, "maxVideoBitrateKbps": 1400 },
+    "360p": { "width": 640, "height": 360, "maxVideoBitrateKbps": 800 }
+  },
+  "presets": {
+    "max4k": { "type": "bounded", "maxWidth": 3840, "maxHeight": 2160, "maxVideoBitrateKbps": 16000 },
+    "max2160p": { "type": "bounded", "maxWidth": 3840, "maxHeight": 2160, "maxVideoBitrateKbps": 16000 },
+    "max1440p": { "type": "bounded", "maxWidth": 2560, "maxHeight": 1440, "maxVideoBitrateKbps": 9000 },
+    "max1080p": { "type": "bounded", "maxWidth": 1920, "maxHeight": 1080, "maxVideoBitrateKbps": 5000 },
+    "max720p": { "type": "bounded", "maxWidth": 1280, "maxHeight": 720, "maxVideoBitrateKbps": 2800 },
+    "max480p": { "type": "bounded", "maxWidth": 854, "maxHeight": 480, "maxVideoBitrateKbps": 1400 },
+    "max360p": { "type": "bounded", "maxWidth": 640, "maxHeight": 360, "maxVideoBitrateKbps": 800 },
+    "conference": {
+      "type": "custom",
+      "renditions": [
+        { "rung": "720p" },
+        { "name": "540p-low", "width": 960, "height": 540, "maxVideoBitrateKbps": 1100 },
+        { "rung": "360p", "maxVideoBitrateKbps": 650 }
+      ]
+    }
+  }
+}

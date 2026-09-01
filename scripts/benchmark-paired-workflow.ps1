@@ -42,16 +42,60 @@ function Get-LabelValue([string] $Value) {
 }
 
 function Set-MediaRuntimeImages([string] $LoginServer, [string] $DotNetTag, [string] $RustTag, [string] $AnalysisDeployment, [string] $CompletionDeployment) {
+    $dotnetImages = @{
+        encode = "$LoginServer/video-encoder-dotnet:$DotNetTag"
+        audio = "$LoginServer/video-audio-encoder-dotnet:$DotNetTag"
+        stitch = "$LoginServer/video-stitcher-dotnet:$DotNetTag"
+    }
+    $rustImages = @{
+        encode = "$LoginServer/video-encoder-rust:$RustTag"
+        audio = "$LoginServer/video-audio-encoder-rust:$RustTag"
+        stitch = "$LoginServer/video-stitcher-rust:$RustTag"
+    }
+
     $patch = @{
         data = @{
-            Images__Dotnet__Encoder = "$LoginServer/video-encoder-dotnet:$DotNetTag"
-            Images__Dotnet__Stitcher = "$LoginServer/video-stitcher-dotnet:$DotNetTag"
-            Images__Rust__Encoder = "$LoginServer/video-encoder-rust:$RustTag"
-            Images__Rust__Stitcher = "$LoginServer/video-stitcher-rust:$RustTag"
+            Images__Dotnet__Encoder = $dotnetImages.encode
+            Images__Dotnet__AudioEncoder = $dotnetImages.audio
+            Images__Dotnet__Stitcher = $dotnetImages.stitch
+            Images__Rust__Encoder = $rustImages.encode
+            Images__Rust__AudioEncoder = $rustImages.audio
+            Images__Rust__Stitcher = $rustImages.stitch
         }
     } | ConvertTo-Json -Compress
     kubectl patch configmap video-config --namespace $KubernetesNamespace --type merge --patch $patch | Out-Host
     Assert-NativeCommandSucceeded "Updating media runtime images"
+
+    $jobTemplatesConfigMap = kubectl get configmap video-job-templates --namespace $KubernetesNamespace -o json | ConvertFrom-Json -Depth 20
+    Assert-NativeCommandSucceeded "Reading job template config map"
+
+    $jobTemplateUpdates = @{}
+    foreach ($property in $jobTemplatesConfigMap.data.PSObject.Properties) {
+        $image = $null
+        switch -Regex ($property.Name) {
+            '^encode-dotnet-' { $image = $dotnetImages.encode; break }
+            '^audio-encode-dotnet-' { $image = $dotnetImages.audio; break }
+            '^stitch-dotnet-' { $image = $dotnetImages.stitch; break }
+            '^encode-rust-' { $image = $rustImages.encode; break }
+            '^audio-encode-rust-' { $image = $rustImages.audio; break }
+            '^stitch-rust-' { $image = $rustImages.stitch; break }
+            default { continue }
+        }
+
+        $jobTemplateUpdates[$property.Name] = [regex]::Replace(
+            [string] $property.Value,
+            '(?m)^(\s*image:\s*).+$',
+            ('$1' + $image))
+    }
+
+    if ($jobTemplateUpdates.Count -eq 0) {
+        throw "video-job-templates does not contain any rendered media job templates to patch."
+    }
+
+    $jobTemplatePatch = @{ data = $jobTemplateUpdates } | ConvertTo-Json -Compress -Depth 20
+    kubectl patch configmap video-job-templates --namespace $KubernetesNamespace --type merge --patch $jobTemplatePatch | Out-Host
+    Assert-NativeCommandSucceeded "Updating job template images"
+
     kubectl rollout restart "deployment/$AnalysisDeployment" --namespace $KubernetesNamespace | Out-Host
     Assert-NativeCommandSucceeded "Restarting analysis"
     kubectl rollout restart "deployment/$CompletionDeployment" --namespace $KubernetesNamespace | Out-Host

@@ -1,0 +1,38 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: video-encoder-template
+spec:
+  template:
+    spec:
+      nodeSelector:
+        workload: video-encoding
+        kubernetes.azure.com/scalesetpriority: regular
+        kubernetes.io/os: linux
+      tolerations: []
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: video-audio-encoder-template
+spec:
+  template:
+    spec:
+      nodeSelector:
+        workload: video-encoding
+        kubernetes.azure.com/scalesetpriority: regular
+        kubernetes.io/os: linux
+      tolerations: []
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: video-stitcher-template
+spec:
+  template:
+    spec:
+      nodeSelector:
+        workload: video-encoding
+        kubernetes.azure.com/scalesetpriority: regular
+        kubernetes.io/os: linux
+      tolerations: []

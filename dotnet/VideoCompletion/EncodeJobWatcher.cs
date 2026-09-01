@@ -12,6 +12,7 @@ public sealed class EncodeJobWatcher(
     IConfiguration configuration,
     ILogger<EncodeJobWatcher> logger) : BackgroundService
 {
+    private const string UseSpotAnnotation = "video.fastvideo/use-spot";
     private readonly HashSet<string> _loggedFailedPods = [];
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -241,13 +242,15 @@ public sealed class EncodeJobWatcher(
         var jobId = RequiredAnnotation(annotations, JobNames.JobIdAnnotation);
         var stitchJobName = JobNames.For("stitch", jobId);
         var encodeNodeSelector = encodeJob.Spec?.Template?.Spec?.NodeSelector;
-        var useSpot = encodeNodeSelector?.TryGetValue(
-            "kubernetes.azure.com/scalesetpriority",
-            out var scaleSetPriority) == true && scaleSetPriority == "spot";
-        var mediaRuntime = OptionalAnnotation(
+        var useSpot = annotations.TryGetValue(UseSpotAnnotation, out var useSpotValue)
+            ? bool.Parse(useSpotValue)
+            : encodeNodeSelector?.TryGetValue(
+                "kubernetes.azure.com/scalesetpriority",
+                out var scaleSetPriority) == true && scaleSetPriority == "spot";
+        var mediaRuntime = JobTemplateFiles.NormalizeMediaRuntime(OptionalAnnotation(
             annotations,
             JobNames.MediaRuntimeAnnotation,
-            configuration["Encoding:MediaRuntimeDefault"] ?? "dotnet");
+            configuration["Encoding:MediaRuntimeDefault"] ?? "dotnet"));
         var architecture = encodeNodeSelector?.TryGetValue("kubernetes.io/arch", out var architectureValue) == true
             ? architectureValue
             : string.Empty;
@@ -260,87 +263,85 @@ public sealed class EncodeJobWatcher(
         {
         }
 
-        var labels = new Dictionary<string, string>
-        {
-            ["app.kubernetes.io/name"] = "video-stitcher",
-            ["video/job-id"] = JobNames.LabelValue(jobId),
-            ["azure.workload.identity/use"] = "true"
-        };
-        var outputVolumeName = "output-storage";
-        var outputMountPath = configuration["Storage:OutputMountPath"] ?? "/mnt/output";
-        var nodeSelector = new Dictionary<string, string>
-        {
-            ["workload"] = "video-encoding",
-            ["kubernetes.azure.com/scalesetpriority"] = useSpot ? "spot" : "regular",
-            ["kubernetes.io/os"] = "linux"
-        };
-        if (!string.IsNullOrEmpty(architecture))
-            nodeSelector["kubernetes.io/arch"] = architecture;
+        var stitchJob = await LoadJobTemplateAsync("stitch", mediaRuntime, useSpot, cancellationToken);
+        stitchJob.Metadata ??= new V1ObjectMeta();
+        stitchJob.Metadata.Name = stitchJobName;
+        var labels = EnsureLabels(stitchJob.Metadata);
+        labels["app.kubernetes.io/name"] = "video-stitcher";
+        labels["video/job-id"] = JobNames.LabelValue(jobId);
+        var jobAnnotations = EnsureAnnotations(stitchJob.Metadata);
+        jobAnnotations[JobNames.JobIdAnnotation] = jobId;
 
-        var pod = new V1PodTemplateSpec
+        var spec = RequiredSpec(stitchJob);
+        spec.ActiveDeadlineSeconds = configuration.GetValue("Encoding:StitchJobActiveDeadlineSeconds", 21600);
+
+        var podLabels = EnsureLabels(spec.Template.Metadata ??= new V1ObjectMeta());
+        podLabels["app.kubernetes.io/name"] = "video-stitcher";
+        podLabels["video/job-id"] = JobNames.LabelValue(jobId);
+
+        var podSpec = RequiredPodSpec(spec.Template, stitchJobName);
+        if (!string.IsNullOrEmpty(architecture))
         {
-            Metadata = new V1ObjectMeta { Labels = labels },
-            Spec = new V1PodSpec
-            {
-                Containers =
-                [
-                    new V1Container
-                    {
-                        Name = "stitcher",
-                        Image = RequiredImage(mediaRuntime, "Stitcher"),
-                        Env =
-                        [
-                            Env("JOB_ID", jobId),
-                            Env("SEGMENT_COUNT", (encodeJob.Spec?.Completions
-                                ?? throw new InvalidOperationException($"Encode job {encodeJob.Metadata.Name} has no completion count")).ToString()),
-                            Env("AUDIO_BLOB_NAME", RequiredAnnotation(annotations, JobNames.AudioBlobNameAnnotation)),
-                            Env("OUTPUT_PATH", RequiredAnnotation(annotations, JobNames.OutputPathAnnotation)),
-                            Env("OUTPUT_TYPE", OptionalAnnotation(annotations, JobNames.OutputTypeAnnotation, VideoOutputTypes.Mp4)),
-                            Env("CALCULATE_VMAF", OptionalAnnotation(annotations, JobNames.CalculateVmafAnnotation, "false")),
-                            Env("OUTPUT_STORAGE_ACCOUNT_NAME", RequiredConfig("Storage:OutputAccountName")),
-                            Env("OUTPUT_STORAGE_CONTAINER", RequiredConfig("Storage:OutputContainer")),
-                            Env("OUTPUT_MOUNT_PATH", outputMountPath)
-                        ],
-                        VolumeMounts = [new V1VolumeMount { Name = outputVolumeName, MountPath = outputMountPath }],
-                        Resources = new V1ResourceRequirements
-                        {
-                            Requests = new Dictionary<string, ResourceQuantity> { ["cpu"] = new("1"), ["memory"] = new("2Gi") },
-                            Limits = new Dictionary<string, ResourceQuantity> { ["cpu"] = new("2"), ["memory"] = new("4Gi") }
-                        }
-                    }
-                ],
-                Volumes =
-                [
-                    BlobFuseVolume(
-                        outputVolumeName,
-                        RequiredConfig("Storage:OutputAccountName"),
-                        RequiredConfig("Storage:OutputContainer"),
-                        RequiredConfig("WorkloadIdentity:ClientId"))
-                ],
-                RestartPolicy = "Never",
-                ServiceAccountName = "video-worker",
-                Tolerations = useSpot
-                    ? [new V1Toleration { Effect = "NoSchedule", OperatorProperty = "Equal", Key = "kubernetes.azure.com/scalesetpriority", Value = "spot" }]
-                    : null,
-                NodeSelector = nodeSelector,
-                TerminationGracePeriodSeconds = 120
-            }
-        };
-        var stitchJob = new V1Job
-        {
-            Metadata = new V1ObjectMeta
-            {
-                Name = stitchJobName,
-                Labels = labels,
-                Annotations = new Dictionary<string, string>
-                {
-                    [JobNames.JobIdAnnotation] = jobId
-                }
-            },
-            Spec = new V1JobSpec { Template = pod, BackoffLimit = 6, ActiveDeadlineSeconds = configuration.GetValue("Encoding:StitchJobActiveDeadlineSeconds", 21600), TtlSecondsAfterFinished = 3600 }
-        };
+            podSpec.NodeSelector ??= new Dictionary<string, string>(StringComparer.Ordinal);
+            podSpec.NodeSelector["kubernetes.io/arch"] = architecture;
+        }
+
+        var container = RequiredContainer(podSpec, "stitcher", stitchJobName);
+        SetEnvValue(container, "JOB_ID", jobId);
+        SetEnvValue(container, "SEGMENT_COUNT", (encodeJob.Spec?.Completions
+            ?? throw new InvalidOperationException($"Encode job {encodeJob.Metadata.Name} has no completion count")).ToString());
+        SetEnvValue(container, "AUDIO_BLOB_NAME", RequiredAnnotation(annotations, JobNames.AudioBlobNameAnnotation));
+        SetEnvValue(container, "OUTPUT_PATH", RequiredAnnotation(annotations, JobNames.OutputPathAnnotation));
+        SetEnvValue(container, "OUTPUT_TYPE", OptionalAnnotation(annotations, JobNames.OutputTypeAnnotation, VideoOutputTypes.Mp4));
+        SetEnvValue(container, "CALCULATE_VMAF", OptionalAnnotation(annotations, JobNames.CalculateVmafAnnotation, "false"));
+        SetEnvValue(container, "OUTPUT_STORAGE_ACCOUNT_NAME", RequiredConfig("Storage:OutputAccountName"));
+        SetEnvValue(container, "OUTPUT_STORAGE_CONTAINER", RequiredConfig("Storage:OutputContainer"));
+        SetEnvValue(container, "OUTPUT_MOUNT_PATH", configuration["Storage:OutputMountPath"] ?? "/mnt/output");
+
         await kubernetes.BatchV1.CreateNamespacedJobAsync(stitchJob, targetNamespace, cancellationToken: cancellationToken);
         logger.LogInformation("Submitted stitch job for {JobId}", jobId);
+    }
+
+    private static V1JobSpec RequiredSpec(V1Job job) =>
+        job.Spec ?? throw new InvalidOperationException($"Job template '{job.Metadata?.Name ?? "<unnamed>"}' is missing spec");
+
+    private static V1PodSpec RequiredPodSpec(V1PodTemplateSpec template, string jobName) =>
+        template.Spec ?? throw new InvalidOperationException($"Job template '{jobName}' is missing pod spec");
+
+    private static V1Container RequiredContainer(V1PodSpec podSpec, string name, string jobName) =>
+        podSpec.Containers.SingleOrDefault(container => string.Equals(container.Name, name, StringComparison.Ordinal))
+        ?? throw new InvalidOperationException($"Job template '{jobName}' is missing container '{name}'");
+
+    private static IDictionary<string, string> EnsureLabels(V1ObjectMeta metadata)
+    {
+        metadata.Labels ??= new Dictionary<string, string>(StringComparer.Ordinal);
+        return metadata.Labels;
+    }
+
+    private static IDictionary<string, string> EnsureAnnotations(V1ObjectMeta metadata)
+    {
+        metadata.Annotations ??= new Dictionary<string, string>(StringComparer.Ordinal);
+        return metadata.Annotations;
+    }
+
+    private static void SetEnvValue(V1Container container, string name, string value)
+    {
+        var env = container.Env ?? throw new InvalidOperationException($"Container '{container.Name}' is missing env vars");
+        var entry = env.SingleOrDefault(candidate => string.Equals(candidate.Name, name, StringComparison.Ordinal))
+            ?? throw new InvalidOperationException($"Container '{container.Name}' is missing env var '{name}'");
+        entry.Value = value;
+        entry.ValueFrom = null;
+    }
+
+    private static async Task<V1Job> LoadJobTemplateAsync(string role, string mediaRuntime, bool useSpot, CancellationToken cancellationToken)
+    {
+        var path = JobTemplateFiles.PathFor(role, mediaRuntime, useSpot);
+        if (!File.Exists(path))
+            throw new InvalidOperationException($"Job template '{path}' does not exist");
+
+        var yaml = await File.ReadAllTextAsync(path, cancellationToken);
+        return KubernetesYaml.Deserialize<V1Job>(yaml, false)
+            ?? throw new InvalidOperationException($"Job template '{path}' is empty");
     }
 
     private async Task ReportResultAsync(
@@ -425,41 +426,6 @@ public sealed class EncodeJobWatcher(
             ? value
             : defaultValue;
 
-    private static V1EnvVar Env(string name, string value) => new() { Name = name, Value = value };
-
-    private string RequiredImage(string mediaRuntime, string role)
-    {
-        var normalizedRuntime = mediaRuntime.ToLowerInvariant() switch
-        {
-            "dotnet" => "dotnet",
-            "rust" => "rust",
-            _ => throw new InvalidOperationException($"Media runtime '{mediaRuntime}' must be dotnet or rust")
-        };
-        var key = $"Images:{normalizedRuntime}:{role}";
-        return configuration[key]
-            ?? configuration[$"Images:{role}"]
-            ?? throw new InvalidOperationException($"{key} is required");
-    }
-
-    private static V1Volume BlobFuseVolume(string name, string storageAccount, string containerName, string clientId) =>
-        new()
-        {
-            Name = name,
-            Csi = new V1CSIVolumeSource
-            {
-                Driver = "blob.csi.azure.com",
-                ReadOnlyProperty = false,
-                VolumeAttributes = new Dictionary<string, string>
-                {
-                    ["protocol"] = "fuse2",
-                    ["storageAccount"] = storageAccount,
-                    ["containerName"] = containerName,
-                    ["ClientID"] = clientId,
-                    ["mountWithWorkloadIdentityToken"] = "true",
-                    ["mountOptions"] = "--allow-other --use-attr-cache=true --file-cache-timeout-in-seconds=30 --disable-writeback-cache=true"
-                }
-            }
-        };
 
     private string RequiredConfig(string key) =>
         configuration[key] ?? throw new InvalidOperationException($"{key} is required");

@@ -1,0 +1,17 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+patches:
+  - path: patch-analyzer.yaml
+  - path: patch-completion.yaml
+configMapGenerator:
+  - name: video-config
+    behavior: merge
+    literals:
+      - Storage__SubmissionQueue=video-submitted
+      - Storage__ResultQueue=video-results
+      - Storage__QueuePollSeconds=3
+      - Storage__QueueVisibilityTimeoutSeconds=900
+      - Storage__QueueVisibilityRenew=true
+      - Storage__QueueVisibilityRenewalSeconds=120

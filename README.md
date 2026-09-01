@@ -1,15 +1,15 @@
 # FastVideo
 
-FastVideo is a .NET 10, Rust, and FFmpeg pipeline for horizontally parallel video encoding on Azure Kubernetes Service. It can use Spot nodes as a cost-saving mechanism, but the pipeline itself is about fast, scalable video processing on Spot or regular nodes.
+FastVideo is a .NET 10, Rust, and FFmpeg pipeline for horizontally parallel video encoding on Kubernetes. Azure Kubernetes Service has the complete infrastructure-as-code path; an external-cluster profile supports existing Kubernetes clusters with separately provisioned dependencies.
 
 The Storage Queue and Service Bus control planes can run side by side. `storagequeue` deploys the Rust analyzer and completion workers to `video-storagequeue`; `servicebus` deploys the .NET analysis and completion workers to `video-servicebus`. Each namespace has its own KEDA scaler, service account, RBAC, and workload-identity federation. The control-plane transport is independent from the `dotnet` or `rust` encoder and stitcher media runtime.
 
 ## Workflow
 
 1. KEDA scales the selected analyzer from the `video-submitted` Storage Queue or Service Bus queue.
-2. The analyzer reads the source from the read-only input mount and probes it with FFprobe. It rejects audio longer than `Encoding__MaxAudioDurationSeconds`, stream-copies audio to output storage when `audioCodec` is `copy`, computes segment boundaries, writes the manifest, and creates the media Jobs. Audio transcoding runs concurrently in a singleton Job on the selected Spot or regular pool; video encoding runs in a Kubernetes Indexed Job.
+2. The analyzer reads the source from the read-only input mount and probes it with FFprobe. It rejects audio longer than `Encoding__MaxAudioDurationSeconds`, stream-copies audio to output storage when `audioCodec` is `copy`, computes segment boundaries, writes the manifest, loads the pre-rendered media Job template that matches the requested runtime and Spot/regular choice, patches only the per-submission fields, and creates the media Jobs. Audio transcoding runs concurrently in a singleton Job on the selected Spot or regular pool; video encoding runs in a Kubernetes Indexed Job.
 3. Every `VideoEncoder` index reads the source from input storage, encodes only its deterministic video time range (no audio), and writes to a unique staging path on the output BlobFuse mount. After FFmpeg succeeds, it renames the staging file to the deterministic segment path. When requested, the index also compares the segment with its source interval using VMAF and writes a deterministic score sidecar. A retry skips each artifact that already exists. Each index gets up to five retries on interruption or encoding failure.
-4. Kubernetes marks the Indexed encode Job complete only after every index succeeds. For transcoding requests, the singleton Job watcher also waits for the audio encode Job to complete. It then creates a deterministic stitch Job using metadata stored on the encode Job. Stitching follows the request's `useSpot` setting and runs on the same Spot or regular pool selected for encoding.
+4. Kubernetes marks the Indexed encode Job complete only after every index succeeds. For transcoding requests, the singleton Job watcher also waits for the audio encode Job to complete. It then loads the matching stitch Job template, patches deterministic workflow metadata stored on the encode Job, and creates the stitch Job. Stitching follows the request's `useSpot` setting and runs on the same Spot or regular pool selected for encoding.
 5. `VideoStitcher` constructs ordered segment paths directly from indexes `0..SegmentCount-1` and reads them and the extracted audio exclusively from output storage. One FFmpeg process concatenates the video and emits the selected MP4 output, CMAF package with DASH and HLS manifests, or both. When VMAF was requested, the stitcher also writes the arithmetic mean of all segment VMAF means beside the requested output path.
 6. A singleton completion reconciler logs failed encode pod attempts and sends one terminal `VideoProcessingResult` per video to `video-results`: encode failure after all retries means failure, stitch success means success, and stitch failure means failure. Individual retry failures and encode success are not sent as terminal results. After stitching succeeds, the reconciler deletes the corresponding encode Job.
 
@@ -29,11 +29,9 @@ Indexed encode Jobs use Spot nodes by default and tolerate eviction. A request c
 ## Prerequisites
 
 - PowerShell 7 or later on Windows or Linux
-- .NET 10 SDK for local builds
-- Azure CLI with the Bicep extension
 - `kubectl`
-- An Azure subscription where the deployer can create AKS, role assignments, ACR, Storage, Service Bus, and managed identities
-- Permission to write Azure role assignments on the target scope (for example, Owner or User Access Administrator)
+
+Local builds require the .NET 10 SDK, Rust 1.98, and Docker. The default Azure deployment additionally requires Azure CLI with Bicep, an Azure subscription where the deployer can create AKS, role assignments, ACR, Storage, Service Bus, and managed identities, and permission to write role assignments on the target scope (for example, Owner or User Access Administrator). External mode has separate prerequisites below and does not invoke Azure CLI.
 
 Runtime containers use the .NET 10 Azure Linux 3 image and run as the non-root `app` user. They default to BtbN's latest Linux x64 GPL shared FFmpeg build; the release archive is verified against BtbN's published SHA-256 checksums during each image build. Set the Docker build argument `FFMPEG_BUILD=custom` (or deploy with `-FfmpegBuild custom`) to compile FFmpeg 9.0 with native AAC, `libx264`, `libsvtav1`, `libdav1d`, and `libvmaf`. Override the custom version with the `FFMPEG_VERSION` Docker build argument or `-FfmpegVersion` deployment parameter. Both variants include the VMAF model. Azure access uses AKS Workload Identity; no connection strings or account keys are deployed.
 
@@ -48,7 +46,7 @@ The Rust implementation in `rust` provides analyzer, completion, encoder, and st
 
 ```powershell
 Push-Location rust
-cargo build --release
+cargo build --locked --release
 Pop-Location
 ```
 
@@ -86,6 +84,26 @@ Use ACR build agents instead of local Docker by adding `-AcrBuild`. The script s
 
 ## Deploy
 
+### Kubernetes manifests
+
+Deployment manifests live under `deploy/k8s/` as Kustomize bases, transport overlays, and provider components:
+
+- `deploy/k8s/base/` - namespace, service account, RBAC, the transport-agnostic analyzer/completion Deployments and PDB, plus the shared `video-config` and `video-ladder-profiles` ConfigMaps. The base `video-config` carries only provider-neutral defaults: mount paths, encoding defaults, namespace/service-account defaults, and placeholder media image references used when rendering job templates. Provider/deployment-specific values such as storage account/container identifiers and workload identity client IDs are injected by the generated Azure or external overlay.
+- `deploy/k8s/overlays/storagequeue/` - merges only Storage Queue transport settings and swaps the analyzer/completion images to the Rust Storage Queue control plane.
+- `deploy/k8s/overlays/servicebus/` - merges only Service Bus transport settings and swaps the analyzer/completion images to the .NET Service Bus control plane.
+- `deploy/k8s/components/providers/azure/` and `deploy/k8s/components/providers/external/` - provider components for the control-plane Deployments. Azure carries AKS-native Workload Identity and Blob CSI defaults; external remains intentionally inert so `scripts/deploy.ps1` can inject cluster-specific values from the user config.
+- `deploy/k8s/jobs/base/` - checked-in static Job templates for encode, audio-encode, and stitch.
+- `deploy/k8s/jobs/overlays/dotnet/` and `deploy/k8s/jobs/overlays/rust/` - image-only media-runtime overlays.
+- `deploy/k8s/jobs/components/providers/*` and `deploy/k8s/jobs/components/scheduling/azure/*` - provider and scheduling components that patch CSI, node-selection, and toleration defaults into the shared Job templates.
+
+Because storage account names, the workload identity client ID, the Service Bus namespace, image tags, and KEDA scaler metadata are only known at deploy time, `scripts/deploy.ps1` writes a small generated overlay to `deploy/.generated/<mode>-<transport>/` (gitignored). That overlay layers the chosen transport overlay with the chosen provider component, patches in the real control-plane values, and generates a `video-job-templates` ConfigMap from pre-rendered media Job templates. The script renders both runtimes and both Spot/regular scheduling variants so the deployed analyzers/completion workers can honor per-submission `mediaRuntime` and `useSpot` choices by selecting a mounted YAML file instead of rebuilding pod specs in code.
+
+`kubectl kustomize deploy/.generated/<mode>-<transport>` renders the final manifest; you can run that command yourself to inspect or diff what will be applied. Every checked-in base/overlay can also be rendered standalone without a cluster, and the Job templates can be rendered the same way through a small composition kustomization that references `deploy/k8s/jobs/overlays/<runtime>` plus the desired provider/scheduling components.
+
+`scripts/deploy.ps1` writes the rendered manifest to `-RenderedManifestPath` (default `deploy/rendered.yaml`, gitignored) for inspection, applies it with `kubectl apply --filename`, unpauses the KEDA `ScaledObject` when the scaler is enabled, and restarts the `video-analyzer`/`video-completion` Deployments so they pick up the refreshed mounted job templates and control-plane images.
+
+### Azure (default)
+
 ```powershell
 ./scripts/deploy.ps1 -Location westus2
 ```
@@ -99,13 +117,8 @@ Audio is limited to six hours by default. Override the analysis-stage limit at d
 The default deploys the Rust Storage Queue control plane and Rust media workers. Deploy either or both control planes; select the media runtime independently for each namespace:
 
 ```powershell
-# Rust analyzer/completion over Storage Queue, with .NET encoder/stitcher
-./scripts/deploy.ps1 -Location westus2 `
-    -MessageTransport storagequeue -MediaRuntime dotnet
-
-# .NET analysis/completion over Service Bus, with Rust encoder/stitcher
-./scripts/deploy.ps1 -Location westus2 `
-    -MessageTransport servicebus -MediaRuntime rust
+./scripts/deploy.ps1 -Location westus2 -MessageTransport storagequeue -MediaRuntime dotnet
+./scripts/deploy.ps1 -Location westus2 -MessageTransport servicebus -MediaRuntime rust
 ```
 
 The resource group defaults to `<current-user-id>-video`, so each user gets an isolated deployment. Pass `-ResourceGroup` to override it. The Kubernetes namespace defaults to `video-storagequeue` or `video-servicebus`; pass `-KubernetesNamespace` to override it.
@@ -113,27 +126,43 @@ The resource group defaults to `<current-user-id>-video`, so each user gets an i
 To compile a specific FFmpeg release from the official GitHub mirror:
 
 ```powershell
-./scripts/deploy.ps1 `
-    -Location westus2 `
-    -FfmpegBuild custom `
-    -FfmpegVersion 9.0
+./scripts/deploy.ps1 -Location westus2 -FfmpegBuild custom -FfmpegVersion 9.0
 ```
 
-The script deploys [infra/main.bicep](infra/main.bicep), which creates or updates the selected broker and its RBAC assignments. Existing resources from the other mode are retained. It calls [scripts/build-images.ps1](scripts/build-images.ps1) to build the corresponding Rust or .NET control-plane images, build .NET and Rust encoder, audio encoder, and stitcher images for both `linux/amd64` and `linux/arm64`, and publish a multi-platform manifest for each media image. It then combines the shared [deploy/k8s/video.yaml](deploy/k8s/video.yaml) resources with the selected transport manifest. Each transport deployment only applies and restarts resources in its own namespace, allowing both control planes to remain active. The AKS system pool hosts analysis and completion. Dedicated x64 Spot, ARM64 Spot, and regular media-processing pools autoscale from zero. Encoding and stitching use any available Spot media architecture unless `useSpot` is `false`; no architecture-specific application code or image tag is required.
+The script still deploys `infra/main.bicep`, builds/pushes the selected images, and fetches AKS credentials. After the Azure deployment finishes, it reads `deploy/overlays/azure-config.json` - now a small JSON profile that only carries the KEDA scaler type/metadata per transport, since every other Azure default (node selectors, tolerations, CSI driver, workload-identity pod label, and media Job CSI defaults) is Kustomize-native and lives in `deploy/k8s/components/providers/azure/` plus `deploy/k8s/jobs/components/` - resolves its `{{TOKEN}}` placeholders from the Bicep deployment outputs, writes the generated overlay described above, renders it with `kubectl kustomize`, and applies only the selected transport namespace.
 
-The infrastructure also enables Container Insights with managed-identity authentication and retains container logs in Log Analytics for 30 days, including logs from pods deleted after KEDA scales a deployment to zero.
-
-When the infrastructure has not changed, skip the Bicep deployment and reuse the latest successful deployment outputs while rebuilding and deploying all container images:
+When the infrastructure has not changed, skip the Bicep deployment and reuse the latest successful deployment outputs while rebuilding and redeploying all container images:
 
 ```powershell
-./scripts/deploy.ps1 `
-    -SkipInfrastructureDeployment `
-    -MessageTransport storagequeue
+./scripts/deploy.ps1 -SkipInfrastructureDeployment -MessageTransport storagequeue
 ```
 
 When skipping infrastructure deployment, the script reuses the latest successful deployment record for the requested `-MessageTransport`. Run infrastructure deployment at least once for each transport so its broker RBAC and namespace-specific federated credential exist.
 
 Azure RBAC can take several minutes to propagate after first deployment. If the first pods report authorization failures, restart them after propagation.
+
+### Existing Kubernetes cluster
+
+External mode renders and applies the same Kustomize-based resources without invoking Azure CLI, Bicep, ACR, or image builds. Prerequisites are:
+
+- an existing kubeconfig context and namespace-creation permission;
+- FastVideo images already pushed under one registry repository prefix;
+- externally provisioned Azure Blob Storage and either Azure Storage Queues or Azure Service Bus;
+- a CSI driver capable of mounting those containers, plus its required volume attributes;
+- a Kubernetes service account authentication setup that lets the current worker SDKs use Microsoft Entra credentials;
+- KEDA and a matching scaler, or `"scaler": { "mode": "none" }` to run one analyzer replica.
+
+Copy [deploy/external-config.example.json](deploy/external-config.example.json) outside source control, replace its example values, and deploy:
+
+```powershell
+Copy-Item deploy/external-config.example.json ~/fastvideo-external.json
+# Edit ~/fastvideo-external.json; do not add credentials or connection strings.
+./scripts/deploy.ps1 -DeploymentMode external -ExternalConfigPath ~/fastvideo-external.json -MessageTransport storagequeue -MediaRuntime rust -ImageTag v1
+```
+
+The config remains the single user-editable JSON profile - there is no separate Kustomize authoring step. `scripts/deploy.ps1` reads it directly and writes every value (kube context, namespace, image repository, service account and annotations, pod labels, control-plane and Spot/regular media node selectors/tolerations, CSI driver/attributes, and scaler type/metadata/authentication) into the generated overlay at `deploy/.generated/external-<transport>/`, layered on the inert `deploy/k8s/components/providers/external/` control-plane component and the inert `deploy/k8s/jobs/components/providers/external/` Job-template component. With scaler mode `none`, scaling is deliberately disabled and the analyzer stays at one replica.
+
+The portability boundary is Kubernetes scheduling, registry naming, CSI mounting, and scaler configuration. It is **not yet a provider-neutral data plane**: queue and result clients still use Azure Storage Queue or Azure Service Bus SDKs, blob paths and manifests still use Azure Blob-compatible HTTPS URLs, and authentication still expects Microsoft Entra credentials. A different broker or object store requires a worker adapter implementation; configuring another scaler or CSI driver alone does not add that adapter. The example therefore uses externally provisioned Azure-compatible services and contains identifiers only, never secrets or connection strings.
 
 ## Submit Work
 

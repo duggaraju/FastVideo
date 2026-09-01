@@ -43,9 +43,10 @@ appsettings.*.local.json
 *.tfstate.*
 infra/main.json
 
-# Generated deployment manifests
-deploy/k8s/video.rendered.yaml
+# Generated deployment manifests and dynamic Kustomize overlays
 deploy/rendered.yaml
+deploy/k8s/runtime/
+deploy/.generated/
 
 # Operating system files
 .DS_Store

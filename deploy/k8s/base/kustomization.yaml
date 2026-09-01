@@ -1,0 +1,40 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: video
+resources:
+  - namespace.yaml
+  - serviceaccount.yaml
+  - rbac.yaml
+  - deployment-analyzer.yaml
+  - deployment-completion.yaml
+  - completion-pdb.yaml
+configMapGenerator:
+  - name: video-config
+    behavior: create
+    literals:
+      - Storage__InputMountPath=/mnt/input
+      - Storage__OutputMountPath=/mnt/output
+      - Completion__PollSeconds=10
+      - Kubernetes__Namespace=video
+      - Kubernetes__ServiceAccountName=video-worker
+      - Images__Dotnet__Encoder=video-encoder-dotnet:latest
+      - Images__Dotnet__AudioEncoder=video-audio-encoder-dotnet:latest
+      - Images__Dotnet__Stitcher=video-stitcher-dotnet:latest
+      - Images__Rust__Encoder=video-encoder-rust:latest
+      - Images__Rust__AudioEncoder=video-audio-encoder-rust:latest
+      - Images__Rust__Stitcher=video-stitcher-rust:latest
+      - Encoding__MediaRuntimeDefault=rust
+      - Encoding__MaxParallelism=32
+      - Encoding__MinParallelismPerJob=2
+      - Encoding__MaxAudioDurationSeconds=21600
+      - Encoding__ParallelizationStrategy=fixed-duration
+      - Encoding__LadderProfilesPath=/etc/video/ladder/ladder-profiles.json
+      - Encoding__EncodeJobActiveDeadlineSeconds=21600
+      - Encoding__AudioEncodeJobActiveDeadlineSeconds=21600
+      - Encoding__StitchJobActiveDeadlineSeconds=21600
+  - name: video-ladder-profiles
+    behavior: create
+    files:
+      - ladder-profiles.json=ladder-profiles.json
+generatorOptions:
+  disableNameSuffixHash: true

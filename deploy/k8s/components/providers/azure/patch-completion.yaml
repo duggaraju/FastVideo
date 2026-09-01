@@ -1,0 +1,13 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: video-completion
+spec:
+  template:
+    metadata:
+      labels:
+        azure.workload.identity/use: "true"
+    spec:
+      nodeSelector:
+        kubernetes.io/os: linux
+        kubernetes.azure.com/mode: system
