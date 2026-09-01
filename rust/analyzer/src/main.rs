@@ -16,8 +16,9 @@ use video::{
     config,
     contracts::{
         AUDIO_BLOB_NAME_ANNOTATION, AUDIO_ENCODING_REQUIRED_ANNOTATION, CALCULATE_VMAF_ANNOTATION,
-        JOB_ID_ANNOTATION, MEDIA_RUNTIME_ANNOTATION, OUTPUT_PATH_ANNOTATION,
-        OUTPUT_TYPE_ANNOTATION, VideoEncodingProfile, VideoManifest, VideoSubmitted, job_name,
+        CAPACITY_CLASS_ANNOTATION, CapacityClass, JOB_ID_ANNOTATION, MEDIA_RUNTIME_ANNOTATION,
+        OUTPUT_PATH_ANNOTATION, OUTPUT_TYPE_ANNOTATION, VideoEncodingProfile, VideoManifest,
+        VideoSubmitted, job_name,
     },
     media, parallelism, paths,
 };
@@ -447,7 +448,7 @@ async fn process_submission(
                 max_video_bitrate_kbps: profile.max_video_bitrate_kbps,
             })
             .collect(),
-        use_spot: request.use_spot,
+        capacity_class: request.capacity_class,
         calculate_vmaf: request.calculate_vmaf,
         output_type: output_type.to_owned(),
     };
@@ -517,7 +518,7 @@ async fn submit_encoding_job(
         None => None,
     };
 
-    let mut job = load_job_template("encode", media_runtime, manifest.use_spot)?;
+    let mut job = load_job_template("encode", media_runtime, manifest.capacity_class)?;
     job.metadata.name = Some(encode_job_name.clone());
 
     let labels = labels_mut(&mut job.metadata);
@@ -560,14 +561,12 @@ async fn submit_encoding_job(
         MEDIA_RUNTIME_ANNOTATION.to_owned(),
         media_runtime.to_owned(),
     );
-    annotations.insert(
-        "video.fastvideo/use-spot".to_owned(),
-        if manifest.use_spot {
-            "true".to_owned()
-        } else {
-            "false".to_owned()
-        },
-    );
+    if let Some(capacity_class) = manifest.capacity_class {
+        annotations.insert(
+            CAPACITY_CLASS_ANNOTATION.to_owned(),
+            capacity_class.as_str().to_owned(),
+        );
+    }
 
     let encode_active_deadline_seconds: i64 =
         config::setting("Encoding__EncodeJobActiveDeadlineSeconds", "21600")
@@ -667,7 +666,7 @@ async fn submit_audio_encoding_job(
         None => None,
     };
 
-    let mut job = load_job_template("audio-encode", media_runtime, manifest.use_spot)?;
+    let mut job = load_job_template("audio-encode", media_runtime, manifest.capacity_class)?;
     job.metadata.name = Some(audio_job_name.clone());
 
     let labels = labels_mut(&mut job.metadata);
@@ -682,14 +681,12 @@ async fn submit_audio_encoding_job(
 
     let annotations = annotations_mut(&mut job.metadata);
     annotations.insert(JOB_ID_ANNOTATION.to_owned(), manifest.job_id.clone());
-    annotations.insert(
-        "video.fastvideo/use-spot".to_owned(),
-        if manifest.use_spot {
-            "true".to_owned()
-        } else {
-            "false".to_owned()
-        },
-    );
+    if let Some(capacity_class) = manifest.capacity_class {
+        annotations.insert(
+            CAPACITY_CLASS_ANNOTATION.to_owned(),
+            capacity_class.as_str().to_owned(),
+        );
+    }
 
     let audio_encode_active_deadline_seconds: i64 =
         config::setting("Encoding__AudioEncodeJobActiveDeadlineSeconds", "21600")
@@ -745,8 +742,12 @@ async fn submit_audio_encoding_job(
     }
 }
 
-fn load_job_template(role: &str, media_runtime: &str, use_spot: bool) -> Result<Job> {
-    let path = video::job_templates::template_path(role, media_runtime, use_spot)?;
+fn load_job_template(
+    role: &str,
+    media_runtime: &str,
+    capacity_class: Option<CapacityClass>,
+) -> Result<Job> {
+    let path = video::job_templates::template_path(role, media_runtime, capacity_class)?;
     let yaml = std::fs::read_to_string(&path)
         .with_context(|| format!("Failed to read job template '{}'", path.display()))?;
     serde_yaml::from_str(&yaml)

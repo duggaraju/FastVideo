@@ -7,7 +7,6 @@ spec:
     spec:
       nodeSelector:
         workload: video-encoding
-        kubernetes.azure.com/scalesetpriority: spot
         kubernetes.io/os: linux
       tolerations: [{"key":"kubernetes.azure.com/scalesetpriority","operator":"Equal","value":"spot","effect":"NoSchedule"}]
 ---
@@ -20,7 +19,6 @@ spec:
     spec:
       nodeSelector:
         workload: video-encoding
-        kubernetes.azure.com/scalesetpriority: spot
         kubernetes.io/os: linux
       tolerations: [{"key":"kubernetes.azure.com/scalesetpriority","operator":"Equal","value":"spot","effect":"NoSchedule"}]
 ---
@@ -33,6 +31,5 @@ spec:
     spec:
       nodeSelector:
         workload: video-encoding
-        kubernetes.azure.com/scalesetpriority: spot
         kubernetes.io/os: linux
       tolerations: [{"key":"kubernetes.azure.com/scalesetpriority","operator":"Equal","value":"spot","effect":"NoSchedule"}]

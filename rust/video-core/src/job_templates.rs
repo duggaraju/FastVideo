@@ -1,6 +1,8 @@
 use anyhow::{Result, bail};
 use std::path::PathBuf;
 
+use crate::contracts::CapacityClass;
+
 pub const TEMPLATE_DIRECTORY: &str = "/etc/video/job-templates";
 
 pub fn normalize_media_runtime(value: &str) -> Result<&'static str> {
@@ -11,14 +13,20 @@ pub fn normalize_media_runtime(value: &str) -> Result<&'static str> {
     }
 }
 
-pub fn template_path(role: &str, media_runtime: &str, use_spot: bool) -> Result<PathBuf> {
+pub fn template_path(
+    role: &str,
+    media_runtime: &str,
+    capacity_class: Option<CapacityClass>,
+) -> Result<PathBuf> {
     if role.trim().is_empty() {
         bail!("Job template role is required");
     }
 
+    let capacity_class_suffix = capacity_class
+        .map(|value| format!("-{}", value.as_str()))
+        .unwrap_or_default();
     Ok(PathBuf::from(TEMPLATE_DIRECTORY).join(format!(
-        "{role}-{}-{}.yaml",
-        normalize_media_runtime(media_runtime)?,
-        if use_spot { "spot" } else { "regular" }
+        "{role}-{}{capacity_class_suffix}.yaml",
+        normalize_media_runtime(media_runtime)?
     )))
 }

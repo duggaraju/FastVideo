@@ -12,7 +12,6 @@ public sealed class EncodeJobWatcher(
     IConfiguration configuration,
     ILogger<EncodeJobWatcher> logger) : BackgroundService
 {
-    private const string UseSpotAnnotation = "video.fastvideo/use-spot";
     private readonly HashSet<string> _loggedFailedPods = [];
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -242,11 +241,10 @@ public sealed class EncodeJobWatcher(
         var jobId = RequiredAnnotation(annotations, JobNames.JobIdAnnotation);
         var stitchJobName = JobNames.For("stitch", jobId);
         var encodeNodeSelector = encodeJob.Spec?.Template?.Spec?.NodeSelector;
-        var useSpot = annotations.TryGetValue(UseSpotAnnotation, out var useSpotValue)
-            ? bool.Parse(useSpotValue)
-            : encodeNodeSelector?.TryGetValue(
-                "kubernetes.azure.com/scalesetpriority",
-                out var scaleSetPriority) == true && scaleSetPriority == "spot";
+        var capacityClass = CapacityClasses.Normalize(
+            annotations.TryGetValue(CapacityClasses.AnnotationName, out var annotatedCapacityClass)
+                ? annotatedCapacityClass
+                : null);
         var mediaRuntime = JobTemplateFiles.NormalizeMediaRuntime(OptionalAnnotation(
             annotations,
             JobNames.MediaRuntimeAnnotation,
@@ -263,7 +261,7 @@ public sealed class EncodeJobWatcher(
         {
         }
 
-        var stitchJob = await LoadJobTemplateAsync("stitch", mediaRuntime, useSpot, cancellationToken);
+        var stitchJob = await LoadJobTemplateAsync("stitch", mediaRuntime, capacityClass, cancellationToken);
         stitchJob.Metadata ??= new V1ObjectMeta();
         stitchJob.Metadata.Name = stitchJobName;
         var labels = EnsureLabels(stitchJob.Metadata);
@@ -333,9 +331,9 @@ public sealed class EncodeJobWatcher(
         entry.ValueFrom = null;
     }
 
-    private static async Task<V1Job> LoadJobTemplateAsync(string role, string mediaRuntime, bool useSpot, CancellationToken cancellationToken)
+    private static async Task<V1Job> LoadJobTemplateAsync(string role, string mediaRuntime, string? capacityClass, CancellationToken cancellationToken)
     {
-        var path = JobTemplateFiles.PathFor(role, mediaRuntime, useSpot);
+        var path = JobTemplateFiles.PathFor(role, mediaRuntime, capacityClass);
         if (!File.Exists(path))
             throw new InvalidOperationException($"Job template '{path}' does not exist");
 

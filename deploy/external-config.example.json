@@ -38,7 +38,11 @@
     "kubernetes.io/os": "linux"
   },
   "controlPlaneTolerations": [],
-  "mediaNodeSelectorSpot": {
+  "mediaNodeSelector": {
+    "kubernetes.io/os": "linux",
+    "workload": "video-encoding"
+  },
+  "mediaNodeSelectorInterruptible": {
     "kubernetes.io/os": "linux",
     "workload": "video-encoding"
   },
@@ -46,7 +50,8 @@
     "kubernetes.io/os": "linux",
     "workload": "video-encoding"
   },
-  "mediaTolerationsSpot": [],
+  "mediaTolerations": [],
+  "mediaTolerationsInterruptible": [],
   "mediaTolerationsRegular": [],
   "scaler": {
     "mode": "keda",

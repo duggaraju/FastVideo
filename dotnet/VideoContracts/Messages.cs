@@ -55,7 +55,7 @@ public sealed record VideoSubmitted(
     string? EncoderPreset = null,
     int? Crf = null,
     int? MaxVideoBitrateKbps = null,
-    bool UseSpot = true,
+    string? CapacityClass = null,
     bool CalculateVmaf = false,
     string? MediaRuntime = null,
     string? ParallelizationStrategy = null,
@@ -76,7 +76,7 @@ public sealed record VideoManifest(
     string AudioCodec,
     string? Preset,
     IReadOnlyList<VideoEncodingProfile> EncodingProfiles,
-    bool UseSpot,
+    string? CapacityClass,
     bool CalculateVmaf,
     string MediaRuntime,
     string OutputType);

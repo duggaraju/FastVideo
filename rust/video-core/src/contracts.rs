@@ -10,6 +10,35 @@ pub const OUTPUT_TYPE_ANNOTATION: &str = "video/output-type";
 pub const CALCULATE_VMAF_ANNOTATION: &str = "video/calculate-vmaf";
 pub const MEDIA_RUNTIME_ANNOTATION: &str = "video/media-runtime";
 pub const RESULT_REPORTED_ANNOTATION: &str = "video/result-reported";
+pub const CAPACITY_CLASS_ANNOTATION: &str = "video.fastvideo/capacity-class";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CapacityClass {
+    Interruptible,
+    Regular,
+}
+
+impl CapacityClass {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Interruptible => "interruptible",
+            Self::Regular => "regular",
+        }
+    }
+}
+
+impl std::str::FromStr for CapacityClass {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "interruptible" => Ok(Self::Interruptible),
+            "regular" => Ok(Self::Regular),
+            _ => Err("capacity class must be interruptible or regular".to_owned()),
+        }
+    }
+}
 
 pub fn normalize_output_type(value: &str) -> Result<&'static str, String> {
     match value.to_ascii_lowercase().as_str() {
@@ -36,8 +65,7 @@ pub struct VideoSubmitted {
     pub encoder_preset: Option<String>,
     pub crf: Option<u32>,
     pub max_video_bitrate_kbps: Option<u32>,
-    #[serde(default = "default_true")]
-    pub use_spot: bool,
+    pub capacity_class: Option<CapacityClass>,
     #[serde(default)]
     pub calculate_vmaf: bool,
     pub media_runtime: Option<String>,
@@ -76,8 +104,8 @@ pub struct VideoManifest {
     pub preset: Option<String>,
     #[serde(alias = "EncodingProfiles")]
     pub encoding_profiles: Vec<VideoEncodingProfile>,
-    #[serde(alias = "UseSpot")]
-    pub use_spot: bool,
+    #[serde(alias = "CapacityClass", default)]
+    pub capacity_class: Option<CapacityClass>,
     #[serde(alias = "CalculateVmaf")]
     pub calculate_vmaf: bool,
     #[serde(alias = "OutputType", default = "default_output_type")]
@@ -179,9 +207,6 @@ fn default_audio_codec() -> String {
 fn default_output_type() -> String {
     "mp4".into()
 }
-fn default_true() -> bool {
-    true
-}
 
 #[cfg(test)]
 mod tests {
@@ -211,15 +236,33 @@ mod tests {
                     "Crf":32,
                     "MaxVideoBitrateKbps":4000
                 }],
-                "UseSpot":true,
+                "CapacityClass":"interruptible",
                 "CalculateVmaf":false
             }"#,
         )
         .unwrap();
 
         assert_eq!(manifest.job_id, "job-1");
+        assert_eq!(manifest.capacity_class, Some(CapacityClass::Interruptible));
         assert_eq!(manifest.segments[0].duration_seconds, 60.0);
         assert_eq!(manifest.encoding_profiles[0].name, "1080p");
+    }
+
+    #[test]
+    fn capacity_class_is_provider_neutral_and_optional() {
+        assert_eq!(CapacityClass::Interruptible.as_str(), "interruptible");
+        assert_eq!("regular".parse(), Ok(CapacityClass::Regular));
+        assert!("spot".parse::<CapacityClass>().is_err());
+
+        let submission: VideoSubmitted = serde_json::from_str(
+            r#"{
+                "jobId":"job-1",
+                "inputVideoUri":"https://input.blob.core.windows.net/videos/input.mp4",
+                "outputPath":"https://output.blob.core.windows.net/videos/output"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(submission.capacity_class, None);
     }
 
     #[test]

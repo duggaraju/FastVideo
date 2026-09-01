@@ -7,7 +7,6 @@ metadata:
     video/job-id: placeholder
   annotations:
     video/job-id: placeholder
-    video.fastvideo/use-spot: "true"
 spec:
   backoffLimit: 6
   activeDeadlineSeconds: 21600

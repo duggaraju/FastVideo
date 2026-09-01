@@ -17,8 +17,9 @@ use video::{
     config,
     contracts::{
         AUDIO_BLOB_NAME_ANNOTATION, AUDIO_ENCODING_REQUIRED_ANNOTATION, CALCULATE_VMAF_ANNOTATION,
-        JOB_ID_ANNOTATION, MEDIA_RUNTIME_ANNOTATION, OUTPUT_PATH_ANNOTATION,
-        OUTPUT_TYPE_ANNOTATION, RESULT_REPORTED_ANNOTATION, VideoProcessingResult, job_name,
+        CAPACITY_CLASS_ANNOTATION, CapacityClass, JOB_ID_ANNOTATION, MEDIA_RUNTIME_ANNOTATION,
+        OUTPUT_PATH_ANNOTATION, OUTPUT_TYPE_ANNOTATION, RESULT_REPORTED_ANNOTATION,
+        VideoProcessingResult, job_name,
     },
     parallelism,
 };
@@ -363,14 +364,11 @@ async fn submit_stitch_job(
         .as_ref()
         .and_then(|spec| spec.template.spec.as_ref())
         .and_then(|spec| spec.node_selector.as_ref());
-    let use_spot = annotations
-        .get("video.fastvideo/use-spot")
-        .map(|value| value == "true")
-        .unwrap_or_else(|| {
-            encode_node_selector
-                .and_then(|selector| selector.get("kubernetes.azure.com/scalesetpriority"))
-                .is_some_and(|priority| priority == "spot")
-        });
+    let capacity_class = annotations
+        .get(CAPACITY_CLASS_ANNOTATION)
+        .map(|value| value.parse::<CapacityClass>())
+        .transpose()
+        .map_err(anyhow::Error::msg)?;
     let media_runtime = video::job_templates::normalize_media_runtime(
         annotations
             .get(MEDIA_RUNTIME_ANNOTATION)
@@ -382,7 +380,7 @@ async fn submit_stitch_job(
         config::setting("Encoding__StitchJobActiveDeadlineSeconds", "21600")
             .parse()
             .context("Encoding__StitchJobActiveDeadlineSeconds is invalid")?;
-    let mut job = load_job_template("stitch", media_runtime, use_spot)?;
+    let mut job = load_job_template("stitch", media_runtime, capacity_class)?;
     job.metadata.name = Some(stitch_name.clone());
 
     let labels = labels_mut(&mut job.metadata);
@@ -446,8 +444,12 @@ async fn submit_stitch_job(
     }
 }
 
-fn load_job_template(role: &str, media_runtime: &str, use_spot: bool) -> Result<Job> {
-    let path = video::job_templates::template_path(role, media_runtime, use_spot)?;
+fn load_job_template(
+    role: &str,
+    media_runtime: &str,
+    capacity_class: Option<CapacityClass>,
+) -> Result<Job> {
+    let path = video::job_templates::template_path(role, media_runtime, capacity_class)?;
     let yaml = std::fs::read_to_string(&path)
         .with_context(|| format!("Failed to read job template '{}'", path.display()))?;
     serde_yaml::from_str(&yaml)

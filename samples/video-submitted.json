@@ -6,6 +6,5 @@
   "parallelizationStrategy": "keyframe-boundary",
   "audioCodec": "copy",
   "preset": "max1080p",
-  "useSpot": true,
   "calculateVmaf": false
 }

@@ -15,7 +15,6 @@ public sealed class AnalysisWorker(
     IConfiguration configuration,
     ILogger<AnalysisWorker> logger) : BackgroundService
 {
-    private const string UseSpotAnnotation = "video.fastvideo/use-spot";
     private ServiceBusProcessor? _processor;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -136,7 +135,7 @@ public sealed class AnalysisWorker(
                     profile.EncoderPreset,
                     profile.Crf,
                     profile.MaxVideoBitrateKbps)).ToList(),
-                request.UseSpot,
+                CapacityClasses.Normalize(request.CapacityClass),
                 request.CalculateVmaf,
                 mediaRuntime,
                 outputType);
@@ -232,7 +231,7 @@ public sealed class AnalysisWorker(
         }
 
         var mediaRuntime = JobTemplateFiles.NormalizeMediaRuntime(manifest.MediaRuntime);
-        var job = await LoadJobTemplateAsync("encode", mediaRuntime, manifest.UseSpot, cancellationToken);
+        var job = await LoadJobTemplateAsync("encode", mediaRuntime, manifest.CapacityClass, cancellationToken);
         job.Metadata ??= new V1ObjectMeta();
         job.Metadata.Name = jobName;
         var labels = EnsureLabels(job.Metadata);
@@ -246,7 +245,8 @@ public sealed class AnalysisWorker(
         annotations[JobNames.OutputTypeAnnotation] = manifest.OutputType;
         annotations[JobNames.CalculateVmafAnnotation] = manifest.CalculateVmaf ? "true" : "false";
         annotations[JobNames.MediaRuntimeAnnotation] = mediaRuntime;
-        annotations[UseSpotAnnotation] = manifest.UseSpot ? "true" : "false";
+        if (manifest.CapacityClass is not null)
+            annotations[CapacityClasses.AnnotationName] = manifest.CapacityClass;
 
         var spec = RequiredSpec(job);
         spec.Completions = manifest.SegmentCount;
@@ -302,7 +302,7 @@ public sealed class AnalysisWorker(
         }
 
         var mediaRuntime = JobTemplateFiles.NormalizeMediaRuntime(manifest.MediaRuntime);
-        var job = await LoadJobTemplateAsync("audio-encode", mediaRuntime, manifest.UseSpot, cancellationToken);
+        var job = await LoadJobTemplateAsync("audio-encode", mediaRuntime, manifest.CapacityClass, cancellationToken);
         job.Metadata ??= new V1ObjectMeta();
         job.Metadata.Name = jobName;
         var labels = EnsureLabels(job.Metadata);
@@ -310,7 +310,8 @@ public sealed class AnalysisWorker(
         labels["video/job-id"] = JobNames.LabelValue(manifest.JobId);
         var annotations = EnsureAnnotations(job.Metadata);
         annotations[JobNames.JobIdAnnotation] = manifest.JobId;
-        annotations[UseSpotAnnotation] = manifest.UseSpot ? "true" : "false";
+        if (manifest.CapacityClass is not null)
+            annotations[CapacityClasses.AnnotationName] = manifest.CapacityClass;
 
         var spec = RequiredSpec(job);
         spec.ActiveDeadlineSeconds = configuration.GetValue("Encoding:AudioEncodeJobActiveDeadlineSeconds", 21600);
@@ -370,9 +371,9 @@ public sealed class AnalysisWorker(
         entry.ValueFrom = null;
     }
 
-    private static async Task<V1Job> LoadJobTemplateAsync(string role, string mediaRuntime, bool useSpot, CancellationToken cancellationToken)
+    private static async Task<V1Job> LoadJobTemplateAsync(string role, string mediaRuntime, string? capacityClass, CancellationToken cancellationToken)
     {
-        var path = JobTemplateFiles.PathFor(role, mediaRuntime, useSpot);
+        var path = JobTemplateFiles.PathFor(role, mediaRuntime, capacityClass);
         if (!File.Exists(path))
             throw new InvalidOperationException($"Job template '{path}' does not exist");
 
@@ -453,6 +454,7 @@ public sealed class AnalysisWorker(
             throw new ArgumentException("Preset must be max4k or max<height>p, for example max1080p");
         if (string.IsNullOrWhiteSpace(request.AudioCodec))
             throw new ArgumentException("AudioCodec is required");
+        CapacityClasses.Normalize(request.CapacityClass);
     }
 
     public override async Task StopAsync(CancellationToken cancellationToken)

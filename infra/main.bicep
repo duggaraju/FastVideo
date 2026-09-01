@@ -176,7 +176,10 @@ resource aks 'Microsoft.ContainerService/managedClusters@2025-05-01' = {
         scaleSetEvictionPolicy: 'Delete'
         spotMaxPrice: -1
         nodeTaints: [ 'kubernetes.azure.com/scalesetpriority=spot:NoSchedule' ]
-        nodeLabels: { workload: 'video-encoding' }
+        nodeLabels: {
+          workload: 'video-encoding'
+          'video.fastvideo/capacity-class': 'interruptible'
+        }
       }
       {
         name: 'regular'
@@ -192,7 +195,10 @@ resource aks 'Microsoft.ContainerService/managedClusters@2025-05-01' = {
         minCount: regularMinCount
         maxCount: regularMaxCount
         maxPods: 30
-        nodeLabels: { workload: 'video-encoding' }
+        nodeLabels: {
+          workload: 'video-encoding'
+          'video.fastvideo/capacity-class': 'regular'
+        }
       }
     ]
     networkProfile: {
@@ -225,7 +231,10 @@ resource armSpotPool 'Microsoft.ContainerService/managedClusters/agentPools@2025
     scaleSetEvictionPolicy: 'Delete'
     spotMaxPrice: -1
     nodeTaints: [ 'kubernetes.azure.com/scalesetpriority=spot:NoSchedule' ]
-    nodeLabels: { workload: 'video-encoding' }
+    nodeLabels: {
+      workload: 'video-encoding'
+      'video.fastvideo/capacity-class': 'interruptible'
+    }
   }
 }
 

@@ -15,7 +15,8 @@ param(
     [string] $Preset,
     [Nullable[int]] $Crf,
     [Nullable[int]] $MaxVideoBitrateKbps,
-    [bool] $UseSpot = $true,
+    [ValidateSet("interruptible", "regular")]
+    [string] $CapacityClass = "interruptible",
     [switch] $CalculateVmaf,
     [ValidateSet("dotnet", "rust")]
     [string] $MediaRuntime = "rust",
@@ -179,9 +180,11 @@ $payload = [ordered]@{
     parallelizationStrategy = $ParallelizationStrategy
     audioCodec = $AudioCodec
     outputType = $OutputType
-    useSpot = $UseSpot
     calculateVmaf = $CalculateVmaf.IsPresent
     mediaRuntime = $MediaRuntime
+}
+if (-not [string]::IsNullOrWhiteSpace($CapacityClass)) {
+    $payload.capacityClass = $CapacityClass
 }
 if ($null -ne $Crf) {
     if ($Crf -lt 0 -or $Crf -gt 63) { throw "Crf must be between 0 and 63." }

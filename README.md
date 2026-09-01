@@ -7,13 +7,13 @@ The Storage Queue and Service Bus control planes can run side by side. `storageq
 ## Workflow
 
 1. KEDA scales the selected analyzer from the `video-submitted` Storage Queue or Service Bus queue.
-2. The analyzer reads the source from the read-only input mount and probes it with FFprobe. It rejects audio longer than `Encoding__MaxAudioDurationSeconds`, stream-copies audio to output storage when `audioCodec` is `copy`, computes segment boundaries, writes the manifest, loads the pre-rendered media Job template that matches the requested runtime and Spot/regular choice, patches only the per-submission fields, and creates the media Jobs. Audio transcoding runs concurrently in a singleton Job on the selected Spot or regular pool; video encoding runs in a Kubernetes Indexed Job.
+2. The analyzer reads the source from the read-only input mount and probes it with FFprobe. It rejects audio longer than `Encoding__MaxAudioDurationSeconds`, stream-copies audio to output storage when `audioCodec` is `copy`, computes segment boundaries, writes the manifest, loads the pre-rendered media Job template that matches the requested runtime and optional capacity class, patches only the per-submission fields, and creates the media Jobs. Audio transcoding runs concurrently in a singleton Job with the same scheduling constraints as the video encoding Kubernetes Indexed Job.
 3. Every `VideoEncoder` index reads the source from input storage, encodes only its deterministic video time range (no audio), and writes to a unique staging path on the output BlobFuse mount. After FFmpeg succeeds, it renames the staging file to the deterministic segment path. When requested, the index also compares the segment with its source interval using VMAF and writes a deterministic score sidecar. A retry skips each artifact that already exists. Each index gets up to five retries on interruption or encoding failure.
-4. Kubernetes marks the Indexed encode Job complete only after every index succeeds. For transcoding requests, the singleton Job watcher also waits for the audio encode Job to complete. It then loads the matching stitch Job template, patches deterministic workflow metadata stored on the encode Job, and creates the stitch Job. Stitching follows the request's `useSpot` setting and runs on the same Spot or regular pool selected for encoding.
+4. Kubernetes marks the Indexed encode Job complete only after every index succeeds. For transcoding requests, the singleton Job watcher also waits for the audio encode Job to complete. It then loads the matching stitch Job template, patches deterministic workflow metadata stored on the encode Job, and creates the stitch Job. Stitching follows the request's optional `capacityClass` constraint.
 5. `VideoStitcher` constructs ordered segment paths directly from indexes `0..SegmentCount-1` and reads them and the extracted audio exclusively from output storage. One FFmpeg process concatenates the video and emits the selected MP4 output, CMAF package with DASH and HLS manifests, or both. When VMAF was requested, the stitcher also writes the arithmetic mean of all segment VMAF means beside the requested output path.
 6. A singleton completion reconciler logs failed encode pod attempts and sends one terminal `VideoProcessingResult` per video to `video-results`: encode failure after all retries means failure, stitch success means success, and stitch failure means failure. Individual retry failures and encode success are not sent as terminal results. After stitching succeeds, the reconciler deletes the corresponding encode Job.
 
-Indexed encode Jobs use Spot nodes by default and tolerate eviction. A request can instead select the dedicated autoscaling regular encoding pool. Stitch Jobs use the same pool selected for encoding, while lightweight analysis and the Job watcher remain on regular system nodes. Encoder retries remain safe because blob names are deterministic, while Kubernetes Job conditions provide durable fan-in state.
+When `capacityClass` is omitted, media Jobs can run on any eligible media pool. A request can strictly select the provider-neutral `interruptible` or `regular` class; on AKS, `interruptible` maps to Spot nodes. Stitch Jobs preserve the same scheduling constraint as encoding, while lightweight analysis and the Job watcher remain on regular system nodes. Encoder retries remain safe because blob names are deterministic, while Kubernetes Job conditions provide durable fan-in state.
 
 ## Projects
 
@@ -94,9 +94,9 @@ Deployment manifests live under `deploy/k8s/` as Kustomize bases, transport over
 - `deploy/k8s/components/providers/azure/` and `deploy/k8s/components/providers/external/` - provider components for the control-plane Deployments. Azure carries AKS-native Workload Identity and Blob CSI defaults; external remains intentionally inert so `scripts/deploy.ps1` can inject cluster-specific values from the user config.
 - `deploy/k8s/jobs/base/` - checked-in static Job templates for encode, audio-encode, and stitch.
 - `deploy/k8s/jobs/overlays/dotnet/` and `deploy/k8s/jobs/overlays/rust/` - image-only media-runtime overlays.
-- `deploy/k8s/jobs/components/providers/*` and `deploy/k8s/jobs/components/scheduling/azure/*` - provider and scheduling components that patch CSI, node-selection, and toleration defaults into the shared Job templates.
+- `deploy/k8s/jobs/components/providers/*` and `deploy/k8s/jobs/components/scheduling/azure/*` - provider and scheduling components that patch CSI, node-selection, and toleration defaults into the shared Job templates. The optional generic capacity classes are `interruptible` and `regular`; only the Azure scheduling component maps `interruptible` to AKS Spot labels and taints. Its default profile has no capacity selector and tolerates the AKS Spot taint so either media pool is eligible.
 
-Because storage account names, the workload identity client ID, the Service Bus namespace, image tags, and KEDA scaler metadata are only known at deploy time, `scripts/deploy.ps1` writes a small generated overlay to `deploy/.generated/<mode>-<transport>/` (gitignored). That overlay layers the chosen transport overlay with the chosen provider component, patches in the real control-plane values, and generates a `video-job-templates` ConfigMap from pre-rendered media Job templates. The script renders both runtimes and both Spot/regular scheduling variants so the deployed analyzers/completion workers can honor per-submission `mediaRuntime` and `useSpot` choices by selecting a mounted YAML file instead of rebuilding pod specs in code.
+Because storage account names, the workload identity client ID, the Service Bus namespace, image tags, and KEDA scaler metadata are only known at deploy time, `scripts/deploy.ps1` writes a small generated overlay to `deploy/.generated/<mode>-<transport>/` (gitignored). That overlay layers the chosen transport overlay with the chosen provider component, patches in the real control-plane values, and generates a `video-job-templates` ConfigMap from pre-rendered media Job templates. The script renders both runtimes with unconstrained, interruptible, and regular scheduling variants so the deployed analyzers/completion workers can honor per-submission `mediaRuntime` and optional `capacityClass` choices by selecting a mounted YAML file instead of rebuilding pod specs in code.
 
 `kubectl kustomize deploy/.generated/<mode>-<transport>` renders the final manifest; you can run that command yourself to inspect or diff what will be applied. Every checked-in base/overlay can also be rendered standalone without a cluster, and the Job templates can be rendered the same way through a small composition kustomization that references `deploy/k8s/jobs/overlays/<runtime>` plus the desired provider/scheduling components.
 
@@ -160,7 +160,7 @@ Copy-Item deploy/external-config.example.json ~/fastvideo-external.json
 ./scripts/deploy.ps1 -DeploymentMode external -ExternalConfigPath ~/fastvideo-external.json -MessageTransport storagequeue -MediaRuntime rust -ImageTag v1
 ```
 
-The config remains the single user-editable JSON profile - there is no separate Kustomize authoring step. `scripts/deploy.ps1` reads it directly and writes every value (kube context, namespace, image repository, service account and annotations, pod labels, control-plane and Spot/regular media node selectors/tolerations, CSI driver/attributes, and scaler type/metadata/authentication) into the generated overlay at `deploy/.generated/external-<transport>/`, layered on the inert `deploy/k8s/components/providers/external/` control-plane component and the inert `deploy/k8s/jobs/components/providers/external/` Job-template component. With scaler mode `none`, scaling is deliberately disabled and the analyzer stays at one replica.
+The config remains the single user-editable JSON profile - there is no separate Kustomize authoring step. `scripts/deploy.ps1` reads it directly and writes every value (kube context, namespace, image repository, service account and annotations, pod labels, control-plane and default/interruptible/regular media node selectors and tolerations, CSI driver/attributes, and scaler type/metadata/authentication) into the generated overlay at `deploy/.generated/external-<transport>/`, layered on the inert `deploy/k8s/components/providers/external/` control-plane component and the inert `deploy/k8s/jobs/components/providers/external/` Job-template component. `mediaNodeSelector` and `mediaTolerations` configure omitted `capacityClass` requests. With scaler mode `none`, scaling is deliberately disabled and the analyzer stays at one replica.
 
 The portability boundary is Kubernetes scheduling, registry naming, CSI mounting, and scaler configuration. It is **not yet a provider-neutral data plane**: queue and result clients still use Azure Storage Queue or Azure Service Bus SDKs, blob paths and manifests still use Azure Blob-compatible HTTPS URLs, and authentication still expects Microsoft Entra credentials. A different broker or object store requires a worker adapter implementation; configuring another scaler or CSI driver alone does not add that adapter. The example therefore uses externally provisioned Azure-compatible services and contains identifiers only, never secrets or connection strings.
 
@@ -176,7 +176,7 @@ Optional `crf`, `encoderPreset`, and `maxVideoBitrateKbps` fields customize enco
 
 Ladder rungs and named presets are deployment configuration in [deploy/ladder-profiles.json](deploy/ladder-profiles.json). A `bounded` preset selects shared rungs at or below its resolution and bitrate ceilings; its optional `rungs` array can restrict which shared rungs are eligible. A `custom` preset declares an exact `renditions` array. Each custom rendition can reference a shared rung with `{ "rung": "720p" }`, optionally override its name, dimensions, or bitrate, or define all fields inline. Source-dimension and source-bitrate safeguards apply to both preset types. The deployment script validates the JSON, embeds it in the `video-ladder-profiles` ConfigMap, and mounts it read-only at `/etc/video/ladder/ladder-profiles.json` in both analyzers. Add, remove, or retune rungs and presets without changing or rebuilding application code. The analyzers read the projected file for each submission, while `Encoding__LadderProfiles` remains available as an inline JSON fallback for local deployments.
 
-`useSpot` is optional and defaults to `true`. Set it to `false` to schedule all indexes for that video on the regular encoding pool. `calculateVmaf` is optional and defaults to `false`. When enabled, every encoder compares its output with the matching source interval. The final `.vmaf.json` beside the output video contains the overall unweighted arithmetic mean and an ordered `Segments` array with the `Index` and `Score` for every segment.
+`capacityClass` is optional. When omitted or `null`, no capacity-class node selector is added, so the Job can run on any eligible media pool. Supported explicit values are `interruptible` and `regular`. Kubernetes itself does not define Spot capacity: each deployment maps these classes to its own node labels and taints. The Azure profile maps `interruptible` to AKS Spot pools and makes an unconstrained Job tolerate the mandatory AKS Spot taint; an external cluster supplies the corresponding default and class-specific media selectors and tolerations. `calculateVmaf` is optional and defaults to `false`. When enabled, every encoder compares its output with the matching source interval. The final `.vmaf.json` beside the output video contains the overall unweighted arithmetic mean and an ordered `Segments` array with the `Index` and `Score` for every segment.
 
 `outputType` is optional and defaults to `mp4`. Supported values are `mp4`, `cmaf`, and `both`:
 
@@ -206,7 +206,7 @@ The script discovers the latest successful deployment, creates a transport/VMAF-
 ./scripts/test-workflow.ps1 `
     -InputVideoUri "https://videoinsoudinndket2a.blob.core.windows.net/input/bingshort.mp4" `
     -ParallelizationStrategy keyframe-boundary `
-    -UseSpot $false `
+    -CapacityClass regular `
     -CalculateVmaf `
     -TimeoutMinutes 90
 ```
@@ -229,12 +229,12 @@ After the blob validation succeeds, the script reports the `video-results` messa
 
 The benchmark script can pin encoder and stitch Jobs to either architecture using an optional `architecture` field in the queue JSON. The analyzer translates that field into the standard Kubernetes `kubernetes.io/arch` node selector. Use `-Architecture any` or omit `-Architecture` to leave the architecture selector empty so Jobs remain eligible for any matching media-processing architecture. Normal submissions use the same architecture-independent behavior.
 
-Run the same source, encoding settings, Spot priority, and run count for both architectures:
+Run the same source, encoding settings, interruptible capacity class, and run count for both architectures:
 
 ```powershell
-./scripts/benchmark-workflow.ps1 -Architecture amd64 -Runs 5 -UseSpot $true -OutputPath ./scripts/amd64.json
-./scripts/benchmark-workflow.ps1 -Architecture arm64 -Runs 5 -UseSpot $true -OutputPath ./scripts/arm64.json
-./scripts/benchmark-workflow.ps1 -Architecture any -Runs 1 -UseSpot $true -OutputPath ./scripts/any-arch.json
+./scripts/benchmark-workflow.ps1 -Architecture amd64 -Runs 5 -CapacityClass interruptible -OutputPath ./scripts/amd64.json
+./scripts/benchmark-workflow.ps1 -Architecture arm64 -Runs 5 -CapacityClass interruptible -OutputPath ./scripts/arm64.json
+./scripts/benchmark-workflow.ps1 -Architecture any -Runs 1 -CapacityClass interruptible -OutputPath ./scripts/any-arch.json
 ```
 
 To compare .NET and Rust encoding/stitching on the x64 Spot pool, deploy and benchmark each implementation with distinct immutable image tags. Use the custom FFmpeg build and the same FFmpeg version for both:
@@ -244,13 +244,13 @@ To compare .NET and Rust encoding/stitching on the x64 Spot pool, deploy and ben
     -MediaRuntime dotnet -ImageTag bench-dotnet `
     -FfmpegBuild custom -FfmpegVersion 8.1 -Platforms linux/amd64
 ./scripts/benchmark-workflow.ps1 -MediaRuntime dotnet `
-    -Architecture amd64 -Runs 5 -UseSpot $true -OutputPath ./scripts/dotnet-amd64.json
+    -Architecture amd64 -Runs 5 -CapacityClass interruptible -OutputPath ./scripts/dotnet-amd64.json
 
 ./scripts/deploy.ps1 -SkipInfrastructureDeployment `
     -MediaRuntime rust -ImageTag bench-rust `
     -FfmpegBuild custom -FfmpegVersion 8.1 -Platforms linux/amd64
 ./scripts/benchmark-workflow.ps1 -MediaRuntime rust `
-    -Architecture amd64 -Runs 5 -UseSpot $true -OutputPath ./scripts/rust-amd64.json
+    -Architecture amd64 -Runs 5 -CapacityClass interruptible -OutputPath ./scripts/rust-amd64.json
 ```
 
 The two runs use the same input URI by default and are pinned to the x64 Spot node pool. Each pod result records its image and resolved image ID; verify those fields before comparing medians. Alternate deployment order across repeated batches to reduce node warm-up, image-pull, storage-cache, autoscaler, and changing Spot-capacity bias.

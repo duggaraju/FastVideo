@@ -7,9 +7,9 @@ spec:
     spec:
       nodeSelector:
         workload: video-encoding
-        video.fastvideo/capacity-class: regular
+        video.fastvideo/capacity-class: interruptible
         kubernetes.io/os: linux
-      tolerations: []
+      tolerations: [{"key":"kubernetes.azure.com/scalesetpriority","operator":"Equal","value":"spot","effect":"NoSchedule"}]
 ---
 apiVersion: batch/v1
 kind: Job
@@ -20,9 +20,9 @@ spec:
     spec:
       nodeSelector:
         workload: video-encoding
-        video.fastvideo/capacity-class: regular
+        video.fastvideo/capacity-class: interruptible
         kubernetes.io/os: linux
-      tolerations: []
+      tolerations: [{"key":"kubernetes.azure.com/scalesetpriority","operator":"Equal","value":"spot","effect":"NoSchedule"}]
 ---
 apiVersion: batch/v1
 kind: Job
@@ -33,6 +33,6 @@ spec:
     spec:
       nodeSelector:
         workload: video-encoding
-        video.fastvideo/capacity-class: regular
+        video.fastvideo/capacity-class: interruptible
         kubernetes.io/os: linux
-      tolerations: []
+      tolerations: [{"key":"kubernetes.azure.com/scalesetpriority","operator":"Equal","value":"spot","effect":"NoSchedule"}]

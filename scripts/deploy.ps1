@@ -131,8 +131,10 @@ function Get-JobTemplateRole([string] $Document) {
     throw "Unrecognized rendered job template document."
 }
 
-function Render-JobTemplateSet([string] $GeneratedDir, [string] $Runtime, [string] $Scheduling) {
-    $renderDir = Join-Path $GeneratedDir "job-template-build/$Runtime-$Scheduling"
+function Render-JobTemplateSet([string] $GeneratedDir, [string] $Runtime, [AllowNull()][string] $CapacityClass) {
+    $templateProfile = if ([string]::IsNullOrWhiteSpace($CapacityClass)) { "default" } else { $CapacityClass }
+    $capacityClassSuffix = if ([string]::IsNullOrWhiteSpace($CapacityClass)) { "" } else { "-$CapacityClass" }
+    $renderDir = Join-Path $GeneratedDir "job-template-build/$Runtime-$templateProfile"
     if (Test-Path -LiteralPath $renderDir) {
         Remove-Item -LiteralPath $renderDir -Recurse -Force
     }
@@ -145,7 +147,7 @@ function Render-JobTemplateSet([string] $GeneratedDir, [string] $Runtime, [strin
 
     $patchNames = [System.Collections.Generic.List[string]]::new()
     if ($DeploymentMode -eq "azure") {
-        $jobComponents.Add("../../../../k8s/jobs/components/scheduling/azure/$Scheduling")
+        $jobComponents.Add("../../../../k8s/jobs/components/scheduling/azure/$templateProfile")
         $jobPatch = @"
 apiVersion: batch/v1
 kind: Job
@@ -210,8 +212,16 @@ spec:
         Set-Content -LiteralPath (Join-Path $renderDir "patch-storage.yaml") -Value $jobPatch -Encoding UTF8
         $patchNames.Add("patch-storage.yaml")
     } else {
-        $scheduleNodeSelector = if ($Scheduling -eq "spot") { $mediaNodeSelectorSpot } else { $mediaNodeSelectorRegular }
-        $scheduleTolerations = if ($Scheduling -eq "spot") { $mediaTolerationsSpot } else { $mediaTolerationsRegular }
+        $scheduleNodeSelector = switch ($CapacityClass) {
+          "interruptible" { $mediaNodeSelectorInterruptible }
+          "regular" { $mediaNodeSelectorRegular }
+          default { $mediaNodeSelector }
+        }
+        $scheduleTolerations = switch ($CapacityClass) {
+          "interruptible" { $mediaTolerationsInterruptible }
+          "regular" { $mediaTolerationsRegular }
+          default { $mediaTolerations }
+        }
         $jobPatch = @"
 apiVersion: batch/v1
 kind: Job
@@ -309,14 +319,14 @@ $imagesYaml
     Set-Content -LiteralPath (Join-Path $renderDir "kustomization.yaml") -Value $kustomization -Encoding UTF8
 
     $manifest = (kubectl kustomize $renderDir | Out-String)
-    Assert-NativeCommandSucceeded "Rendering $Runtime/$Scheduling job templates with kubectl kustomize"
+    Assert-NativeCommandSucceeded "Rendering $Runtime/$templateProfile job templates with kubectl kustomize"
 
     $outputDir = Join-Path $GeneratedDir "job-templates"
     New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
     $entries = [System.Collections.Generic.List[string]]::new()
     foreach ($document in (Split-YamlDocuments $manifest)) {
         $role = Get-JobTemplateRole $document
-        $fileName = "$role-$Runtime-$Scheduling.yaml"
+        $fileName = "$role-$Runtime$capacityClassSuffix.yaml"
         Set-Content -LiteralPath (Join-Path $outputDir $fileName) -Value $document -Encoding UTF8
         $entries.Add("      - $fileName=job-templates/$fileName")
     }
@@ -343,9 +353,11 @@ $outputCsiVolumeAttributes = @{}
 $podLabels = @{}
 $controlPlaneNodeSelector = @{}
 $controlPlaneTolerations = @()
-$mediaNodeSelectorSpot = @{}
+$mediaNodeSelector = @{}
+$mediaNodeSelectorInterruptible = @{}
 $mediaNodeSelectorRegular = @{}
-$mediaTolerationsSpot = @()
+$mediaTolerations = @()
+$mediaTolerationsInterruptible = @()
 $mediaTolerationsRegular = @()
 
 if ($DeploymentMode -eq "external") {
@@ -395,9 +407,11 @@ if ($DeploymentMode -eq "external") {
     $podLabels = Get-ConfigValue $external "podLabels" @{}
     $controlPlaneNodeSelector = Get-ConfigValue $external "controlPlaneNodeSelector" @{}
     $controlPlaneTolerations = @(Get-ConfigValue $external "controlPlaneTolerations" @())
-    $mediaNodeSelectorSpot = Get-ConfigValue $external "mediaNodeSelectorSpot" @{}
+    $mediaNodeSelector = Get-ConfigValue $external "mediaNodeSelector" @{}
+    $mediaNodeSelectorInterruptible = Get-ConfigValue $external "mediaNodeSelectorInterruptible" @{}
     $mediaNodeSelectorRegular = Get-ConfigValue $external "mediaNodeSelectorRegular" @{}
-    $mediaTolerationsSpot = @(Get-ConfigValue $external "mediaTolerationsSpot" @())
+    $mediaTolerations = @(Get-ConfigValue $external "mediaTolerations" @())
+    $mediaTolerationsInterruptible = @(Get-ConfigValue $external "mediaTolerationsInterruptible" @())
     $mediaTolerationsRegular = @(Get-ConfigValue $external "mediaTolerationsRegular" @())
 
     $serviceBusNamespace = [string](Get-ConfigValue $external "serviceBusNamespace" "")
@@ -705,8 +719,8 @@ spec:
 
 $jobTemplateFileEntries = [System.Collections.Generic.List[string]]::new()
 foreach ($runtime in @("dotnet", "rust")) {
-    foreach ($scheduling in @("spot", "regular")) {
-        foreach ($entry in (Render-JobTemplateSet $generatedDir $runtime $scheduling)) {
+  foreach ($capacityClass in @($null, "interruptible", "regular")) {
+    foreach ($entry in (Render-JobTemplateSet $generatedDir $runtime $capacityClass)) {
             $jobTemplateFileEntries.Add($entry)
         }
     }

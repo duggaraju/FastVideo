@@ -13,7 +13,6 @@ metadata:
     video/output-type: mp4
     video/calculate-vmaf: "false"
     video/media-runtime: rust
-    video.fastvideo/use-spot: "true"
 spec:
   completionMode: Indexed
   completions: 1

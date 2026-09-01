@@ -42,14 +42,14 @@ FastVideo is an AKS/FFmpeg pipeline with two independent choices:
 - **Control-plane transport:** Rust analyzer/completion workers use Azure Storage Queues in `video-storagequeue`; .NET analysis/completion workers use Azure Service Bus in `video-servicebus`.
 - **Media runtime:** encoder, audio encoder, and stitcher Jobs can independently use the .NET or Rust implementation. Do not couple transport selection to media runtime selection.
 
-The workflow is analyzer -> Indexed video encode Job plus optional singleton audio encode Job -> completion reconciler -> stitch Job -> one terminal result. KEDA scales only the analyzer intake deployment. Analysis and completion run on system nodes; media Jobs run on Spot nodes by default or the regular media pool when `useSpot` is false.
+The workflow is analyzer -> Indexed video encode Job plus optional singleton audio encode Job -> completion reconciler -> stitch Job -> one terminal result. KEDA scales only the analyzer intake deployment. Analysis and completion run on system nodes; media Jobs use the provider-neutral `interruptible` capacity class by default or `regular` when requested. The Azure scheduling component maps `interruptible` to AKS Spot nodes.
 
 Shared logical components have parallel implementations:
 
 - `dotnet/VideoContracts` and `rust/video-core/src/contracts.rs` define interoperable queue, manifest, result, annotation, and deterministic-name contracts.
 - `dotnet/VideoAnalysis` and `rust/analyzer` probe media, select profiles and segmentation, write the manifest, and submit Kubernetes Jobs.
 - `dotnet/VideoCompletion` and `rust/completion` rebalance the global Indexed Job parallelism budget, fan in encode/audio completion, create stitch Jobs, and publish terminal results.
-- The encoder/audio-encoder/stitcher binaries are short-lived Kubernetes Job processes driven primarily by environment variables and BlobFuse-mounted files. Their static pod specs live under `deploy/k8s/jobs/`; analyzers and completion workers load the mounted YAML template matching the requested runtime and Spot/regular choice, then patch only per-submission fields before calling the Kubernetes API.
+- The encoder/audio-encoder/stitcher binaries are short-lived Kubernetes Job processes driven primarily by environment variables and BlobFuse-mounted files. Their static pod specs live under `deploy/k8s/jobs/`; analyzers and completion workers load the mounted YAML template matching the requested runtime and interruptible/regular capacity class, then patch only per-submission fields before calling the Kubernetes API.
 
 Media flows through BlobFuse rather than local downloads. The input mount is read-only; intermediate and final artifacts use the output mount. Stitchers intentionally mount only output storage. `deploy/ladder-profiles.json` is runtime configuration mounted into both analyzers, not application code. The pre-rendered media Job templates are likewise mounted into analyzer/completion pods from the generated `video-job-templates` ConfigMap.
 

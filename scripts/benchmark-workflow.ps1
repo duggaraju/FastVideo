@@ -6,7 +6,8 @@ param(
     [uri] $InputVideoUri = "https://videoinsoudinndket2a.blob.core.windows.net/input/BigBuckBunny_1080p_10min.mp4",
     [ValidateRange(1, 20)]
     [int] $Runs = 5,
-    [bool] $UseSpot = $true,
+    [ValidateSet("interruptible", "regular")]
+    [string] $CapacityClass = "interruptible",
     [ValidateSet("dotnet", "rust")]
     [string] $MediaRuntime = "rust",
     [ValidateSet("auto", "storagequeue", "servicebus")]
@@ -148,8 +149,8 @@ Assert-NativeCommandSucceeded "Getting AKS credentials"
 
 $outputStorageAccount = $deployment.outputStorageName.value
 $outputContainer = $deployment.outputContainerName.value
-$priority = if ($UseSpot) { "spot" } else { "regular" }
-$mode = "$MediaRuntime-$priority-$Architecture"
+$capacityMode = if ([string]::IsNullOrWhiteSpace($CapacityClass)) { "unconstrained" } else { $CapacityClass }
+$mode = "$MediaRuntime-$capacityMode-$Architecture"
 if ([string]::IsNullOrWhiteSpace($BatchId)) {
     $BatchId = "bench-$mode-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
 }
@@ -172,9 +173,11 @@ for ($run = 1; $run -le $Runs; $run++) {
         segmentDurationSeconds = 60
         parallelizationStrategy = "fixed-duration"
         audioCodec = "copy"
-        useSpot = $UseSpot
         calculateVmaf = $CalculateVmaf
         mediaRuntime = $MediaRuntime
+    }
+    if (-not [string]::IsNullOrWhiteSpace($CapacityClass)) {
+        $payload.capacityClass = $CapacityClass
     }
     if ($Architecture -ne "any") {
         $payload.architecture = $Architecture

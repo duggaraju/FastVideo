@@ -73,12 +73,12 @@ function Set-MediaRuntimeImages([string] $LoginServer, [string] $DotNetTag, [str
     foreach ($property in $jobTemplatesConfigMap.data.PSObject.Properties) {
         $image = $null
         switch -Regex ($property.Name) {
-            '^encode-dotnet-' { $image = $dotnetImages.encode; break }
-            '^audio-encode-dotnet-' { $image = $dotnetImages.audio; break }
-            '^stitch-dotnet-' { $image = $dotnetImages.stitch; break }
-            '^encode-rust-' { $image = $rustImages.encode; break }
-            '^audio-encode-rust-' { $image = $rustImages.audio; break }
-            '^stitch-rust-' { $image = $rustImages.stitch; break }
+            '^encode-dotnet(?:-|\.yaml$)' { $image = $dotnetImages.encode; break }
+            '^audio-encode-dotnet(?:-|\.yaml$)' { $image = $dotnetImages.audio; break }
+            '^stitch-dotnet(?:-|\.yaml$)' { $image = $dotnetImages.stitch; break }
+            '^encode-rust(?:-|\.yaml$)' { $image = $rustImages.encode; break }
+            '^audio-encode-rust(?:-|\.yaml$)' { $image = $rustImages.audio; break }
+            '^stitch-rust(?:-|\.yaml$)' { $image = $rustImages.stitch; break }
             default { continue }
         }
 
@@ -116,7 +116,7 @@ function Start-Benchmark([string] $Runtime, [string] $BatchId, [string] $ResultP
         & $ScriptPath `
             -ResourceGroup $Group `
             -Runs 1 `
-            -UseSpot $true `
+            -CapacityClass interruptible `
             -MediaRuntime $MediaRuntime `
             -MessageTransport $Transport `
             -Architecture amd64 `
@@ -210,7 +210,7 @@ try {
             & $benchmarkScript `
                 -ResourceGroup $ResourceGroup `
                 -Runs 1 `
-                -UseSpot $true `
+                -CapacityClass interruptible `
                 -MediaRuntime $order[1] `
                 -MessageTransport $MessageTransport `
                 -Architecture amd64 `
