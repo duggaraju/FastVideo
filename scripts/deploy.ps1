@@ -282,6 +282,18 @@ spec:
     $resourcesYaml = "  - $runtimeOverlay"
     $componentsYaml = ($jobComponents | ForEach-Object { "  - $_" }) -join "`n"
     $patchesYaml = if ($patchNames.Count -eq 0) { "  []" } else { ($patchNames | ForEach-Object { "  - path: $_" }) -join "`n" }
+    $imageSuffix = if ($Runtime -eq "rust") { "rust" } else { "dotnet" }
+    $imagesYaml = @"
+  - name: video-encoder-$imageSuffix
+    newName: $imageRepository/video-encoder-$imageSuffix
+    newTag: "$ImageTag"
+  - name: video-audio-encoder-$imageSuffix
+    newName: $imageRepository/video-audio-encoder-$imageSuffix
+    newTag: "$ImageTag"
+  - name: video-stitcher-$imageSuffix
+    newName: $imageRepository/video-stitcher-$imageSuffix
+    newTag: "$ImageTag"
+"@
     $kustomization = @"
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
@@ -291,10 +303,12 @@ components:
 $componentsYaml
 patches:
 $patchesYaml
+images:
+$imagesYaml
 "@
     Set-Content -LiteralPath (Join-Path $renderDir "kustomization.yaml") -Value $kustomization -Encoding UTF8
 
-    $manifest = kubectl kustomize $renderDir
+    $manifest = (kubectl kustomize $renderDir | Out-String)
     Assert-NativeCommandSucceeded "Rendering $Runtime/$Scheduling job templates with kubectl kustomize"
 
     $outputDir = Join-Path $GeneratedDir "job-templates"
